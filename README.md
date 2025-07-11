@@ -1,5 +1,5 @@
 # Site2Local
-Ferramenta simples Python 3.X feita por chatgpt que cria um site existente que usa e não usa suporte a html e php rodando em localhost também conhecido como 127.0.0.1!
+Ferramenta simples Python 3.X feita por chatgpt que cria um site existente que usa e não usa suporte a html e que use php rodando em localhost também conhecido como 127.0.0.1!
 
 # O que posso mudar nisso?
 Você pode alterar se deseja ou não ignorar o erro "acesso negado", pode ativar elementos ocultos, ativar o crawling e alterar headers para celular, tablet, desktop, auto e bot.
