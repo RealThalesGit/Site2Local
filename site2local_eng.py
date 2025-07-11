@@ -16,15 +16,15 @@ import sys
 sys.setrecursionlimit(10000)
 
 # -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports both HTML-based and PHP-based sites
-SITE_URL = "https://www.lexnumerus.com.br"
-PORT = 8080
+MODE = "AUTO_MODE"  # Supports all sites that use and dont use html and support sites that use php too!
+SITE_URL = "https://www.example.com"
+PORT = 8080 # change to 80 if you are on pc, and if you are with a rooted device too!, for non-rooted android you can let it 8080 anyways!
 FORCE_ACCESS_DENIED_BYPASS = False
-SCAN_FOR_HIDDEN_PATHS = True
-ENABLE_HIDDEN_ELEMENTS = True
-SHOW_HIDDEN_ELEMENTS = True
-ENABLE_CRAWLING = True
-HEADER_DEVICE = "mobile"  # Set to "mobile", "desktop", "tablet", "bot", or "auto" for automatic detection
+SCAN_FOR_HIDDEN_PATHS = False
+ENABLE_HIDDEN_ELEMENTS = False
+SHOW_HIDDEN_ELEMENTS = False
+ENABLE_CRAWLING = False
+HEADER_DEVICE = "mobile"  # Set this according to your device, mobile, tablet, desktop and even "auto" and "bots"
 
 # -------------------- DEVICE DETECTION --------------------
 def detect_device():
@@ -221,10 +221,10 @@ if __name__ == '__main__':
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"\U0001F4E5 Crawling site: {SITE_URL} (mode: {MODE})")
+        print(f"Crawling site: {SITE_URL} (mode: {MODE})")
         crawl(SITE_URL)
     else:
-        print(" Crawling is disabled.")
+        print("Crawling is disabled.")
     print(f"SRC directory: {os.path.abspath(SITE_SRC)}")
     print(f"POST data directory: {os.path.abspath(SITE_DATA)}")
     print(f"Server running at http://127.0.0.1:{PORT}")
