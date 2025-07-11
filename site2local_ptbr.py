@@ -130,6 +130,27 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
+# -------------------- FUNÇÃO PARA DETECTAR E BAIXAR MIRRORS/CDN --------------------
+def check_and_download_mirror(url):
+    # Extrai domínio e arquivo
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    filename = os.path.basename(parsed.path)
+
+    # Pede confirmação para baixar
+    print(f"\nUm Mirror/CDN foi encontrado no site, você quer baixar o que há neste suposto mirror {domain}/{filename}? (Y) Yes (N) No")
+    while True:
+        choice = input().strip().upper()
+        if choice == 'Y':
+            print(f"Baixando mirror: {url}")
+            path = download(url)
+            return path
+        elif choice == 'N':
+            print(f"Pulando mirror: {url}")
+            return None
+        else:
+            print("Digite 'Y' para sim ou 'N' para não.")
+
 # -------------------- DOWNLOAD E CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
@@ -152,13 +173,16 @@ def is_html(content):
     return content.strip().lower().startswith(b"<!doctype") or b"<html" in content.lower()
 
 def crawl(url):
-    if url in visited: return
+    if url in visited: 
+        return
     visited.add(url)
     saved = download(url)
-    if not saved: return
+    if not saved: 
+        return
 
     with open(saved, "rb") as f: content = f.read()
-    if not is_html(content): return
+    if not is_html(content): 
+        return
     soup = BeautifulSoup(content, "html.parser")
 
     if SHOW_HIDDEN_ELEMENTS:
@@ -172,8 +196,14 @@ def crawl(url):
             src = r.get(attr)
             if src:
                 full = urljoin(url, src)
-                if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
-                    crawl(full)
+                if is_valid_url(full):
+                    domain_main = urlparse(SITE_URL).netloc
+                    domain_full = urlparse(full).netloc
+                    if domain_full == domain_main:
+                        crawl(full)
+                    else:
+                        # Possível mirror ou CDN externo detectado
+                        check_and_download_mirror(full)
 
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
