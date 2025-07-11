@@ -1,4 +1,4 @@
-# Isso foi feito pelo chatgpt, como viu no README.md não foi feito por humanos, o unico texto humano é esse texto :D
+# Isso foi feito pelo chatgpt, como viu no README.md essa ferramenta foi feito por humanos, o unico texto humano é esse texto :D
 import os
 import json
 import hashlib
