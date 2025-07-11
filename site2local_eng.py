@@ -171,8 +171,15 @@ def crawl(url):
             src = r.get(attr)
             if src:
                 full = urljoin(url, src)
-                if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
-                    crawl(full)
+                if is_valid_url(full):
+                    if urlparse(full).netloc == urlparse(SITE_URL).netloc:
+                        crawl(full)
+                    else:
+                        # Mirror/CDN detected outside main domain
+                        print(f"\nMirror/CDN found at: {full}")
+                        ans = input(f"Do you want to download content from this mirror/CDN? (Y/N): ").strip().lower()
+                        if ans == 'y':
+                            crawl(full)
 
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
