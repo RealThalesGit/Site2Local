@@ -1,6 +1,4 @@
-# SITE2LOCAL v2.2.1 (English Version)
-# Full site mirroring with device detection, optional crawling, and access bypass
-
+# This was made by chatgpt as you see in README.md this tool wasnt made by humans, the only the human text here is this text :D
 import os
 import json
 import hashlib
@@ -13,23 +11,27 @@ from flask import Flask, request, Response, send_file
 from urllib.parse import urljoin, urlparse
 import sys
 
+# Increases the recursion limit to avoid errors on sites with many resources
 sys.setrecursionlimit(10000)
 
-# -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports all sites that use and dont use html and support sites that use php too!
-SITE_URL = "https://www.example.com"
-PORT = 8080 # change to 80 if you are on pc, and if you are with a rooted device too!, for non-rooted android you can let it 8080 anyways!
-FORCE_ACCESS_DENIED_BYPASS = False
-SCAN_FOR_HIDDEN_PATHS = False
-ENABLE_HIDDEN_ELEMENTS = False
-SHOW_HIDDEN_ELEMENTS = False
-ENABLE_CRAWLING = False
-HEADER_DEVICE = "mobile"  # Set this according to your device, mobile, tablet, desktop and even "auto" and "bots"
+# -------------------- CONFIGURATION --------------------
+MODE = "AUTO_MODE"  # Supports HTML and non-HTML sites, including PHP
+SITE_URL = "https://example.com"  # Make sure to start with "https://"
+PORT = 8080  # Local server port (can be 80, 8080, etc.)
+FORCE_ACCESS_DENIED_BYPASS = False  # Forces "Access Denied" bypass using alternate headers
+SCAN_FOR_HIDDEN_PATHS = True  # Enables scanning for hidden paths (e.g., /admin, /.git)
+ENABLE_HIDDEN_ELEMENTS = True  # Enables handling of hidden elements in HTML
+SHOW_HIDDEN_ELEMENTS = True  # Makes hidden elements visible and clickable
+ENABLE_CRAWLING = True  # Enables or disables automatic site crawling
+HEADER_DEVICE = "mobile"  # Set your device type: mobile, tablet, desktop, auto, or bot
 
 # -------------------- DEVICE DETECTION --------------------
 def detect_device():
+    # Return manually defined type if set
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
+
+    # Otherwise, detect automatically from User-Agent
     ua = request.headers.get("User-Agent", "").lower()
     if "android" in ua and "mobile" in ua: return "mobile"
     if "iphone" in ua or "ipad" in ua: return "mobile"
@@ -38,6 +40,7 @@ def detect_device():
     if "bot" in ua: return "bot"
     return "desktop"
 
+# -------------------- DEVICE-SPECIFIC HEADERS --------------------
 def get_headers_for_device(device):
     if device == "mobile":
         return {
@@ -60,7 +63,7 @@ def get_headers_for_device(device):
             "Accept-Encoding": "br, gzip"
         }
 
-# -------------------- PATHS --------------------
+# -------------------- LOCAL PATHS --------------------
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{device_type}")
@@ -68,10 +71,12 @@ SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{device_type}")
 
 EXT_HTML = {".html", ".htm"}
 EXT_STATIC = EXT_HTML | {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".json", ".webp"}
-visited = set()
+visited = set()  # Set of already visited URLs during crawling
 
+# Create Flask app instance
 app = Flask(__name__, static_folder=None)
 
+# -------------------- HELPER FUNCTIONS --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
@@ -105,6 +110,7 @@ def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
+    # Reveal hidden styles and add visual borders
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for el in soup.select("[hidden]"): del el['hidden']
@@ -123,6 +129,7 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
+# -------------------- DOWNLOAD AND CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
         print(f"[CACHE] {url}")
@@ -166,20 +173,23 @@ def crawl(url):
                 full = urljoin(url, src)
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
+
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
+
     if SCAN_FOR_HIDDEN_PATHS:
         for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
             try:
                 test_url = urljoin(SITE_URL + "/", test)
                 r = requests.get(test_url, headers={"Accept-Encoding": "br, gzip"})
                 if r.status_code == 200 and is_html(r.content):
-                    print(f"[HIDDEN FOUND] {test_url}")
+                    print(f"[FOUND HIDDEN] {test_url}")
                     crawl(test_url)
             except: continue
 
+# -------------------- FLASK ROUTING --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
@@ -216,16 +226,16 @@ def proxy(path):
     except Exception as e:
         return Response(f"Remote error: {e}", status=500)
 
-# -------------------- MAIN --------------------
+# -------------------- MAIN EXECUTION --------------------
 if __name__ == '__main__':
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"Crawling site: {SITE_URL} (mode: {MODE})")
+        print(f"Starting site crawl: {SITE_URL} (mode: {MODE})")
         crawl(SITE_URL)
     else:
         print("Crawling is disabled.")
-    print(f"SRC directory: {os.path.abspath(SITE_SRC)}")
-    print(f"POST data directory: {os.path.abspath(SITE_DATA)}")
-    print(f"Server running at http://127.0.0.1:{PORT}")
+    print(f"Files saved in: {os.path.abspath(SITE_SRC)}")
+    print(f"POSTs saved in: {os.path.abspath(SITE_DATA)}")
+    print(f"Server running at: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
