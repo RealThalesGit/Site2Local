@@ -1,6 +1,4 @@
-# SITE2LOCAL v2.2.1 (English Version)
-# Full site mirroring with device detection, optional crawling, and access bypass
-
+# Isso foi feito pelo chatgpt, como viu no README.md não foi feito por humanos, o unico texto humano é esse texto :D
 import os
 import json
 import hashlib
@@ -13,23 +11,27 @@ from flask import Flask, request, Response, send_file
 from urllib.parse import urljoin, urlparse
 import sys
 
+# Aumenta o limite de recursão para evitar erros em sites com muitos recursos
 sys.setrecursionlimit(10000)
 
-# -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports all sites that use and dont use html and support sites that use php too!
-SITE_URL = "https://www.example.com"
-PORT = 8080 # change to 80 if you are on pc, and if you are with a rooted device too!, for non-rooted android you can let it 8080 anyways!
-FORCE_ACCESS_DENIED_BYPASS = False
-SCAN_FOR_HIDDEN_PATHS = False
-ENABLE_HIDDEN_ELEMENTS = False
-SHOW_HIDDEN_ELEMENTS = False
-ENABLE_CRAWLING = False
-HEADER_DEVICE = "mobile"  # Set this according to your device, mobile, tablet, desktop and even "auto" and "bots"
+# -------------------- CONFIGURAÇÃO --------------------
+MODE = "AUTO_MODE"  # Suporta sites que usam e não usam HTML, e também há suporte a PHP
+SITE_URL = "https://example.com"  # Lembre-se de colocar "https://" no início
+PORT = 8080  # Porta do servidor local (pode ser 80, 8080, etc.)
+FORCE_ACCESS_DENIED_BYPASS = False  # Força bypass de erro "Access Denied" usando headers diferentes
+SCAN_FOR_HIDDEN_PATHS = True  # Ativa varredura por caminhos ocultos (ex: /admin, /.git)
+ENABLE_HIDDEN_ELEMENTS = True  # Ativa tratamento de elementos ocultos no HTML
+SHOW_HIDDEN_ELEMENTS = True  # Mostra elementos ocultos e os torna clicáveis
+ENABLE_CRAWLING = True  # Habilita ou desabilita o crawling automático do site
+HEADER_DEVICE = "mobile"  # Define o tipo de dispositivo: mobile, tablet, desktop, auto ou bot
 
-# -------------------- DEVICE DETECTION --------------------
+# -------------------- DETECÇÃO DE DISPOSITIVO --------------------
 def detect_device():
+    # Se o tipo estiver definido manualmente, retorna ele
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
+    
+    # Caso contrário, detecta automaticamente pelo User-Agent
     ua = request.headers.get("User-Agent", "").lower()
     if "android" in ua and "mobile" in ua: return "mobile"
     if "iphone" in ua or "ipad" in ua: return "mobile"
@@ -38,6 +40,7 @@ def detect_device():
     if "bot" in ua: return "bot"
     return "desktop"
 
+# -------------------- OBTÉM HEADERS PARA CADA DISPOSITIVO --------------------
 def get_headers_for_device(device):
     if device == "mobile":
         return {
@@ -60,7 +63,8 @@ def get_headers_for_device(device):
             "Accept-Encoding": "br, gzip"
         }
 
-# -------------------- PATHS --------------------
+# -------------------- CAMINHOS LOCAIS --------------------
+# Define o tipo de dispositivo para nomear as pastas de forma única
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{device_type}")
@@ -68,10 +72,12 @@ SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{device_type}")
 
 EXT_HTML = {".html", ".htm"}
 EXT_STATIC = EXT_HTML | {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".json", ".webp"}
-visited = set()
+visited = set()  # Conjunto de URLs já visitadas no crawling
 
+# Cria a instância do servidor Flask
 app = Flask(__name__, static_folder=None)
 
+# -------------------- FUNÇÕES AUXILIARES --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
@@ -105,6 +111,7 @@ def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
+    # Altera estilos ocultos e adiciona bordas visuais
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for el in soup.select("[hidden]"): del el['hidden']
@@ -123,6 +130,7 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
+# -------------------- DOWNLOAD E CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
         print(f"[CACHE] {url}")
@@ -137,7 +145,7 @@ def download(url):
         content = try_decompress(r)
         return save_content(url, content)
     except Exception as e:
-        print(f"[ERROR] {url}: {e}")
+        print(f"[ERRO] {url}: {e}")
         return None
 
 def is_html(content):
@@ -166,20 +174,23 @@ def crawl(url):
                 full = urljoin(url, src)
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
+
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
+
     if SCAN_FOR_HIDDEN_PATHS:
         for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
             try:
                 test_url = urljoin(SITE_URL + "/", test)
                 r = requests.get(test_url, headers={"Accept-Encoding": "br, gzip"})
                 if r.status_code == 200 and is_html(r.content):
-                    print(f"[HIDDEN FOUND] {test_url}")
+                    print(f"[OCULTO] {test_url}")
                     crawl(test_url)
             except: continue
 
+# -------------------- ROTEAMENTO FLASK --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
@@ -198,7 +209,7 @@ def proxy(path):
             r = requests.post(target, data=data, headers=request.headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
-            return Response(f"Error: {e}", status=502)
+            return Response(f"Erro: {e}", status=502)
 
     if os.path.exists(local):
         mime = mimetypes.guess_type(local)[0] or "application/octet-stream"
@@ -214,18 +225,18 @@ def proxy(path):
             f.write(content)
         return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type"))
     except Exception as e:
-        return Response(f"Remote error: {e}", status=500)
+        return Response(f"Erro remoto: {e}", status=500)
 
-# -------------------- MAIN --------------------
+# -------------------- EXECUÇÃO PRINCIPAL --------------------
 if __name__ == '__main__':
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"Crawling site: {SITE_URL} (mode: {MODE})")
+        print(f"Iniciando crawling do site: {SITE_URL} (modo: {MODE})")
         crawl(SITE_URL)
     else:
-        print("Crawling is disabled.")
-    print(f"SRC directory: {os.path.abspath(SITE_SRC)}")
-    print(f"POST data directory: {os.path.abspath(SITE_DATA)}")
-    print(f"Server running at http://127.0.0.1:{PORT}")
+        print("Crawling desativado.")
+    print(f"Arquivos salvos em: {os.path.abspath(SITE_SRC)}")
+    print(f"POSTs salvos em: {os.path.abspath(SITE_DATA)}")
+    print(f"Servidor rodando em: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
