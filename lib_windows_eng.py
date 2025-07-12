@@ -1,5 +1,4 @@
 import os
-import sys
 
 def ENABLE_WIN_LIB():
     """
@@ -11,12 +10,9 @@ def ENABLE_WIN_LIB():
         return
 
     try:
-        # Enables support for long paths on Windows 10+
         import ctypes
         kernel32 = ctypes.windll.kernel32
-        # This is a symbolic call; real enabling may require policy or registry changes
         kernel32.SetDllDirectoryW.restype = ctypes.c_bool
-
         print("[INFO] Windows lib enabled: long path support (if OS allows).")
     except Exception as e:
         print(f"[WARN] Error enabling long path support: {e}")
@@ -30,7 +26,6 @@ def safe_path(path):
     if os.name != "nt":
         return path  # On other OSes, return the original path
 
-    # Remove invalid characters in Windows file names
     invalid_chars = '<>:"|?*'
     cleaned_parts = []
     for part in path.split(os.sep):
@@ -39,8 +34,19 @@ def safe_path(path):
         cleaned_parts.append(part)
     cleaned_path = os.sep.join(cleaned_parts)
 
-    # Add \\?\ prefix for long paths if not already present
     if not cleaned_path.startswith(r"\\?\\"):
-        cleaned_path = r"\\?\\" + os.path.abspath(cleaned_path)
+        if not os.path.isabs(cleaned_path):
+            cleaned_path = os.path.abspath(cleaned_path)
+        cleaned_path = r"\\?\\" + cleaned_path
 
     return cleaned_path
+
+def remove_long_path_prefix(path):
+    """
+    Removes the \\?\ prefix from a Windows path for libraries that do not support it.
+    """
+    if os.name != "nt":
+        return path
+    if path.startswith(r"\\?\\"):
+        return path[4:]
+    return path
