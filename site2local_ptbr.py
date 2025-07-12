@@ -25,6 +25,9 @@ SHOW_HIDDEN_ELEMENTS = True  # Mostra elementos ocultos e os torna clicáveis
 ENABLE_CRAWLING = True  # Habilita ou desabilita o crawling automático do site
 HEADER_DEVICE = "mobile"  # Define o tipo de dispositivo: mobile, tablet, desktop, auto ou bot
 
+# Variável para aceitar todos os mirrors após confirmação 'A'
+ACCEPT_ALL_MIRRORS_REQUEST = False
+
 # -------------------- DETECÇÃO DE DISPOSITIVO --------------------
 def detect_device():
     # Se o tipo estiver definido manualmente, retorna ele
@@ -44,12 +47,12 @@ def detect_device():
 def get_headers_for_device(device):
     if device == "mobile":
         return {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
     elif device == "tablet":
         return {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
     elif device == "bot":
@@ -59,12 +62,11 @@ def get_headers_for_device(device):
         }
     else:
         return {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
 
 # -------------------- CAMINHOS LOCAIS --------------------
-# Define o tipo de dispositivo para nomear as pastas de forma única
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{device_type}")
@@ -132,24 +134,31 @@ def modify_html_for_visibility(soup):
 
 # -------------------- FUNÇÃO PARA DETECTAR E BAIXAR MIRRORS/CDN --------------------
 def check_and_download_mirror(url):
-    # Extrai domínio e arquivo
+    global ACCEPT_ALL_MIRRORS_REQUEST
     parsed = urlparse(url)
     domain = parsed.netloc
     filename = os.path.basename(parsed.path)
 
-    # Pede confirmação para baixar
-    print(f"\nUm Mirror/CDN foi encontrado no site, você quer baixar o que há neste suposto mirror {domain}/{filename}? (Y) Yes (N) No")
+    print(f"\nUm Mirror/CDN foi encontrado no site, deseja baixar o conteúdo deste mirror {domain}/{filename}?")
+    print("Digite (Y) para sim, (N) para não ou (A) para aceitar todos os mirrors daqui pra frente automaticamente.")
+
     while True:
         choice = input().strip().upper()
         if choice == 'Y':
             print(f"Baixando mirror: {url}")
-            path = download(url)
-            return path
+            return crawl(url)
         elif choice == 'N':
             print(f"Pulando mirror: {url}")
             return None
+        elif choice == 'A':
+            print("Aceitando todos os mirrors automaticamente a partir de agora.")
+            ACCEPT_ALL_MIRRORS_REQUEST = True
+            return crawl(url)
+        elif ACCEPT_ALL_MIRRORS_REQUEST:
+            print(f"Automaticamente aceitando mirror: {url}")
+            return crawl(url)
         else:
-            print("Digite 'Y' para sim ou 'N' para não.")
+            print("Digite 'Y' para sim, 'N' para não ou 'A' para aceitar todos.")
 
 # -------------------- DOWNLOAD E CRAWLING --------------------
 def download(url):
@@ -203,7 +212,11 @@ def crawl(url):
                         crawl(full)
                     else:
                         # Possível mirror ou CDN externo detectado
-                        check_and_download_mirror(full)
+                        if ACCEPT_ALL_MIRRORS_REQUEST:
+                            print(f"Automaticamente aceitando mirror: {full}")
+                            crawl(full)
+                        else:
+                            check_and_download_mirror(full)
 
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
