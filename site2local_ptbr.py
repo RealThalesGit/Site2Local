@@ -1,6 +1,4 @@
-# SITE2LOCAL v2.2.0 revamp
-# Espelhamento com suporte a dispositivos, crawling opcional, bypass e mirrors
-
+# Chatgpt fez revamp
 import os
 import json
 import hashlib
