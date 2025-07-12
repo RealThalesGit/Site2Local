@@ -25,6 +25,9 @@ SHOW_HIDDEN_ELEMENTS = True  # Makes hidden elements visible and clickable
 ENABLE_CRAWLING = True  # Enables or disables automatic site crawling
 HEADER_DEVICE = "mobile"  # Set your device type: mobile, tablet, desktop, auto, or bot
 
+# Variable to accept all mirrors automatically after confirmation 'A'
+ACCEPT_ALL_MIRRORS_REQUEST = False
+
 # -------------------- DEVICE DETECTION --------------------
 def detect_device():
     # Return manually defined type if set
@@ -129,6 +132,34 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
+# -------------------- MIRROR/CDN DETECTION AND DOWNLOAD --------------------
+def check_and_download_mirror(url):
+    global ACCEPT_ALL_MIRRORS_REQUEST
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    filename = os.path.basename(parsed.path)
+
+    print(f"\nMirror/CDN detected on the site, do you want to download the content from this mirror {domain}/{filename}?")
+    print("Type (Y) for yes, (N) for no, or (A) to accept all mirrors automatically from now on.")
+
+    while True:
+        choice = input().strip().upper()
+        if choice == 'Y':
+            print(f"Downloading mirror: {url}")
+            return crawl(url)
+        elif choice == 'N':
+            print(f"Skipping mirror: {url}")
+            return None
+        elif choice == 'A':
+            print("Accepting all mirrors automatically from now on.")
+            ACCEPT_ALL_MIRRORS_REQUEST = True
+            return crawl(url)
+        elif ACCEPT_ALL_MIRRORS_REQUEST:
+            print(f"Automatically accepting mirror: {url}")
+            return crawl(url)
+        else:
+            print("Please type 'Y' for yes, 'N' for no, or 'A' to accept all.")
+
 # -------------------- DOWNLOAD AND CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
@@ -172,14 +203,17 @@ def crawl(url):
             if src:
                 full = urljoin(url, src)
                 if is_valid_url(full):
-                    if urlparse(full).netloc == urlparse(SITE_URL).netloc:
+                    domain_main = urlparse(SITE_URL).netloc
+                    domain_full = urlparse(full).netloc
+                    if domain_full == domain_main:
                         crawl(full)
                     else:
-                        # Mirror/CDN detected outside main domain
-                        print(f"\nMirror/CDN found at: {full}")
-                        ans = input(f"Do you want to download content from this mirror/CDN? (Y/N): ").strip().lower()
-                        if ans == 'y':
+                        # Possible mirror or external CDN detected
+                        if ACCEPT_ALL_MIRRORS_REQUEST:
+                            print(f"Automatically accepting mirror: {full}")
                             crawl(full)
+                        else:
+                            check_and_download_mirror(full)
 
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
