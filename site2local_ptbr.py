@@ -16,7 +16,7 @@ sys.setrecursionlimit(10000)
 
 # -------------------- CONFIGURAÇÃO --------------------
 MODE = "AUTO_MODE"  # Suporta sites que usam e não usam HTML, e também há suporte a PHP
-SITE_URL = "https://example.com"  # Lembre-se de colocar "https://" no início
+SITE_URL = "https://google.com.br"  # Lembre-se de colocar "https://" no início
 PORT = 8080  # Porta do servidor local (pode ser 80, 8080, etc.)
 FORCE_ACCESS_DENIED_BYPASS = False  # Força bypass de erro "Access Denied" usando headers diferentes
 SCAN_FOR_HIDDEN_PATHS = True  # Ativa varredura por caminhos ocultos (ex: /admin, /.git)
@@ -26,7 +26,7 @@ ENABLE_CRAWLING = True  # Habilita ou desabilita o crawling automático do site
 HEADER_DEVICE = "mobile"  # Define o tipo de dispositivo: mobile, tablet, desktop, auto ou bot
 
 # Variável para aceitar todos os mirrors após confirmação 'A'
-ACCEPT_ALL_MIRRORS_REQUEST = False
+ACCEPT_ALL_MIRRORS_REQUEST = True
 
 # -------------------- DETECÇÃO DE DISPOSITIVO --------------------
 def detect_device():
