@@ -14,10 +14,9 @@ def ENABLE_WIN_LIB():
         # Habilita suporte a caminhos longos no Windows 10+
         import ctypes
         kernel32 = ctypes.windll.kernel32
-        # Ativa suporte a paths longos no processo atual
+        # Apenas uma chamada simbólica para ilustrar, ativação real depende de política/registro
         kernel32.SetDllDirectoryW.restype = ctypes.c_bool
 
-        # Pode ser necessário habilitar via policy ou registro, aqui só avisa
         print("[INFO] Lib Windows ativada: suporte a caminhos longos (se o SO permitir).")
     except Exception as e:
         print(f"[WARN] Erro ao ativar suporte a caminhos longos: {e}")
@@ -29,9 +28,9 @@ def safe_path(path):
     e limpando caracteres inválidos no nome dos arquivos.
     """
     if os.name != "nt":
-        return path  # Em outros SOs não altera
+        return path  # Em outros sistemas operacionais, retorna o caminho original
 
-    # Remove caracteres inválidos em nomes Windows
+    # Remove caracteres inválidos em nomes do Windows
     invalid_chars = '<>:"|?*'
     cleaned_parts = []
     for part in path.split(os.sep):
