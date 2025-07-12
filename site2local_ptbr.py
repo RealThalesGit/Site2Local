@@ -14,7 +14,7 @@ import platform
 # Ativa correções para Windows (caminhos longos, nomes inválidos)
 try:
     import lib_windows_ptbr
-    lib_windows.ENABLE_WIN_LIB()
+    lib_windows_ptbr.ENABLE_WIN_LIB()
 except Exception as e:
     print(f"[AVISO] lib_windows não pôde ser ativado: {e}")
 
@@ -86,7 +86,7 @@ def is_valid_url(url):
     return bool(p.netloc) and bool(p.scheme)
 
 def local_path(url):
-    from lib_windows import safe_path
+    from lib_windows_ptbr import safe_path
     p = urlparse(url)
     path = p.path
     if path.endswith("/"): path += "index.html"
