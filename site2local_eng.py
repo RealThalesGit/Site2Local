@@ -1,6 +1,4 @@
-# SITE2LOCAL v2.2.0 revamp
-# Mirroring with device support, optional crawling, bypass, and mirrors
-
+# Ty chatgpt!
 import os
 import json
 import hashlib
