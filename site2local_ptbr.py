@@ -291,4 +291,18 @@ def proxy(path):
             headers["Cookie"] = "security_bypass=true"
         r = requests.get(target, headers=headers)
         r.raise_for_status()
-       
+        os.makedirs(os.path.dirname(local_interno), exist_ok=True)
+        with open(local_interno, "wb") as f:
+            f.write(r.content)
+        mime = mimetypes.guess_type(local_flask)[0] or "application/octet-stream"
+        return send_file(local_flask, mimetype=mime, conditional=True)
+    except Exception as e:
+        return Response(f"Erro no proxy: {e}", status=502)
+
+if __name__ == "__main__":
+    if not os.path.exists(PASTA_SITE_SRC):
+        os.makedirs(PASTA_SITE_SRC)
+    if HABILITAR_CRAWLING:
+        crawl(SITE_URL)
+    print(f"Servidor em execução: http://127.0.0.1:{PORTA}")
+    app.run(host="0.0.0.0", port=PORTA)
