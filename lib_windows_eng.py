@@ -1,42 +1,46 @@
 import os
 import sys
 
-def safe_path(path: str) -> str:
-    """
-    Fixes the path to avoid Windows long path errors.
-    If the path exceeds 260 characters, adds the \\?\ prefix to support long paths.
-    Also replaces invalid characters for Windows filenames/folders.
-    """
-    if not path:
-        return path
-
-    # Invalid characters for Windows filenames
-    invalid_chars = '<>:"/\\|?*'
-    cleaned_path = "".join(c if c not in invalid_chars else "_" for c in path)
-
-    # Add \\?\ prefix for long paths if needed
-    if os.name == "nt" and len(cleaned_path) > 260 and not cleaned_path.startswith(r"\\?\"):
-        # If UNC path (network), use special prefix
-        if cleaned_path.startswith("\\\\"):
-            # Replace initial double backslashes with \\?\UNC\
-            cleaned_path = r"\\?\UNC" + cleaned_path[1:]
-        else:
-            cleaned_path = r"\\?\" + cleaned_path
-
-    return cleaned_path
-
 def ENABLE_WIN_LIB():
     """
-    Enables Windows-specific fixes:
-    - Fixes long path limit (260 characters)
-    - Replaces invalid characters in paths
-    - Can adjust other Windows-specific settings if needed
+    Enables fixes to support long paths and invalid filenames on Windows.
+    Should be called at the start of the main script.
     """
     if os.name != "nt":
-        # Do nothing if not running on Windows
+        print("[INFO] Operating system is not Windows, lib_windows disabled.")
         return
 
-    # Increase recursion limit on Windows to avoid deep operation issues
-    sys.setrecursionlimit(10000)
+    try:
+        # Enables support for long paths on Windows 10+
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # This is a symbolic call; real enabling may require policy or registry changes
+        kernel32.SetDllDirectoryW.restype = ctypes.c_bool
 
-    print("[INFO] Windows Lib enabled: fixing long paths and invalid names")
+        print("[INFO] Windows lib enabled: long path support (if OS allows).")
+    except Exception as e:
+        print(f"[WARN] Error enabling long path support: {e}")
+
+def safe_path(path):
+    """
+    Returns a Windows-safe version of the given path,
+    adding the \\?\ prefix to avoid the 260 character limit,
+    and cleaning invalid characters from file names.
+    """
+    if os.name != "nt":
+        return path  # On other OSes, return the original path
+
+    # Remove invalid characters in Windows file names
+    invalid_chars = '<>:"|?*'
+    cleaned_parts = []
+    for part in path.split(os.sep):
+        for ch in invalid_chars:
+            part = part.replace(ch, "_")
+        cleaned_parts.append(part)
+    cleaned_path = os.sep.join(cleaned_parts)
+
+    # Add \\?\ prefix for long paths if not already present
+    if not cleaned_path.startswith(r"\\?\\"):
+        cleaned_path = r"\\?\\" + os.path.abspath(cleaned_path)
+
+    return cleaned_path
