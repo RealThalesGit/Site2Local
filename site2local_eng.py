@@ -24,10 +24,10 @@ sys.setrecursionlimit(10000)
 MODE = "AUTO_MODE"
 SITE_URL = "https://discord.com"
 PORT = 80
-FORCE_ACCESS_DENIED_BYPASS = True
-SCAN_FOR_HIDDEN_PATHS = True
-ENABLE_HIDDEN_ELEMENTS = True
-SHOW_HIDDEN_ELEMENTS = True
+FORCE_ACCESS_DENIED_BYPASS = False
+SCAN_FOR_HIDDEN_PATHS = False
+ENABLE_HIDDEN_ELEMENTS = False
+SHOW_HIDDEN_ELEMENTS = False
 ENABLE_CRAWLING = True
 HEADER_DEVICE = "desktop"
 ACCEPT_ALL_MIRRORS_REQUEST = True
@@ -131,7 +131,7 @@ def check_and_download_mirror(url):
     if ACCEPT_ALL_MIRRORS_REQUEST:
         return crawl(url)
     print(f"\n[Mirror detected] {url}")
-    choice = input("Download mirror? (Y)es / (N)o / (A)ccept all: ").strip().upper()
+    choice = input("Download mirror? (Y)Yes / (N)No / (A)Accept all: ").strip().upper()
     if choice == "Y":
         return crawl(url)
     elif choice == "A":
