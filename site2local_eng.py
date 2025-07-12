@@ -16,7 +16,7 @@ sys.setrecursionlimit(10000)
 
 # -------------------- CONFIGURATION --------------------
 MODE = "AUTO_MODE"  # Supports HTML and non-HTML sites, including PHP
-SITE_URL = "https://example.com"  # Make sure to start with "https://"
+SITE_URL = "https://youtube.com"  # Make sure to start with "https://"
 PORT = 8080  # Local server port (can be 80, 8080, etc.)
 FORCE_ACCESS_DENIED_BYPASS = False  # Forces "Access Denied" bypass using alternate headers
 SCAN_FOR_HIDDEN_PATHS = True  # Enables scanning for hidden paths (e.g., /admin, /.git)
@@ -24,17 +24,12 @@ ENABLE_HIDDEN_ELEMENTS = True  # Enables handling of hidden elements in HTML
 SHOW_HIDDEN_ELEMENTS = True  # Makes hidden elements visible and clickable
 ENABLE_CRAWLING = True  # Enables or disables automatic site crawling
 HEADER_DEVICE = "mobile"  # Set your device type: mobile, tablet, desktop, auto, or bot
-
-# Variable to accept all mirrors automatically after confirmation 'A'
-ACCEPT_ALL_MIRRORS_REQUEST = False
+ACCEPT_ALL_MIRRORS_REQUEST = True  # Automatically accept all mirrors/CDNs
 
 # -------------------- DEVICE DETECTION --------------------
 def detect_device():
-    # Return manually defined type if set
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
-
-    # Otherwise, detect automatically from User-Agent
     ua = request.headers.get("User-Agent", "").lower()
     if "android" in ua and "mobile" in ua: return "mobile"
     if "iphone" in ua or "ipad" in ua: return "mobile"
@@ -74,9 +69,8 @@ SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{device_type}")
 
 EXT_HTML = {".html", ".htm"}
 EXT_STATIC = EXT_HTML | {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".json", ".webp"}
-visited = set()  # Set of already visited URLs during crawling
+visited = set()
 
-# Create Flask app instance
 app = Flask(__name__, static_folder=None)
 
 # -------------------- HELPER FUNCTIONS --------------------
@@ -113,7 +107,6 @@ def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
-    # Reveal hidden styles and add visual borders
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for el in soup.select("[hidden]"): del el['hidden']
@@ -132,40 +125,27 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
-# -------------------- MIRROR/CDN DETECTION AND DOWNLOAD --------------------
+# -------------------- MIRROR HANDLING --------------------
 def check_and_download_mirror(url):
-    global ACCEPT_ALL_MIRRORS_REQUEST
     parsed = urlparse(url)
     domain = parsed.netloc
     filename = os.path.basename(parsed.path)
-
-    print(f"\nMirror/CDN detected on the site, do you want to download the content from this mirror {domain}/{filename}?")
-    print("Type (Y) for yes, (N) for no, or (A) to accept all mirrors automatically from now on.")
-
+    print(f"\nMirror/CDN found at: {domain}/{filename}")
     while True:
-        choice = input().strip().upper()
-        if choice == 'Y':
-            print(f"Downloading mirror: {url}")
+        choice = input("Do you want to download this mirror/CDN? (Y/N): ").strip().lower()
+        if choice == 'y':
             return crawl(url)
-        elif choice == 'N':
-            print(f"Skipping mirror: {url}")
+        elif choice == 'n':
+            print("Skipping mirror.")
             return None
-        elif choice == 'A':
-            print("Accepting all mirrors automatically from now on.")
-            ACCEPT_ALL_MIRRORS_REQUEST = True
-            return crawl(url)
-        elif ACCEPT_ALL_MIRRORS_REQUEST:
-            print(f"Automatically accepting mirror: {url}")
-            return crawl(url)
         else:
-            print("Please type 'Y' for yes, 'N' for no, or 'A' to accept all.")
+            print("Please type 'Y' or 'N'.")
 
 # -------------------- DOWNLOAD AND CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
         print(f"[CACHE] {url}")
         return local_path(url)
-
     device = detect_device()
     headers = get_headers_for_device(device)
     try:
@@ -186,16 +166,13 @@ def crawl(url):
     visited.add(url)
     saved = download(url)
     if not saved: return
-
     with open(saved, "rb") as f: content = f.read()
     if not is_html(content): return
     soup = BeautifulSoup(content, "html.parser")
-
     if SHOW_HIDDEN_ELEMENTS:
         modify_html_for_visibility(soup)
         with open(saved, "w", encoding="utf-8") as f:
             f.write(str(soup))
-
     tags = {"script": "src", "link": "href", "img": "src", "source": "src", "video": "src", "audio": "src"}
     for tag, attr in tags.items():
         for r in soup.find_all(tag):
@@ -205,21 +182,18 @@ def crawl(url):
                 if is_valid_url(full):
                     domain_main = urlparse(SITE_URL).netloc
                     domain_full = urlparse(full).netloc
-                    if domain_full == domain_main:
+                    if domain_main in domain_full or domain_full.endswith("." + domain_main):
                         crawl(full)
                     else:
-                        # Possible mirror or external CDN detected
                         if ACCEPT_ALL_MIRRORS_REQUEST:
                             print(f"Automatically accepting mirror: {full}")
                             crawl(full)
                         else:
                             check_and_download_mirror(full)
-
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
-
     if SCAN_FOR_HIDDEN_PATHS:
         for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
             try:
@@ -238,7 +212,6 @@ def proxy(path):
     if request.query_string:
         target += "?" + request.query_string.decode()
     local = local_path(target)
-
     if request.method == "POST":
         data = request.get_data()
         os.makedirs(SITE_DATA, exist_ok=True)
@@ -250,11 +223,9 @@ def proxy(path):
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"Error: {e}", status=502)
-
     if os.path.exists(local):
         mime = mimetypes.guess_type(local)[0] or "application/octet-stream"
         return send_file(local, mimetype=mime, conditional=True)
-
     try:
         headers = get_headers_for_device(detect_device())
         r = requests.get(target, headers=headers)
