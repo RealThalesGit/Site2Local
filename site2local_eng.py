@@ -1,3 +1,7 @@
+# -------------------- SITE2LOCAL v2.3 --------------------
+# Smart mirroring with automatic HTTP/HTTPS fallback
+# Espelhamento inteligente com fallback automático HTTP/HTTPS
+
 import os
 import json
 import hashlib
@@ -13,47 +17,103 @@ import sys
 sys.setrecursionlimit(10000)
 
 # -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports sites using or not using HTML and also supports PHP
-
-# Flags to control HTTP/HTTPS scheme
-USE_HTTP = False
-USE_HTTPS = True
-NO_HTTP_AND_HTTPS = False
-
-RAW_SITE_URL = "web.whatsapp.com"  # Raw domain, without http(s)://
+MODE = "AUTO_MODE"  # Supports HTML and PHP or pure domain sites
+# Suporta sites com/sem HTML, com PHP / Supports HTML and PHP or pure domain sites
+RAW_SITE_URL = "connect.nulls.gg"  # Pure domain without scheme
+# Domínio puro, sem esquema / Pure domain without scheme
 PORT = 8080
+ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
 SCAN_FOR_HIDDEN_PATHS = True
 ENABLE_HIDDEN_ELEMENTS = True
 SHOW_HIDDEN_ELEMENTS = True
-ENABLE_CRAWLING = True
-HEADER_DEVICE = "linux"  # mobile, desktop, tablet, linux, bot, auto
+HEADER_DEVICE = "mobile"  # mobile, desktop, tablet, linux, bot, auto
 ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
 
+SCHEME_CACHE_FILE = "scheme_cache.json"  # File to cache preferred scheme
+# Arquivo para armazenar esquema preferido / File to cache preferred scheme
+
 # -------------------- URL FUNCTIONS --------------------
-def process_url(url: str) -> str:
-    """Adjusts the URL according to the USE_HTTP, USE_HTTPS and NO_HTTP_AND_HTTPS flags."""
-    if NO_HTTP_AND_HTTPS:
-        if url.startswith("http://"):
-            return url[len("http://"):]
-        if url.startswith("https://"):
-            return url[len("https://"):]
-        return url
-    
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        if USE_HTTPS:
-            return "https://" + url
-        elif USE_HTTP:
-            return "http://" + url
-        else:
-            return url
-    return url
+def load_cached_scheme(domain):
+    if not os.path.exists(SCHEME_CACHE_FILE):
+        return None
+    try:
+        with open(SCHEME_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+            return cache.get(domain)
+    except Exception:
+        return None
 
-SITE_URL = process_url(RAW_SITE_URL)
+def save_cached_scheme(domain, scheme):
+    cache = {}
+    if os.path.exists(SCHEME_CACHE_FILE):
+        try:
+            with open(SCHEME_CACHE_FILE, "r") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+    cache[domain] = scheme
+    with open(SCHEME_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
 
-# -------------------- DEVICE --------------------
+def resolve_url(base_url):
+    """
+    Tries HTTPS then HTTP, returns full URL with scheme.
+    Saves preferred scheme in cache for future calls.
+
+    Tenta HTTPS e HTTP, retorna URL completa com esquema.
+    Salva esquema em cache para acelerar futuras chamadas.
+    """
+    cached_scheme = load_cached_scheme(base_url)
+    schemes_to_try = [cached_scheme] if cached_scheme else ["https", "http"]
+    # Avoid None in list / Evita None na lista
+    schemes_to_try = [s for s in schemes_to_try if s]
+
+    for scheme in schemes_to_try:
+        test_url = f"{scheme}://{base_url}"
+        try:
+            r = requests.head(test_url, timeout=5)
+            if r.status_code < 400:
+                print(f"[OK] Using {scheme.upper()}")
+                print(f"[OK] Usando {scheme.upper()}")
+                save_cached_scheme(base_url, scheme)
+                return test_url
+            else:
+                print(f"[FAIL] {test_url}: {r.status_code}")
+        except Exception:
+            print(f"[ERROR] {scheme.upper()} failed, trying fallback...")
+            print(f"[ERRO] {scheme.upper()} falhou, tentando fallback...")
+
+    # If cached scheme failed, try alternative scheme
+    if cached_scheme:
+        alt_scheme = "https" if cached_scheme == "http" else "http"
+        test_url = f"{alt_scheme}://{base_url}"
+        try:
+            r = requests.head(test_url, timeout=5)
+            if r.status_code < 400:
+                print(f"[OK] Using {alt_scheme.upper()} (fallback)")
+                print(f"[OK] Usando {alt_scheme.upper()} (fallback)")
+                save_cached_scheme(base_url, alt_scheme)
+                return test_url
+            else:
+                print(f"[FAIL] {test_url}: {r.status_code}")
+        except Exception:
+            print(f"[ERROR] {alt_scheme.upper()} failed (fallback).")
+            print(f"[ERRO] {alt_scheme.upper()} falhou (fallback).")
+
+    print("[ERROR] Both schemes failed, cannot proceed.")
+    print("[ERRO] Ambos os esquemas falharam, não pode prosseguir.")
+    return None
+
+# Resolve initial URL
+SITE_URL = resolve_url(RAW_SITE_URL)
+if not SITE_URL:
+    print("Could not resolve valid scheme for domain.")
+    print("Não foi possível determinar esquema válido para domínio.")
+    exit(1)
+
+# -------------------- DEVICE DETECTION --------------------
 def detect_device():
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
@@ -74,7 +134,7 @@ def detect_device():
 
 def get_headers_for_device(device):
     common_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Encoding": "br, gzip, deflate",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
@@ -87,7 +147,6 @@ def get_headers_for_device(device):
         "Sec-Fetch-User": "?1",
         "DNT": "1"
     }
-
     user_agents = {
         "mobile": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
         "tablet": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
@@ -95,7 +154,6 @@ def get_headers_for_device(device):
         "desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
         "linux": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
     }
-
     headers = common_headers.copy()
     headers["User-Agent"] = user_agents.get(device, user_agents["desktop"])
     return headers
@@ -108,8 +166,8 @@ SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{device_type}")
 
 EXT_HTML = {".html", ".htm"}
 EXT_STATIC = EXT_HTML | {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".json", ".webp"}
-visited = set()
 
+visited = set()
 app = Flask(__name__, static_folder=None)
 
 # -------------------- DOWNLOAD AND CACHE FUNCTIONS --------------------
@@ -124,7 +182,7 @@ def local_path(url):
         path += "index.html"
     if not os.path.splitext(path)[1]:
         path = os.path.join(path, "index.html")
-    # Save in a folder separated by domain (p.netloc)
+    # Save in domain-specific folder
     return os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
 
 def save_content(url, content):
@@ -153,7 +211,7 @@ def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
-    # Makes hidden elements visible with highlighted style
+    # Make hidden elements visible with highlight style
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for el in soup.select("[hidden]"):
@@ -222,7 +280,7 @@ def crawl(url):
     if url in visited:
         return
     visited.add(url)
-    mirrors = []  # Here you can put logic to detect real mirrors
+    mirrors = []  # You can add logic here to detect real mirrors
 
     saved = download(url, mirrors=mirrors)
     if not saved:
@@ -240,7 +298,7 @@ def crawl(url):
         with open(saved, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
-    # Search for resources to download
+    # Find resources to download
     tags = {"script": "src", "link": "href", "img": "src", "source": "src", "video": "src", "audio": "src"}
     for tag, attr in tags.items():
         for r in soup.find_all(tag):
@@ -250,7 +308,7 @@ def crawl(url):
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
 
-    # Search for links to crawl
+    # Find links to crawl
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
@@ -268,13 +326,14 @@ def crawl(url):
             except Exception:
                 pass
 
-# -------------------- FLASK ROUTE --------------------
+# -------------------- FLASK ROUTES --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
     target = urljoin(SITE_URL + "/", path)
     if request.query_string:
         target += "?" + request.query_string.decode()
+
     local = local_path(target)
 
     if request.method == "POST":
@@ -284,7 +343,6 @@ def proxy(path):
         with open(os.path.join(SITE_DATA, h + ".json"), "wb") as f:
             f.write(data)
         try:
-            # Use original POST request headers
             headers = dict(request.headers)
             r = requests.post(target, data=data, headers=headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
