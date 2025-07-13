@@ -14,9 +14,9 @@ import sys
 sys.setrecursionlimit(10000)
 
 # -------------------- CONFIGURAÇÕES --------------------
-MODE = "AUTO_MODE"  # AUTO_MODE, HTML_MODE, PHP_MODE, NOHTML_MODE
-RAW_SITE_URL = "web.whatsapp.com"
-PORT = 80
+MODE = "AUTO_MODE"  # AUTO_MODE
+RAW_SITE_URL = "example"
+PORT = 8080
 ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
 SCAN_FOR_HIDDEN_PATHS = True
