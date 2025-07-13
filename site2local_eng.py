@@ -1,4 +1,5 @@
-# Love you chatgpt!
+# Love you ChatGPT
+# Thanks for helping me through every tough moment with debugging, logic, translations, and creativity!
 import os
 import json
 import hashlib
