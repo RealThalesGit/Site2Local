@@ -17,13 +17,13 @@ sys.setrecursionlimit(10000)
 
 # -------------------- CONFIG --------------------
 MODE = "AUTO_MODE"  # Supports HTML and PHP or pure domain sites
-RAW_SITE_URL = "connect.nulls.gg"  # Pure domain without scheme
+RAW_SITE_URL = "google.cat"  # Pure domain without scheme (you dont need to place http or https, it already detect)
 PORT = 8080
 ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
-SCAN_FOR_HIDDEN_PATHS = True
-ENABLE_HIDDEN_ELEMENTS = True
-SHOW_HIDDEN_ELEMENTS = True
+SCAN_FOR_HIDDEN_PATHS = False
+ENABLE_HIDDEN_ELEMENTS = False
+SHOW_HIDDEN_ELEMENTS = False
 HEADER_DEVICE = "mobile"  # mobile, desktop, tablet, linux, bot, auto
 ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
