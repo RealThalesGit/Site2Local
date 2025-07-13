@@ -1,4 +1,3 @@
-# Chatgpt fez revamp
 import os
 import json
 import hashlib
@@ -13,30 +12,64 @@ import sys
 
 sys.setrecursionlimit(10000)
 
-# -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Suporta sites que usam ou não html e também suporta php
-SITE_URL = "https://web.whatsapp.com"
+# -------------------- CONFIGURAÇÃO --------------------
+MODE = "AUTO_MODE"  # Suporta sites que usam ou não HTML e também suporta PHP
+
+# Flags para controle do esquema HTTP/HTTPS
+USE_HTTP = False
+USE_HTTPS = True
+NO_HTTP_AND_HTTPS = False
+
+RAW_SITE_URL = "web.whatsapp.com"  # Domínio puro, sem http(s)://
 PORT = 8080
 FORCE_ACCESS_DENIED_BYPASS = False
 SCAN_FOR_HIDDEN_PATHS = True
 ENABLE_HIDDEN_ELEMENTS = True
 SHOW_HIDDEN_ELEMENTS = True
 ENABLE_CRAWLING = True
-HEADER_DEVICE = "mobile"  # mobile, desktop, tablet, linux, bot, auto
+HEADER_DEVICE = "linux"  # mobile, desktop, tablet, linux, bot, auto
 ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
 
-# -------------------- DISPOSITIVO --------------------
+# -------------------- FUNÇÕES DE URL --------------------
+def process_url(url: str) -> str:
+    """Ajusta a URL conforme as flags USE_HTTP, USE_HTTPS e NO_HTTP_AND_HTTPS."""
+    if NO_HTTP_AND_HTTPS:
+        if url.startswith("http://"):
+            return url[len("http://"):]
+        if url.startswith("https://"):
+            return url[len("https://"):]
+        return url
+    
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        if USE_HTTPS:
+            return "https://" + url
+        elif USE_HTTP:
+            return "http://" + url
+        else:
+            return url
+    return url
+
+SITE_URL = process_url(RAW_SITE_URL)
+
+# -------------------- DETECÇÃO DE DISPOSITIVO --------------------
 def detect_device():
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
     ua = request.headers.get("User-Agent", "").lower()
-    if "android" in ua and "mobile" in ua: return "mobile"
-    if "iphone" in ua or "ipad" in ua: return "mobile"
-    if "android" in ua: return "tablet"
-    if "windows" in ua or "macintosh" in ua: return "desktop"
-    if "linux" in ua: return "linux"
-    if "bot" in ua: return "bot"
+    if "android" in ua and "mobile" in ua:
+        return "mobile"
+    if "iphone" in ua or "ipad" in ua:
+        return "mobile"
+    if "android" in ua:
+        return "tablet"
+    if "windows" in ua or "macintosh" in ua:
+        return "desktop"
+    if "linux" in ua:
+        return "linux"
+    if "bot" in ua:
+        return "bot"
     return "desktop"
 
 def get_headers_for_device(device):
@@ -79,6 +112,7 @@ visited = set()
 
 app = Flask(__name__, static_folder=None)
 
+# -------------------- FUNÇÕES DE DOWNLOAD E CACHE --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
@@ -86,8 +120,11 @@ def is_valid_url(url):
 def local_path(url):
     p = urlparse(url)
     path = p.path
-    if path.endswith("/"): path += "index.html"
-    if not os.path.splitext(path)[1]: path = os.path.join(path, "index.html")
+    if path.endswith("/"):
+        path += "index.html"
+    if not os.path.splitext(path)[1]:
+        path = os.path.join(path, "index.html")
+    # Salva em uma pasta separada por domínio (p.netloc)
     return os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
 
 def save_content(url, content):
@@ -101,22 +138,30 @@ def try_decompress(r):
     content = r.content
     encoding = r.headers.get("Content-Encoding", "")
     if "br" in encoding:
-        try: return brotli.decompress(content)
-        except: pass
+        try:
+            return brotli.decompress(content)
+        except Exception:
+            pass
     if "gzip" in encoding:
-        try: return gzip.decompress(content)
-        except: pass
+        try:
+            return gzip.decompress(content)
+        except Exception:
+            pass
     return content
 
 def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
+    # Torna elementos ocultos visíveis com estilo destacado
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
-    for el in soup.select("[hidden]"): del el['hidden']
-    for el in soup.select("[disabled]"): del el['disabled']
-    for el in soup.select("[readonly]"): del el['readonly']
+    for el in soup.select("[hidden]"):
+        del el['hidden']
+    for el in soup.select("[disabled]"):
+        del el['disabled']
+    for el in soup.select("[readonly]"):
+        del el['readonly']
     for el in soup.find_all(attrs={"data-href": True}):
         href = el["data-href"]
         el.name = "a"
@@ -134,7 +179,7 @@ def ask_user_about_mirror(filename, mirrorurl):
     global ACCEPT_ALL_MIRRORS
     if ACCEPT_ALL_MIRRORS:
         return True
-    print(f"\nUm mirror foi detectado, quer baixar os arquivos do mirror {mirrorurl}?")
+    print(f"\nUm mirror foi detectado, deseja baixar os arquivos do mirror {mirrorurl}?")
     print("[S] Sim   [N] Não   [A] Aceitar todos")
     while True:
         choice = input("Sua escolha (S/N/A): ").strip().lower()
@@ -174,14 +219,20 @@ def is_html(content):
     return content.strip().lower().startswith(b"<!doctype") or b"<html" in content.lower()
 
 def crawl(url):
-    if url in visited: return
+    if url in visited:
+        return
     visited.add(url)
-    mirrors = []  # Aqui você pode adicionar lógica para encontrar mirrors reais para a URL, se houver
-    saved = download(url, mirrors=mirrors)
-    if not saved: return
+    mirrors = []  # Aqui você pode colocar a lógica para detectar mirrors reais
 
-    with open(saved, "rb") as f: content = f.read()
-    if not is_html(content): return
+    saved = download(url, mirrors=mirrors)
+    if not saved:
+        return
+
+    with open(saved, "rb") as f:
+        content = f.read()
+    if not is_html(content):
+        return
+
     soup = BeautifulSoup(content, "html.parser")
 
     if SHOW_HIDDEN_ELEMENTS:
@@ -189,6 +240,7 @@ def crawl(url):
         with open(saved, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
+    # Procurar por recursos para baixar
     tags = {"script": "src", "link": "href", "img": "src", "source": "src", "video": "src", "audio": "src"}
     for tag, attr in tags.items():
         for r in soup.find_all(tag):
@@ -197,10 +249,14 @@ def crawl(url):
                 full = urljoin(url, src)
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
+
+    # Procurar links para crawl
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
+
+    # Scan para caminhos ocultos comuns
     if SCAN_FOR_HIDDEN_PATHS:
         for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
             try:
@@ -209,8 +265,10 @@ def crawl(url):
                 if r.status_code == 200 and is_html(r.content):
                     print(f"[OCULTO] {test_url}")
                     crawl(test_url)
-            except: continue
+            except Exception:
+                pass
 
+# -------------------- ROTA FLASK --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
@@ -226,7 +284,9 @@ def proxy(path):
         with open(os.path.join(SITE_DATA, h + ".json"), "wb") as f:
             f.write(data)
         try:
-            r = requests.post(target, data=data, headers=request.headers)
+            # Usar headers originais da requisição POST
+            headers = dict(request.headers)
+            r = requests.post(target, data=data, headers=headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"Erro: {e}", status=502)
@@ -252,11 +312,11 @@ if __name__ == '__main__':
     os.makedirs(SITE_SRC, exist_ok=True)
     os.makedirs(SITE_DATA, exist_ok=True)
     if ENABLE_CRAWLING:
-        print(f"Crawleando: {SITE_URL} (modo: {MODE})")
+        print(f"Crawling: {SITE_URL} (modo: {MODE})")
         crawl(SITE_URL)
     else:
-        print("Crawling desativado.")
-    print(f"Pasta de arquivos: {os.path.abspath(SITE_SRC)}")
-    print(f"Pasta de dados POST: {os.path.abspath(SITE_DATA)}")
+        print("Crawling desabilitado.")
+    print(f"Pasta dos arquivos: {os.path.abspath(SITE_SRC)}")
+    print(f"Pasta dos dados POST: {os.path.abspath(SITE_DATA)}")
     print(f"Servidor rodando em: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
