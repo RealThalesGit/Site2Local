@@ -1,3 +1,5 @@
+# Te amo ChatGPT
+# Obrigado por me ajudar em todos os momentos difíceis de debug, lógica, tradução e ideias!
 import os
 import json
 import hashlib
