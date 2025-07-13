@@ -1,6 +1,5 @@
 # -------------------- SITE2LOCAL v2.3 --------------------
 # Smart mirroring with automatic HTTP/HTTPS fallback
-# Espelhamento inteligente com fallback automático HTTP/HTTPS
 
 import os
 import json
@@ -18,9 +17,7 @@ sys.setrecursionlimit(10000)
 
 # -------------------- CONFIG --------------------
 MODE = "AUTO_MODE"  # Supports HTML and PHP or pure domain sites
-# Suporta sites com/sem HTML, com PHP / Supports HTML and PHP or pure domain sites
 RAW_SITE_URL = "connect.nulls.gg"  # Pure domain without scheme
-# Domínio puro, sem esquema / Pure domain without scheme
 PORT = 8080
 ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
@@ -32,7 +29,6 @@ ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
 
 SCHEME_CACHE_FILE = "scheme_cache.json"  # File to cache preferred scheme
-# Arquivo para armazenar esquema preferido / File to cache preferred scheme
 
 # -------------------- URL FUNCTIONS --------------------
 def load_cached_scheme(domain):
@@ -61,13 +57,9 @@ def resolve_url(base_url):
     """
     Tries HTTPS then HTTP, returns full URL with scheme.
     Saves preferred scheme in cache for future calls.
-
-    Tenta HTTPS e HTTP, retorna URL completa com esquema.
-    Salva esquema em cache para acelerar futuras chamadas.
     """
     cached_scheme = load_cached_scheme(base_url)
     schemes_to_try = [cached_scheme] if cached_scheme else ["https", "http"]
-    # Avoid None in list / Evita None na lista
     schemes_to_try = [s for s in schemes_to_try if s]
 
     for scheme in schemes_to_try:
@@ -76,14 +68,12 @@ def resolve_url(base_url):
             r = requests.head(test_url, timeout=5)
             if r.status_code < 400:
                 print(f"[OK] Using {scheme.upper()}")
-                print(f"[OK] Usando {scheme.upper()}")
                 save_cached_scheme(base_url, scheme)
                 return test_url
             else:
                 print(f"[FAIL] {test_url}: {r.status_code}")
         except Exception:
             print(f"[ERROR] {scheme.upper()} failed, trying fallback...")
-            print(f"[ERRO] {scheme.upper()} falhou, tentando fallback...")
 
     # If cached scheme failed, try alternative scheme
     if cached_scheme:
@@ -93,24 +83,20 @@ def resolve_url(base_url):
             r = requests.head(test_url, timeout=5)
             if r.status_code < 400:
                 print(f"[OK] Using {alt_scheme.upper()} (fallback)")
-                print(f"[OK] Usando {alt_scheme.upper()} (fallback)")
                 save_cached_scheme(base_url, alt_scheme)
                 return test_url
             else:
                 print(f"[FAIL] {test_url}: {r.status_code}")
         except Exception:
             print(f"[ERROR] {alt_scheme.upper()} failed (fallback).")
-            print(f"[ERRO] {alt_scheme.upper()} falhou (fallback).")
 
     print("[ERROR] Both schemes failed, cannot proceed.")
-    print("[ERRO] Ambos os esquemas falharam, não pode prosseguir.")
     return None
 
 # Resolve initial URL
 SITE_URL = resolve_url(RAW_SITE_URL)
 if not SITE_URL:
     print("Could not resolve valid scheme for domain.")
-    print("Não foi possível determinar esquema válido para domínio.")
     exit(1)
 
 # -------------------- DEVICE DETECTION --------------------
