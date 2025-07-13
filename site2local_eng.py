@@ -1,6 +1,4 @@
-# -------------------- SITE2LOCAL v2.3 --------------------
-# Smart mirroring with automatic HTTP/HTTPS fallback
-
+# Love you chatgpt!
 import os
 import json
 import hashlib
@@ -15,22 +13,22 @@ import sys
 
 sys.setrecursionlimit(10000)
 
-# -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports HTML and PHP or pure domain sites
-RAW_SITE_URL = "google.cat"  # Pure domain without scheme (you dont need to place http or https, it already detect)
-PORT = 8080
+# -------------------- CONFIGURATION --------------------
+MODE = "AUTO_MODE"  # Supports HTML, PHP, or pure domain sites
+RAW_SITE_URL = "web.whatsapp.com"  # No scheme, will auto-detect https/http
+PORT = 80
 ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
-SCAN_FOR_HIDDEN_PATHS = False
+SCAN_FOR_HIDDEN_PATHS = True
 ENABLE_HIDDEN_ELEMENTS = False
 SHOW_HIDDEN_ELEMENTS = False
-HEADER_DEVICE = "mobile"  # mobile, desktop, tablet, linux, bot, auto
+HEADER_DEVICE = "desktop"  # mobile, desktop, tablet, linux, bot, auto
 ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
 
-SCHEME_CACHE_FILE = "scheme_cache.json"  # File to cache preferred scheme
+SCHEME_CACHE_FILE = "scheme_cache.json"
 
-# -------------------- URL FUNCTIONS --------------------
+# -------------------- URL SCHEME RESOLUTION --------------------
 def load_cached_scheme(domain):
     if not os.path.exists(SCHEME_CACHE_FILE):
         return None
@@ -54,10 +52,6 @@ def save_cached_scheme(domain, scheme):
         json.dump(cache, f)
 
 def resolve_url(base_url):
-    """
-    Tries HTTPS then HTTP, returns full URL with scheme.
-    Saves preferred scheme in cache for future calls.
-    """
     cached_scheme = load_cached_scheme(base_url)
     schemes_to_try = [cached_scheme] if cached_scheme else ["https", "http"]
     schemes_to_try = [s for s in schemes_to_try if s]
@@ -67,33 +61,31 @@ def resolve_url(base_url):
         try:
             r = requests.head(test_url, timeout=5)
             if r.status_code < 400:
-                print(f"[OK] Using {scheme.upper()}")
+                print(f"[OK] Using {scheme.upper()} for {base_url}")
                 save_cached_scheme(base_url, scheme)
                 return test_url
             else:
                 print(f"[FAIL] {test_url}: {r.status_code}")
         except Exception:
-            print(f"[ERROR] {scheme.upper()} failed, trying fallback...")
+            print(f"[ERROR] {scheme.upper()} failed for {base_url}, trying fallback...")
 
-    # If cached scheme failed, try alternative scheme
     if cached_scheme:
         alt_scheme = "https" if cached_scheme == "http" else "http"
         test_url = f"{alt_scheme}://{base_url}"
         try:
             r = requests.head(test_url, timeout=5)
             if r.status_code < 400:
-                print(f"[OK] Using {alt_scheme.upper()} (fallback)")
+                print(f"[OK] Using {alt_scheme.upper()} (fallback) for {base_url}")
                 save_cached_scheme(base_url, alt_scheme)
                 return test_url
             else:
                 print(f"[FAIL] {test_url}: {r.status_code}")
         except Exception:
-            print(f"[ERROR] {alt_scheme.upper()} failed (fallback).")
+            print(f"[ERROR] {alt_scheme.upper()} fallback failed for {base_url}")
 
-    print("[ERROR] Both schemes failed, cannot proceed.")
+    print(f"[ERROR] Both schemes failed for {base_url}. Cannot proceed.")
     return None
 
-# Resolve initial URL
 SITE_URL = resolve_url(RAW_SITE_URL)
 if not SITE_URL:
     print("Could not resolve valid scheme for domain.")
@@ -119,30 +111,26 @@ def detect_device():
     return "desktop"
 
 def get_headers_for_device(device):
-    common_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Encoding": "br, gzip, deflate",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "DNT": "1"
-    }
-    user_agents = {
-        "mobile": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
-        "tablet": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
-        "bot": "Googlebot/2.1 (+http://www.google.com/bot.html)",
-        "desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
-        "linux": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
-    }
-    headers = common_headers.copy()
-    headers["User-Agent"] = user_agents.get(device, user_agents["desktop"])
-    return headers
+    if device == "mobile":
+        return {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Mobile Safari/537.36",
+            "Accept-Encoding": "br, gzip"
+        }
+    elif device == "tablet":
+        return {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "Accept-Encoding": "br, gzip"
+        }
+    elif device == "bot":
+        return {
+            "User-Agent": "Googlebot/2.1 (+http://www.google.com/bot.html)",
+            "Accept-Encoding": "gzip, deflate"
+        }
+    else:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "Accept-Encoding": "br, gzip"
+        }
 
 # -------------------- PATHS --------------------
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
@@ -151,12 +139,17 @@ SITE_SRC = os.path.join("site_src", f"{SITE_NAME}_{device_type}")
 SITE_DATA = os.path.join("site_data", f"{SITE_NAME}_{device_type}")
 
 EXT_HTML = {".html", ".htm"}
-EXT_STATIC = EXT_HTML | {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".ico", ".json", ".webp"}
+EXT_STATIC = EXT_HTML | {
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2",
+    ".ttf", ".eot", ".ico", ".json", ".webp", ".mp4", ".webm", ".ogg", ".mp3",
+    ".wav", ".m4a", ".ttf", ".otf", ".pdf", ".txt", ".csv", ".xml", ".zip",
+    ".rar", ".7z", ".tar", ".gz", ".bz2"
+}
 
 visited = set()
+
 app = Flask(__name__, static_folder=None)
 
-# -------------------- DOWNLOAD AND CACHE FUNCTIONS --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
@@ -168,7 +161,6 @@ def local_path(url):
         path += "index.html"
     if not os.path.splitext(path)[1]:
         path = os.path.join(path, "index.html")
-    # Save in domain-specific folder
     return os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
 
 def save_content(url, content):
@@ -184,12 +176,12 @@ def try_decompress(r):
     if "br" in encoding:
         try:
             return brotli.decompress(content)
-        except Exception:
+        except:
             pass
     if "gzip" in encoding:
         try:
             return gzip.decompress(content)
-        except Exception:
+        except:
             pass
     return content
 
@@ -197,7 +189,6 @@ def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
-    # Make hidden elements visible with highlight style
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
     for el in soup.select("[hidden]"):
@@ -219,45 +210,22 @@ def modify_html_for_visibility(soup):
         el["style"] = "display:inline-block !important; background:yellow; border:2px dashed red;"
         el.string = el.get_text() or href
 
-def ask_user_about_mirror(filename, mirrorurl):
-    global ACCEPT_ALL_MIRRORS
-    if ACCEPT_ALL_MIRRORS:
-        return True
-    print(f"\nA mirror was detected, do you want to download the files from the mirror {mirrorurl}?")
-    print("[Y] Yes   [N] No   [A] Accept all")
-    while True:
-        choice = input("Your choice (Y/N/A): ").strip().lower()
-        if choice == "y":
-            return True
-        elif choice == "n":
-            return False
-        elif choice == "a":
-            ACCEPT_ALL_MIRRORS = True
-            return True
-
-def download(url, mirrors=None):
+def download(url):
     if already_downloaded(url):
         print(f"[CACHE] {url}")
         return local_path(url)
 
-    urls_to_try = [url]
-    if ENABLE_MIRROR_DETECTION and mirrors:
-        for m in mirrors:
-            if m != url:
-                urls_to_try.append(m)
-
-    for current_url in urls_to_try:
-        device = detect_device()
-        headers = get_headers_for_device(device)
-        try:
-            print(f"[GET] {current_url} [{device}]")
-            r = requests.get(current_url, timeout=10, headers=headers)
-            r.raise_for_status()
-            content = try_decompress(r)
-            return save_content(current_url, content)
-        except Exception as e:
-            print(f"[ERROR] {current_url}: {e}")
-    return None
+    device = detect_device()
+    headers = get_headers_for_device(device)
+    try:
+        print(f"[GET] {url} [{device}]")
+        r = requests.get(url, timeout=10, headers=headers)
+        r.raise_for_status()
+        content = try_decompress(r)
+        return save_content(url, content)
+    except Exception as e:
+        print(f"[ERROR] {url}: {e}")
+        return None
 
 def is_html(content):
     return content.strip().lower().startswith(b"<!doctype") or b"<html" in content.lower()
@@ -266,9 +234,7 @@ def crawl(url):
     if url in visited:
         return
     visited.add(url)
-    mirrors = []  # You can add logic here to detect real mirrors
-
-    saved = download(url, mirrors=mirrors)
+    saved = download(url)
     if not saved:
         return
 
@@ -276,7 +242,6 @@ def crawl(url):
         content = f.read()
     if not is_html(content):
         return
-
     soup = BeautifulSoup(content, "html.parser")
 
     if SHOW_HIDDEN_ELEMENTS:
@@ -284,7 +249,6 @@ def crawl(url):
         with open(saved, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
-    # Find resources to download
     tags = {"script": "src", "link": "href", "img": "src", "source": "src", "video": "src", "audio": "src"}
     for tag, attr in tags.items():
         for r in soup.find_all(tag):
@@ -293,16 +257,13 @@ def crawl(url):
                 full = urljoin(url, src)
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
-
-    # Find links to crawl
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
-
-    # Scan for common hidden paths
     if SCAN_FOR_HIDDEN_PATHS:
-        for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
+        hidden_paths = ["admin", "login", "panel", "dashboard", ".git", ".env"]
+        for test in hidden_paths:
             try:
                 test_url = urljoin(SITE_URL + "/", test)
                 r = requests.get(test_url, headers={"Accept-Encoding": "br, gzip"})
@@ -312,14 +273,12 @@ def crawl(url):
             except Exception:
                 pass
 
-# -------------------- FLASK ROUTES --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
     target = urljoin(SITE_URL + "/", path)
     if request.query_string:
         target += "?" + request.query_string.decode()
-
     local = local_path(target)
 
     if request.method == "POST":
@@ -329,8 +288,7 @@ def proxy(path):
         with open(os.path.join(SITE_DATA, h + ".json"), "wb") as f:
             f.write(data)
         try:
-            headers = dict(request.headers)
-            r = requests.post(target, data=data, headers=headers)
+            r = requests.post(target, data=data, headers=request.headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"Error: {e}", status=502)
@@ -359,8 +317,8 @@ if __name__ == '__main__':
         print(f"Crawling: {SITE_URL} (mode: {MODE})")
         crawl(SITE_URL)
     else:
-        print("Crawling disabled.")
-    print(f"Files folder: {os.path.abspath(SITE_SRC)}")
+        print("Crawling is disabled.")
+    print(f"SRC folder: {os.path.abspath(SITE_SRC)}")
     print(f"POST data folder: {os.path.abspath(SITE_DATA)}")
-    print(f"Server running at: http://127.0.0.1:{PORT}")
+    print(f"Access via: http://127.0.0.1:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
