@@ -1,4 +1,3 @@
-# Ty chatgpt!
 import os
 import json
 import hashlib
@@ -14,29 +13,63 @@ import sys
 sys.setrecursionlimit(10000)
 
 # -------------------- CONFIG --------------------
-MODE = "AUTO_MODE"  # Supports sites using or not using html and also supports php
-SITE_URL = "https://web.whatsapp.com"
+MODE = "AUTO_MODE"  # Supports sites using or not using HTML and also supports PHP
+
+# Flags to control HTTP/HTTPS scheme
+USE_HTTP = False
+USE_HTTPS = True
+NO_HTTP_AND_HTTPS = False
+
+RAW_SITE_URL = "web.whatsapp.com"  # Raw domain, without http(s)://
 PORT = 8080
 FORCE_ACCESS_DENIED_BYPASS = False
 SCAN_FOR_HIDDEN_PATHS = True
 ENABLE_HIDDEN_ELEMENTS = True
 SHOW_HIDDEN_ELEMENTS = True
 ENABLE_CRAWLING = True
-HEADER_DEVICE = "mobile"  # mobile, desktop, tablet, linux, bot, auto
+HEADER_DEVICE = "linux"  # mobile, desktop, tablet, linux, bot, auto
 ACCEPT_ALL_MIRRORS = True
 ENABLE_MIRROR_DETECTION = True
+
+# -------------------- URL FUNCTIONS --------------------
+def process_url(url: str) -> str:
+    """Adjusts the URL according to the USE_HTTP, USE_HTTPS and NO_HTTP_AND_HTTPS flags."""
+    if NO_HTTP_AND_HTTPS:
+        if url.startswith("http://"):
+            return url[len("http://"):]
+        if url.startswith("https://"):
+            return url[len("https://"):]
+        return url
+    
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        if USE_HTTPS:
+            return "https://" + url
+        elif USE_HTTP:
+            return "http://" + url
+        else:
+            return url
+    return url
+
+SITE_URL = process_url(RAW_SITE_URL)
 
 # -------------------- DEVICE --------------------
 def detect_device():
     if HEADER_DEVICE != "auto":
         return HEADER_DEVICE.lower()
     ua = request.headers.get("User-Agent", "").lower()
-    if "android" in ua and "mobile" in ua: return "mobile"
-    if "iphone" in ua or "ipad" in ua: return "mobile"
-    if "android" in ua: return "tablet"
-    if "windows" in ua or "macintosh" in ua: return "desktop"
-    if "linux" in ua: return "linux"
-    if "bot" in ua: return "bot"
+    if "android" in ua and "mobile" in ua:
+        return "mobile"
+    if "iphone" in ua or "ipad" in ua:
+        return "mobile"
+    if "android" in ua:
+        return "tablet"
+    if "windows" in ua or "macintosh" in ua:
+        return "desktop"
+    if "linux" in ua:
+        return "linux"
+    if "bot" in ua:
+        return "bot"
     return "desktop"
 
 def get_headers_for_device(device):
@@ -79,6 +112,7 @@ visited = set()
 
 app = Flask(__name__, static_folder=None)
 
+# -------------------- DOWNLOAD AND CACHE FUNCTIONS --------------------
 def is_valid_url(url):
     p = urlparse(url)
     return bool(p.netloc) and bool(p.scheme)
@@ -86,8 +120,11 @@ def is_valid_url(url):
 def local_path(url):
     p = urlparse(url)
     path = p.path
-    if path.endswith("/"): path += "index.html"
-    if not os.path.splitext(path)[1]: path = os.path.join(path, "index.html")
+    if path.endswith("/"):
+        path += "index.html"
+    if not os.path.splitext(path)[1]:
+        path = os.path.join(path, "index.html")
+    # Save in a folder separated by domain (p.netloc)
     return os.path.join(SITE_SRC, p.netloc, path.lstrip("/"))
 
 def save_content(url, content):
@@ -101,22 +138,30 @@ def try_decompress(r):
     content = r.content
     encoding = r.headers.get("Content-Encoding", "")
     if "br" in encoding:
-        try: return brotli.decompress(content)
-        except: pass
+        try:
+            return brotli.decompress(content)
+        except Exception:
+            pass
     if "gzip" in encoding:
-        try: return gzip.decompress(content)
-        except: pass
+        try:
+            return gzip.decompress(content)
+        except Exception:
+            pass
     return content
 
 def already_downloaded(url):
     return os.path.exists(local_path(url))
 
 def modify_html_for_visibility(soup):
+    # Makes hidden elements visible with highlighted style
     for el in soup.select("[style*='display:none'], [style*='visibility:hidden'], [style*='opacity:0']"):
         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
-    for el in soup.select("[hidden]"): del el['hidden']
-    for el in soup.select("[disabled]"): del el['disabled']
-    for el in soup.select("[readonly]"): del el['readonly']
+    for el in soup.select("[hidden]"):
+        del el['hidden']
+    for el in soup.select("[disabled]"):
+        del el['disabled']
+    for el in soup.select("[readonly]"):
+        del el['readonly']
     for el in soup.find_all(attrs={"data-href": True}):
         href = el["data-href"]
         el.name = "a"
@@ -174,14 +219,20 @@ def is_html(content):
     return content.strip().lower().startswith(b"<!doctype") or b"<html" in content.lower()
 
 def crawl(url):
-    if url in visited: return
+    if url in visited:
+        return
     visited.add(url)
-    mirrors = []  # Here you can add logic to find real mirrors for the URL if any
-    saved = download(url, mirrors=mirrors)
-    if not saved: return
+    mirrors = []  # Here you can put logic to detect real mirrors
 
-    with open(saved, "rb") as f: content = f.read()
-    if not is_html(content): return
+    saved = download(url, mirrors=mirrors)
+    if not saved:
+        return
+
+    with open(saved, "rb") as f:
+        content = f.read()
+    if not is_html(content):
+        return
+
     soup = BeautifulSoup(content, "html.parser")
 
     if SHOW_HIDDEN_ELEMENTS:
@@ -189,6 +240,7 @@ def crawl(url):
         with open(saved, "w", encoding="utf-8") as f:
             f.write(str(soup))
 
+    # Search for resources to download
     tags = {"script": "src", "link": "href", "img": "src", "source": "src", "video": "src", "audio": "src"}
     for tag, attr in tags.items():
         for r in soup.find_all(tag):
@@ -197,10 +249,14 @@ def crawl(url):
                 full = urljoin(url, src)
                 if is_valid_url(full) and urlparse(full).netloc == urlparse(SITE_URL).netloc:
                     crawl(full)
+
+    # Search for links to crawl
     for a in soup.find_all("a", href=True):
         link = urljoin(url, a['href'])
         if link.startswith(SITE_URL):
             crawl(link)
+
+    # Scan for common hidden paths
     if SCAN_FOR_HIDDEN_PATHS:
         for test in ["admin", "login", "panel", "dashboard", ".git", ".env"]:
             try:
@@ -209,8 +265,10 @@ def crawl(url):
                 if r.status_code == 200 and is_html(r.content):
                     print(f"[HIDDEN] {test_url}")
                     crawl(test_url)
-            except: continue
+            except Exception:
+                pass
 
+# -------------------- FLASK ROUTE --------------------
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST"])
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
@@ -226,7 +284,9 @@ def proxy(path):
         with open(os.path.join(SITE_DATA, h + ".json"), "wb") as f:
             f.write(data)
         try:
-            r = requests.post(target, data=data, headers=request.headers)
+            # Use original POST request headers
+            headers = dict(request.headers)
+            r = requests.post(target, data=data, headers=headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"Error: {e}", status=502)
