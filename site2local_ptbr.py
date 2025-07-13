@@ -1,6 +1,3 @@
-# SITE2LOCAL MEGA REVAMP
-# Espelhamento inteligente com suporte a dispositivos, crawling opcional e bypass
-
 import os
 import json
 import hashlib
@@ -17,7 +14,7 @@ sys.setrecursionlimit(10000)
 
 # -------------------- CONFIGURAÇÕES --------------------
 MODE = "AUTO_MODE"  # Suporta sites HTML, PHP ou domínio puro
-RAW_SITE_URL = "web.whatsapp.com"  # Sem esquema, detecta https/http automaticamente
+RAW_SITE_URL = "example.com"  # Sem esquema, detecta https/http automaticamente
 PORT = 80
 ENABLE_CRAWLING = True
 FORCE_ACCESS_DENIED_BYPASS = False
