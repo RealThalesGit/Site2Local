@@ -16,12 +16,12 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, Response, send_file
 from urllib.parse import urljoin, urlparse, urldefrag
 
-# -------------------- AJUSTES GERAIS --------------------
-sys.setrecursionlimit(20000)  # Permite crawl profundo
-colorama.init(autoreset=True)  # Habilita cores no terminal
+# -------------------- CONFIGURAÇÕES GERAIS --------------------
+sys.setrecursionlimit(20000)  # Crawl profundo
+colorama.init(autoreset=True)  # Cores no terminal
 
 # -------------------- CORES PARA LOGS --------------------
-class Cores:
+class Colors:
     RESET = Style.RESET_ALL
     RED = Fore.RED
     GREEN = Fore.GREEN
@@ -29,59 +29,57 @@ class Cores:
     CYAN = Fore.CYAN
     MAGENTA = Fore.MAGENTA
 
-def log(mensagem, nivel="INFO"):
-    mapa_cores = {
-        "INFO": Cores.GREEN,
-        "WARN": Cores.YELLOW,
-        "ERROR": Cores.RED,
-        "DEBUG": Cores.CYAN,
-        "MAGENTA": Cores.MAGENTA
-    }
-    cor = mapa_cores.get(nivel, Cores.GREEN)
-    print(f"{cor}[Site2Local] [{nivel}] {mensagem}{Cores.RESET}")
+def log(msg, level="INFO"):
+    color = {
+        "INFO": Colors.GREEN,
+        "WARN": Colors.YELLOW,
+        "ERROR": Colors.RED,
+        "DEBUG": Colors.CYAN
+    }.get(level, Colors.GREEN)
+    print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
 
-# -------------------- CONFIGURAÇÕES --------------------
-raw_site_url = "web.whatsapp.com"  # Sem https:// ou http://
-PORTA = 80
-CABECALHO_DISPOSITIVO = "desktop"  # desktop, mobile, tablet, bot, auto
+# -------------------- CONFIGURAÇÕES DO USUÁRIO --------------------
+raw_site_url = "web.whatsapp.com"  # Sem http:// ou https://
+PORT = 80
+HEADER_DEVICE = "desktop"  # desktop, mobile, tablet, bot, auto
 
-MODO_OFFLINE = False
-SALVAR_TRAFEGO = False
-ATIVAR_CRAWL = True
-MOSTRAR_OCULTOS = True
-BUSCAR_CAMINHOS_SECRETOS = True
+OFFLINE_MODE = False
+SAVE_TRAFFIC = False
+ENABLE_CRAWLING = True
+SHOW_HIDDEN = True
+SCAN_HIDDEN_PATHS = True
 
-ACEITAR_TODOS_MIRRORS = False  # Controla se aceita todos mirrors automaticamente
+ACCEPT_ALL_MIRRORS = True  # Obsoleto, mantido para compatibilidade
 
 # -------------------- CONSTRUÇÃO DA URL BASE --------------------
-def construir_url_base(url_crua):
-    for esquema in ["https://", "http://"]:
-        url_teste = esquema + url_crua
+def build_base_url(raw_url):
+    for scheme in ["https://", "http://"]:
+        test_url = scheme + raw_url
         try:
-            r = requests.head(url_teste, timeout=5)
+            r = requests.head(test_url, timeout=5)
             if r.status_code < 400:
-                log(f"Usando {esquema.upper().strip('://')} para {url_crua}")
-                return url_teste
+                log(f"Usando {scheme.upper().strip('://')} para {raw_url}")
+                return test_url
         except Exception:
             continue
-    log(f"Site {url_crua} inacessível, ativando modo OFFLINE", "WARN")
+    log(f"Site {raw_url} inacessível, ativando modo OFFLINE", "WARN")
     return None
 
-SITE_URL = construir_url_base(raw_site_url)
+SITE_URL = build_base_url(raw_site_url)
 if SITE_URL is None:
-    MODO_OFFLINE = True
+    OFFLINE_MODE = True
     SITE_URL = "http://" + raw_site_url  # fallback fictício
 
 # -------------------- PASTAS POR DISPOSITIVO --------------------
-nome_site = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
-tipo_dispositivo = CABECALHO_DISPOSITIVO if CABECALHO_DISPOSITIVO != "auto" else "desktop"
+site_name = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
+device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 
-PASTA_SRC = os.path.join("site_src", f"{nome_site}_{tipo_dispositivo}")
-PASTA_DADOS = os.path.join("site_data", f"{nome_site}_{tipo_dispositivo}")
-ARQUIVO_CACHE_TRAFEGO = os.path.join(PASTA_DADOS, "traffic_cache.json")
+SRC_FOLDER = os.path.join("site_src", f"{site_name}_{device_type}")
+DATA_FOLDER = os.path.join("site_data", f"{site_name}_{device_type}")
+TRAFFIC_CACHE_FILE = os.path.join(DATA_FOLDER, "traffic_cache.json")
 
 EXT_HTML = {".html", ".htm"}
-EXT_ESTATICOS = EXT_HTML | {
+EXT_STATIC = EXT_HTML | {
     ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ".mp4", ".webm", ".ogg", ".mp3", ".wav",
@@ -90,60 +88,58 @@ EXT_ESTATICOS = EXT_HTML | {
 }
 
 # -------------------- VARIÁVEIS GLOBAIS --------------------
-visitados = set()
-arquivos_baixados = set()
-lock_trafego = threading.Lock()
-trafegos_salvos = {}
-
-mirrors_encontrados = {}  # Armazena mirrors por nome de arquivo
+visited = set()
+downloaded_files = set()
+traffic_lock = threading.Lock()
+saved_traffic = {}
 
 # -------------------- APP FLASK --------------------
 app = Flask(__name__, static_folder=None)
 
 # -------------------- FUNÇÕES AUXILIARES --------------------
-def remover_fragmento(url):
+def strip_fragment(url):
     return urldefrag(url)[0]
 
-def url_valida(url):
+def is_valid_url(url):
     p = urlparse(url)
     return bool(p.scheme) and bool(p.netloc)
 
-def caminho_local(url):
-    url = remover_fragmento(url)
+def local_path(url):
+    url = strip_fragment(url)
     p = urlparse(url)
-    caminho = p.path
-    if caminho.endswith("/"):
-        caminho += "index.html"
-    if not os.path.splitext(caminho)[1]:
-        caminho = os.path.join(caminho, "index.html")
-    if caminho.startswith("/"):
-        caminho = caminho[1:]
-    return os.path.join(PASTA_SRC, p.netloc.replace("www.", ""), *caminho.split('/'))
+    path = p.path
+    if path.endswith("/"):
+        path += "index.html"
+    if not os.path.splitext(path)[1]:
+        path = os.path.join(path, "index.html")
+    if path.startswith("/"):
+        path = path[1:]
+    return os.path.join(SRC_FOLDER, p.netloc.replace("www.", ""), *path.split('/'))
 
-def ja_baixado(url):
-    return os.path.isfile(caminho_local(url))
+def is_already_downloaded(url):
+    return os.path.isfile(local_path(url))
 
-def salvar_arquivo(url, conteudo):
-    caminho = caminho_local(url)
-    os.makedirs(os.path.dirname(caminho), exist_ok=True)
-    with open(caminho, "wb") as f:
-        f.write(conteudo)
-    log(f"Arquivo salvo: {caminho}", "DEBUG")
-    arquivos_baixados.add(url)
-    return caminho
+def save_file(url, content):
+    path = local_path(url)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    log(f"Arquivo salvo: {path}", "DEBUG")
+    downloaded_files.add(url)
+    return path
 
-def descomprimir_conteudo(resposta):
+def decompress_content(response):
     try:
-        codificacao = resposta.headers.get("Content-Encoding", "").lower()
-        if "br" in codificacao:
-            return brotli.decompress(resposta.content)
-        if "gzip" in codificacao:
-            return gzip.decompress(resposta.content)
+        encoding = response.headers.get("Content-Encoding", "").lower()
+        if "br" in encoding:
+            return brotli.decompress(response.content)
+        if "gzip" in encoding:
+            return gzip.decompress(response.content)
     except Exception as e:
-        log(f"Falha ao descomprimir conteúdo: {e}", "WARN")
-    return resposta.content
+        log(f"Erro ao descomprimir: {e}", "WARN")
+    return response.content
 
-def obter_headers(dispositivo):
+def get_headers(device):
     base = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -156,25 +152,23 @@ def obter_headers(dispositivo):
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Sec-CH-UA": '"Chromium";v="115", "Not(A:Brand";v="8"',
-        "Sec-CH-UA-Platform": '"Android"' if dispositivo == "mobile" else '"Windows"',
-        "Sec-CH-UA-Mobile": "?1" if dispositivo == "mobile" else "?0"
+        "Sec-CH-UA-Platform": '"Windows"' if device == "desktop" else '"Android"',
+        "Sec-CH-UA-Mobile": "?0" if device == "desktop" else "?1"
     }
-
-    if dispositivo == "mobile":
-        base["User-Agent"] = "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/115.0.5790.171 Mobile Safari/537.36"
-    elif dispositivo == "tablet":
-        base["User-Agent"] = "Mozilla/5.0 (Linux; Android 13; SM-T970) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/115.0.5790.171 Safari/537.36"
-    elif dispositivo == "bot":
+    if device == "mobile":
+        base["User-Agent"] = "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.171 Mobile Safari/537.36"
+    elif device == "tablet":
+        base["User-Agent"] = "Mozilla/5.0 (Linux; Android 13; SM-T970) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.171 Safari/537.36"
+    elif device == "bot":
         base["User-Agent"] = "Googlebot/2.1 (+http://www.google.com/bot.html)"
         base["Accept"] = "*/*"
-    else:
-        base["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, como Gecko) Chrome/115.0.5790.171 Safari/537.36"
-
+    else:  # desktop
+        base["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.171 Safari/537.36"
     return base
 
-def detectar_dispositivo():
-    if CABECALHO_DISPOSITIVO != "auto":
-        return CABECALHO_DISPOSITIVO.lower()
+def detect_device():
+    if HEADER_DEVICE != "auto":
+        return HEADER_DEVICE.lower()
     ua = request.headers.get("User-Agent", "").lower()
     if "android" in ua and ("mobile" in ua or "phone" in ua):
         return "mobile"
@@ -192,72 +186,37 @@ def detectar_dispositivo():
         return "bot"
     return "desktop"
 
-# -------------------- DIÁLOGO ENCANTADO DE MIRRORS --------------------
-def perguntar_sobre_mirror(nome_arquivo, url_mirror):
-    global ACEITAR_TODOS_MIRRORS
-    if ACEITAR_TODOS_MIRRORS:
-        return True
-    print(f"\n[Mirror encontrado] Deseja baixar '{nome_arquivo}' do mirror: {url_mirror}?")
-    print("[S] Sim    [N] Não    [A] Aceitar todos daqui para frente")
-    while True:
-        escolha = input("Sua escolha (S/N/A): ").strip().lower()
-        if escolha == "s":
-            return True
-        elif escolha == "n":
-            return False
-        elif escolha == "a":
-            ACEITAR_TODOS_MIRRORS = True
-            return True
-        else:
-            print("Opção inválida. Escolha S, N ou A.")
-
-def extrair_nome_arquivo(url):
-    caminho = urlparse(url).path
-    return os.path.basename(caminho) or "index.html"
-
-# -------------------- CRAWLER ENCANTADO COM MIRRORS --------------------
+# -------------------- FUNÇÃO DE CRAWLING --------------------
 def crawl_url(url):
-    url = remover_fragmento(url)
-    if url in visitados:
+    url = strip_fragment(url)
+    if url in visited:
         return
-    visitados.add(url)
+    visited.add(url)
 
-    nome_arquivo = extrair_nome_arquivo(url)
-    # Guarda mirrors encontrados para este arquivo
-    mirrors_encontrados.setdefault(nome_arquivo, [])
-    if url not in mirrors_encontrados[nome_arquivo]:
-        mirrors_encontrados[nome_arquivo].append(url)
-
-    if ja_baixado(url):
+    if is_already_downloaded(url):
         log(f"[CACHE] {url}")
         return
 
-    # Se múltiplos mirrors existem e não aceitou todos, pergunta
-    if len(mirrors_encontrados[nome_arquivo]) > 1 and not ACEITAR_TODOS_MIRRORS:
-        if not perguntar_sobre_mirror(nome_arquivo, url):
-            log(f"[MIRROR IGNORADO] {url}")
-            return
-
-    dispositivo = tipo_dispositivo if CABECALHO_DISPOSITIVO != "auto" else "desktop"
-    headers = obter_headers(dispositivo)
+    device = device_type if HEADER_DEVICE != "auto" else "desktop"
+    headers = get_headers(device)
 
     try:
-        log(f"[GET] {url} [{dispositivo}]")
+        log(f"[GET] {url} [{device}]")
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        conteudo = descomprimir_conteudo(r)
-        if not conteudo:
+        content = decompress_content(r)
+        if not content:
             return
 
-        # Se não for HTML, salva direto
-        if b"<html" not in conteudo[:500].lower():
-            salvar_arquivo(url, conteudo)
+        # Salva direto se não for HTML
+        if b"<html" not in content[:500].lower():
+            save_file(url, content)
             return
 
-        soup = BeautifulSoup(conteudo, "html.parser")
+        soup = BeautifulSoup(content, "html.parser")
 
-        if MOSTRAR_OCULTOS:
-            seletores = [
+        if SHOW_HIDDEN:
+            selectors = [
                 "[style*='display:none']",
                 "[style*='visibility:hidden']",
                 "[style*='opacity:0']",
@@ -265,18 +224,18 @@ def crawl_url(url):
                 "[disabled]",
                 "[readonly]"
             ]
-            for sel in seletores:
+            for sel in selectors:
                 for el in soup.select(sel):
                     if 'style' in el.attrs:
                         el['style'] = "display:block !important; visibility:visible !important; opacity:1 !important; background:yellow; border:2px dashed red;"
                     for att in ['hidden', 'disabled', 'readonly']:
                         el.attrs.pop(att, None)
 
-            conteudo = soup.encode("utf-8")
+            content = soup.encode("utf-8")
 
-        salvar_arquivo(url, conteudo)
+        save_file(url, content)
 
-        tags_recursos = {
+        resource_tags = {
             "script": "src",
             "img": "src",
             "link": "href",
@@ -286,167 +245,200 @@ def crawl_url(url):
             "iframe": "src",
         }
 
-        urls_descobertas = []
+        discovered_urls = []
 
-        for tag, attr in tags_recursos.items():
+        for tag, attr in resource_tags.items():
             for el in soup.find_all(tag):
                 link = el.get(attr)
                 if not link:
                     continue
-                url_final = urljoin(url, link)
-                if url_valida(url_final):
-                    urls_descobertas.append(url_final)
+                full_url = urljoin(url, link)
+                if is_valid_url(full_url):
+                    discovered_urls.append(full_url)
 
-        # Links internos <a>
+        # Links <a> internos ao site
         for a in soup.find_all("a", href=True):
             link = urljoin(url, a["href"])
             if link.startswith(SITE_URL):
-                urls_descobertas.append(link)
+                discovered_urls.append(link)
 
-        # Busca caminhos secretos
-        if BUSCAR_CAMINHOS_SECRETOS:
-            caminhos_secretos = ["admin", "login", "panel", ".git", ".env", "config", "backup", "db", "private", "secret"]
-            for c in caminhos_secretos:
-                oculto = urljoin(SITE_URL + "/", c)
+        if SCAN_HIDDEN_PATHS:
+            hidden_paths = ["admin", "login", "panel", ".git", ".env", "config", "backup", "db", "private", "secret"]
+            for hp in hidden_paths:
+                hidden_url = urljoin(SITE_URL + "/", hp)
                 try:
-                    r = requests.head(oculto, headers=headers, timeout=5)
-                    if r.status_code == 200 and oculto not in visitados:
-                        log(f"[CAMINHO SECRETO] {oculto}", "MAGENTA")
-                        urls_descobertas.append(oculto)
+                    r = requests.head(hidden_url, headers=headers, timeout=5)
+                    if r.status_code == 200 and hidden_url not in visited:
+                        log(f"[CAMINHO OCULTO ENCONTRADO] {hidden_url}", "MAGENTA")
+                        discovered_urls.append(hidden_url)
                 except Exception:
                     pass
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            executor.map(crawl_url, urls_descobertas)
+            executor.map(crawl_url, discovered_urls)
 
     except Exception as e:
         log(f"[ERRO] {url}: {e}", "ERROR")
 
-# -------------------- MODO AUTOMÁTICO PARA DEFINIR HTTP OU HTTPS --------------------
-def modo_auto_crawl():
-    global SITE_URL, MODO_OFFLINE
+# -------------------- MODO AUTOMÁTICO DE CRAWL --------------------
+def auto_mode_crawl():
+    global SITE_URL
+    global OFFLINE_MODE
 
-    log(f"Iniciando crawl no MODO_AUTO para {SITE_URL}")
+    log(f"Iniciando crawl no MODO AUTOMÁTICO para {SITE_URL}")
     try:
-        url_https = "https://" + urlparse(SITE_URL).netloc
-        r = requests.head(url_https, timeout=5)
+        https_url = "https://" + urlparse(SITE_URL).netloc
+        r = requests.head(https_url, timeout=5)
         if r.status_code < 400:
             log("HTTPS disponível, usando HTTPS")
-            SITE_URL = url_https
+            SITE_URL = https_url
         else:
-            url_http = "http://" + urlparse(SITE_URL).netloc
-            r2 = requests.head(url_http, timeout=5)
+            http_url = "http://" + urlparse(SITE_URL).netloc
+            r2 = requests.head(http_url, timeout=5)
             if r2.status_code < 400:
                 log("HTTPS indisponível, usando HTTP")
-                SITE_URL = url_http
+                SITE_URL = http_url
             else:
-                log("Site offline, ativando modo OFFLINE", "WARN")
-                MODO_OFFLINE = True
+                log("Site offline, ativando modo OFFLINE local")
+                OFFLINE_MODE = True
 
-        if not MODO_OFFLINE:
+        if not OFFLINE_MODE:
             crawl_url(SITE_URL)
         else:
-            log("MODO OFFLINE ativado, servindo apenas do cache")
+            log("Modo OFFLINE ativado, servindo do cache")
 
     except Exception as e:
-        log(f"[ERRO NO MODO_AUTO] {e}", "ERROR")
-        MODO_OFFLINE = True
+        log(f"[ERRO NO AUTO_MODE] {e}", "ERROR")
+        OFFLINE_MODE = True
 
-# -------------------- FUNÇÕES DE CACHE DE TRÁFEGO --------------------
-def carregar_cache_trafego():
-    global trafegos_salvos
-    if os.path.exists(ARQUIVO_CACHE_TRAFEGO):
+# -------------------- SUPORTE A MIRRORS --------------------
+def ask_user_about_mirror(filename, mirrorurl):
+    if ACCEPT_ALL_MIRRORS:
+        return True
+    print(f"\nUm mirror foi encontrado. Deseja baixar o arquivo {filename} do mirror {mirrorurl}?")
+    print("[S] Sim   [N] Não   [A] Aceitar todos daqui para frente")
+    while True:
+        choice = input("Sua escolha (S/N/A): ").strip().lower()
+        if choice == "s":
+            return True
+        elif choice == "n":
+            return False
+        elif choice == "a":
+            global ACCEPT_ALL_MIRRORS
+            ACCEPT_ALL_MIRRORS = True
+            return True
+        else:
+            print("Opção inválida, tente novamente.")
+
+def download_with_mirrors(url, mirrors):
+    filename = url.split("/")[-1]
+    for mirror in mirrors:
         try:
-            with open(ARQUIVO_CACHE_TRAFEGO, "r") as f:
-                trafegos_salvos = json.load(f)
-            log(f"Cache carregado com {len(trafegos_salvos)} URLs", "DEBUG")
+            if ask_user_about_mirror(filename, mirror):
+                log(f"Baixando {filename} do mirror {mirror}")
+                r = requests.get(mirror, timeout=15)
+                r.raise_for_status()
+                return r.content
         except Exception as e:
-            log(f"Falha ao carregar cache: {e}", "WARN")
-            trafegos_salvos = {}
-    else:
-        trafegos_salvos = {}
+            log(f"Falha ao baixar do mirror {mirror}: {e}", "WARN")
+    log(f"Falha ao baixar {filename} de todos os mirrors", "ERROR")
+    return None
 
-def salvar_cache_trafego():
-    with lock_trafego:
-        try:
-            os.makedirs(PASTA_DADOS, exist_ok=True)
-            with open(ARQUIVO_CACHE_TRAFEGO, "w") as f:
-                json.dump(trafegos_salvos, f)
-            log(f"Cache salvo com {len(trafegos_salvos)} URLs", "DEBUG")
-        except Exception as e:
-            log(f"Falha ao salvar cache: {e}", "WARN")
-
-# -------------------- ROTA FLASK PARA PROXY --------------------
+# -------------------- PROXY DO FLASK --------------------
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
-    url_completa = urljoin(SITE_URL + "/", path)
+    full_url = urljoin(SITE_URL + "/", path)
     if request.query_string:
-        url_completa += "?" + request.query_string.decode()
+        full_url += "?" + request.query_string.decode()
 
-    arquivo_local = caminho_local(url_completa)
+    local_file = local_path(full_url)
 
     if request.method == "POST":
-        dados = request.get_data()
-        os.makedirs(PASTA_DADOS, exist_ok=True)
-        h = hashlib.sha256(url_completa.encode() + dados).hexdigest()
-        with open(os.path.join(PASTA_DADOS, h + ".json"), "wb") as f:
-            f.write(dados)
+        data = request.get_data()
+        os.makedirs(DATA_FOLDER, exist_ok=True)
+        h = hashlib.sha256(full_url.encode() + data).hexdigest()
+        with open(os.path.join(DATA_FOLDER, h + ".json"), "wb") as f:
+            f.write(data)
         try:
-            headers = obter_headers(detectar_dispositivo())
-            r = requests.post(url_completa, data=dados, headers=headers)
+            headers = get_headers(detect_device())
+            r = requests.post(full_url, data=data, headers=headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
             return Response(f"[ERRO NO POST] {e}", status=502)
 
-    if os.path.exists(arquivo_local):
-        mime = mimetypes.guess_type(arquivo_local)[0] or "application/octet-stream"
+    if os.path.exists(local_file):
+        mime = mimetypes.guess_type(local_file)[0] or "application/octet-stream"
         try:
-            return send_file(arquivo_local, mimetype=mime, conditional=True)
+            return send_file(local_file, mimetype=mime, conditional=True)
         except Exception as e:
             return Response(f"[ERRO AO SERVIR ARQUIVO] {e}", status=500)
 
-    if MODO_OFFLINE:
-        if url_completa in trafegos_salvos:
-            cache = trafegos_salvos[url_completa]
-            conteudo = bytes.fromhex(cache["conteudo"])
-            return Response(conteudo, status=cache.get("status", 200), content_type=cache.get("headers", {}).get("Content-Type", "text/html"))
+    if OFFLINE_MODE:
+        if full_url in saved_traffic:
+            cache = saved_traffic[full_url]
+            content = bytes.fromhex(cache["content"])
+            return Response(content, status=cache.get("status", 200), content_type=cache.get("headers", {}).get("Content-Type", "text/html"))
 
     try:
-        headers = obter_headers(detectar_dispositivo())
-        r = requests.get(url_completa, headers=headers, timeout=15)
+        headers = get_headers(detect_device())
+        r = requests.get(full_url, headers=headers, timeout=15)
         r.raise_for_status()
-        conteudo = descomprimir_conteudo(r)
-        os.makedirs(os.path.dirname(arquivo_local), exist_ok=True)
-        with open(arquivo_local, "wb") as f:
-            f.write(conteudo)
-        if SALVAR_TRAFEGO:
-            with lock_trafego:
-                trafegos_salvos[url_completa] = {
-                    "conteudo": conteudo.hex(),
+        content = decompress_content(r)
+        os.makedirs(os.path.dirname(local_file), exist_ok=True)
+        with open(local_file, "wb") as f:
+            f.write(content)
+        if SAVE_TRAFFIC:
+            with traffic_lock:
+                saved_traffic[full_url] = {
+                    "content": content.hex(),
                     "headers": dict(r.headers),
                     "status": r.status_code,
                     "timestamp": time.time()
                 }
-                salvar_cache_trafego()
-        return Response(conteudo, status=r.status_code, content_type=r.headers.get("Content-Type", "text/html"))
+                save_traffic_cache()
+        return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type", "text/html"))
     except Exception as e:
-        return Response(f"[ERRO AO BUSCAR] {url_completa}: {e}", status=502)
+        return Response(f"[ERRO AO BUSCAR] {full_url}: {e}", status=502)
 
-# -------------------- EXECUÇÃO PRINCIPAL --------------------
+# -------------------- GERENCIAMENTO DE CACHE DE TRÁFEGO --------------------
+def load_traffic_cache():
+    global saved_traffic
+    if os.path.exists(TRAFFIC_CACHE_FILE):
+        try:
+            with open(TRAFFIC_CACHE_FILE, "r") as f:
+                saved_traffic = json.load(f)
+            log(f"Cache carregado com {len(saved_traffic)} URLs", "DEBUG")
+        except Exception as e:
+            log(f"Falha ao carregar cache: {e}", "WARN")
+            saved_traffic = {}
+    else:
+        saved_traffic = {}
+
+def save_traffic_cache():
+    with traffic_lock:
+        try:
+            os.makedirs(DATA_FOLDER, exist_ok=True)
+            with open(TRAFFIC_CACHE_FILE, "w") as f:
+                json.dump(saved_traffic, f)
+            log(f"Cache salvo com {len(saved_traffic)} URLs", "DEBUG")
+        except Exception as e:
+            log(f"Falha ao salvar cache: {e}", "WARN")
+
+# -------------------- INÍCIO DO PROGRAMA --------------------
 if __name__ == "__main__":
-    carregar_cache_trafego()
+    load_traffic_cache()
 
-    tipo_dispositivo = CABECALHO_DISPOSITIVO if CABECALHO_DISPOSITIVO != "auto" else "desktop"
+    device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 
-    if ATIVAR_CRAWL:
-        if CABECALHO_DISPOSITIVO == "auto":
-            tipo_dispositivo = "desktop"
-        log(f"Iniciando crawl para {raw_site_url} ({tipo_dispositivo})")
-        if not MODO_OFFLINE:
-            modo_auto_crawl()
+    if ENABLE_CRAWLING:
+        if HEADER_DEVICE == "auto":
+            device_type = "desktop"
+        log(f"Iniciando crawl para {SITE_URL} ({device_type})")
+        if not OFFLINE_MODE:
+            auto_mode_crawl()
         else:
-            log("MODO OFFLINE ativado, apenas cache será usado.")
+            log("Modo OFFLINE ativado, usando apenas cache.")
 
-    log(f"Servidor rodando em http://0.0.0.0:{PORTA}")
-    app.run(host="0.0.0.0", port=PORTA, debug=False, threaded=True)
+    log(f"Servidor rodando em http://0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
