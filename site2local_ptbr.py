@@ -39,7 +39,7 @@ def log(msg, level="INFO"):
     print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
 
 # -------------------- CONFIGURAÇÕES DO USUÁRIO --------------------
-raw_site_url = "web.whatsapp.com"  # Sem http:// ou https://
+raw_site_url = "example.com"  # Sem http:// ou https://
 PORT = 80
 HEADER_DEVICE = "desktop"  # desktop, mobile, tablet, bot, auto
 
