@@ -39,7 +39,7 @@ def log(msg, level="INFO"):
     print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
 
 # -------------------- USER CONFIGURATION --------------------
-raw_site_url = "example.com"  # Without http:// or https://
+raw_site_url = "web.whatsapp.com"  # Without http:// or https://
 PORT = 80
 HEADER_DEVICE = "desktop"  # desktop, mobile, tablet, bot, auto
 
@@ -313,6 +313,7 @@ def auto_mode_crawl():
 
 # -------------------- MIRROR SUPPORT --------------------
 def ask_user_about_mirror(filename, mirrorurl):
+    global ACCEPT_ALL_MIRRORS
     if ACCEPT_ALL_MIRRORS:
         return True
     print(f"\nA mirror was found. Do you want to download the file {filename} from mirror {mirrorurl}?")
@@ -324,7 +325,6 @@ def ask_user_about_mirror(filename, mirrorurl):
         elif choice == "n":
             return False
         elif choice == "a":
-            global ACCEPT_ALL_MIRRORS
             ACCEPT_ALL_MIRRORS = True
             return True
         else:
