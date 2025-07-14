@@ -1,4 +1,4 @@
-# Love you chatgpt!
+# Amo você, chatgpt!
 import os
 import sys
 import threading
@@ -14,32 +14,32 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, Response, send_file
 from urllib.parse import urljoin, urlparse, urldefrag
 
-# -------------------- GENERAL SETTINGS --------------------
-sys.setrecursionlimit(20000)  # Deep crawl
-colorama.init(autoreset=True)  # Terminal colors
+# -------------------- CONFIGURAÇÕES GERAIS --------------------
+sys.setrecursionlimit(20000)  # Varredura profunda (crawl)
+colorama.init(autoreset=True)  # Cores no terminal
 
-# -------------------- COLORS FOR LOGGING --------------------
-class Colors:
+# -------------------- CORES PARA LOG --------------------
+class Cores:
     RESET = Style.RESET_ALL
-    RED = Fore.RED
-    GREEN = Fore.GREEN
-    YELLOW = Fore.YELLOW
-    CYAN = Fore.CYAN
+    VERMELHO = Fore.RED
+    VERDE = Fore.GREEN
+    AMARELO = Fore.YELLOW
+    CIANO = Fore.CYAN
     MAGENTA = Fore.MAGENTA
 
-def log(msg, level="INFO"):
-    color = {
-        "INFO": Colors.GREEN,
-        "WARN": Colors.YELLOW,
-        "ERROR": Colors.RED,
-        "DEBUG": Colors.CYAN
-    }.get(level, Colors.GREEN)
-    print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
+def log(msg, nivel="INFO"):
+    cor = {
+        "INFO": Cores.VERDE,
+        "WARN": Cores.AMARELO,
+        "ERROR": Cores.VERMELHO,
+        "DEBUG": Cores.CIANO
+    }.get(nivel, Cores.VERDE)
+    print(f"{cor}[Site2Local] [{nivel}] {msg}{Cores.RESET}")
 
-# -------------------- USER CONFIGURATION --------------------
-raw_site_url = "speedtest.net"  # Without http:// or https://
+# -------------------- CONFIGURAÇÃO DO USUÁRIO --------------------
+raw_site_url = "speedtest.net"  # Sem http:// ou https://
 PORT = 8080
-HEADER_DEVICE = "mobile" # desktop, mobile, tablet, bot, auto
+HEADER_DEVICE = "mobile"  # desktop, mobile, tablet, bot, auto
 
 OFFLINE_MODE = False
 SAVE_TRAFFIC = False
@@ -47,28 +47,27 @@ ENABLE_CRAWLING = True
 SHOW_HIDDEN = True
 SCAN_HIDDEN_PATHS = True
 
-ACCEPT_ALL_MIRRORS = True  # Deprecated, kept for compatibility
-
-# -------------------- BASE URL CONSTRUCTION --------------------
+ACCEPT_ALL_MIRRORS = True  # Depreciado, mantido para compatibilidade
+# -------------------- CONSTRUÇÃO DA URL BASE --------------------
 def build_base_url(raw_url):
-    for scheme in ["https://", "http://"]:
-        test_url = scheme + raw_url
+    for esquema in ["https://", "http://"]:
+        url_teste = esquema + raw_url
         try:
-            r = requests.head(test_url, timeout=5)
+            r = requests.head(url_teste, timeout=5)
             if r.status_code < 400:
-                log(f"Using {scheme.upper().strip('://')} for {raw_url}")
-                return test_url
+                log(f"Usando {esquema.upper().strip('://')} para {raw_url}")
+                return url_teste
         except Exception:
             continue
-    log(f"Site {raw_url} unreachable, enabling OFFLINE MODE", "WARN")
+    log(f"Site {raw_url} inacessível, ativando MODO OFFLINE", "WARN")
     return None
 
 SITE_URL = build_base_url(raw_site_url)
 if SITE_URL is None:
     OFFLINE_MODE = True
-    SITE_URL = "http://" + raw_site_url  # Fallback dummy
+    SITE_URL = "http://" + raw_site_url  # Fallback fictício
 
-# -------------------- DEVICE FOLDERS --------------------
+# -------------------- PASTAS POR DISPOSITIVO --------------------
 site_name = urlparse(SITE_URL).netloc.replace("www.", "").replace(".", "_")
 device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
 
@@ -84,17 +83,15 @@ EXT_STATIC = EXT_HTML | {
     ".json", ".pdf", ".txt", ".xml", ".csv",
     ".zip", ".rar", ".7z"
 }
-
-# -------------------- GLOBAL VARIABLES --------------------
+# -------------------- VARIÁVEIS GLOBAIS --------------------
 visited = set()
 downloaded_files = set()
 traffic_lock = threading.Lock()
 saved_traffic = {}
 
-# -------------------- FLASK APP --------------------
+# -------------------- APLICAÇÃO FLASK --------------------
 app = Flask(__name__, static_folder=None)
-
-# -------------------- UTILITY FUNCTIONS --------------------
+# -------------------- FUNÇÕES UTILITÁRIAS --------------------
 def strip_fragment(url):
     return urldefrag(url)[0]
 
@@ -122,10 +119,9 @@ def save_file(url, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(content)
-    log(f"File saved: {path}", "DEBUG")
+    log(f"Arquivo salvo: {path}", "DEBUG")
     downloaded_files.add(url)
     return path
-
 def get_headers(device):
     base = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -172,8 +168,7 @@ def detect_device():
     if "bot" in ua:
         return "bot"
     return "desktop"
-
-# -------------------- CRAWLING FUNCTION --------------------
+# -------------------- FUNÇÃO DE CRAWLING --------------------
 def crawl_url(url):
     url = strip_fragment(url)
     if url in visited:
@@ -191,9 +186,9 @@ def crawl_url(url):
         log(f"[GET] {url} [{device}]")
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        content = r.content  # Save raw content, no decompression
+        content = r.content  # Salva conteúdo bruto, sem decompressão
 
-        # Save directly if not HTML
+        # Salva direto se não for HTML
         if b"<html" not in content[:500].lower():
             save_file(url, content)
             return
@@ -241,7 +236,7 @@ def crawl_url(url):
                 if is_valid_url(full_url):
                     discovered_urls.append(full_url)
 
-        # <a> links internal to site
+        # Links <a> internos ao site
         for a in soup.find_all("a", href=True):
             link = urljoin(url, a["href"])
             if link.startswith(SITE_URL):
@@ -254,7 +249,7 @@ def crawl_url(url):
                 try:
                     r = requests.head(hidden_url, headers=headers, timeout=5)
                     if r.status_code == 200 and hidden_url not in visited:
-                        log(f"[HIDDEN PATH FOUND] {hidden_url}", "MAGENTA")
+                        log(f"[CAMINHO OCULTO ENCONTRADO] {hidden_url}", "MAGENTA")
                         discovered_urls.append(hidden_url)
                 except Exception:
                     pass
@@ -263,49 +258,47 @@ def crawl_url(url):
             executor.map(crawl_url, discovered_urls)
 
     except Exception as e:
-        log(f"[ERROR] {url}: {e}", "ERROR")
-
-# -------------------- AUTO MODE CRAWL --------------------
+        log(f"[ERRO] {url}: {e}", "ERROR")
+# -------------------- MODO AUTOMÁTICO DE CRAWLING --------------------
 def auto_mode_crawl():
     global SITE_URL
     global OFFLINE_MODE
 
-    log(f"Starting AUTO_MODE crawl for {SITE_URL}")
+    log(f"Iniciando varredura AUTOMÁTICA para {SITE_URL}")
     try:
         https_url = "https://" + urlparse(SITE_URL).netloc
         r = requests.head(https_url, timeout=5)
         if r.status_code < 400:
-            log("HTTPS available, using HTTPS")
+            log("HTTPS disponível, usando HTTPS")
             SITE_URL = https_url
         else:
             http_url = "http://" + urlparse(SITE_URL).netloc
             r2 = requests.head(http_url, timeout=5)
             if r2.status_code < 400:
-                log("HTTPS not available, using HTTP")
+                log("HTTPS não disponível, usando HTTP")
                 SITE_URL = http_url
             else:
-                log("Site offline, enabling local OFFLINE mode")
+                log("Site offline, ativando modo OFFLINE local")
                 OFFLINE_MODE = True
 
         if not OFFLINE_MODE:
             crawl_url(SITE_URL)
         else:
-            log("OFFLINE MODE enabled, serving from cache")
+            log("MODO OFFLINE ativado, servindo do cache")
 
     except Exception as e:
-        log(f"[AUTO_MODE ERROR] {e}", "ERROR")
+        log(f"[ERRO MODO AUTOMÁTICO] {e}", "ERROR")
         OFFLINE_MODE = True
-
-# -------------------- MIRROR SUPPORT --------------------
+# -------------------- SUPORTE A MIRRORS --------------------
 def ask_user_about_mirror(filename, mirrorurl):
     global ACCEPT_ALL_MIRRORS
     if ACCEPT_ALL_MIRRORS:
         return True
-    print(f"\nA mirror was found. Do you want to download the file {filename} from mirror {mirrorurl}?")
-    print("[Y] Yes   [N] No   [A] Accept all from now on")
+    print(f"\nUm mirror foi encontrado. Deseja baixar o arquivo {filename} do mirror {mirrorurl}?")
+    print("[S] Sim   [N] Não   [A] Aceitar todos daqui para frente")
     while True:
-        choice = input("Your choice (Y/N/A): ").strip().lower()
-        if choice == "y":
+        choice = input("Sua escolha (S/N/A): ").strip().lower()
+        if choice == "s":
             return True
         elif choice == "n":
             return False
@@ -313,23 +306,22 @@ def ask_user_about_mirror(filename, mirrorurl):
             ACCEPT_ALL_MIRRORS = True
             return True
         else:
-            print("Invalid option, please try again.")
+            print("Opção inválida, tente novamente.")
 
 def download_with_mirrors(url, mirrors):
     filename = url.split("/")[-1]
     for mirror in mirrors:
         try:
             if ask_user_about_mirror(filename, mirror):
-                log(f"Downloading {filename} from mirror {mirror}")
+                log(f"Baixando {filename} do mirror {mirror}")
                 r = requests.get(mirror, timeout=15)
                 r.raise_for_status()
                 return r.content
         except Exception as e:
-            log(f"Failed to download from mirror {mirror}: {e}", "WARN")
-    log(f"Failed to download {filename} from all mirrors", "ERROR")
+            log(f"Falha ao baixar do mirror {mirror}: {e}", "WARN")
+    log(f"Falha ao baixar {filename} de todos os mirrors", "ERROR")
     return None
-
-# -------------------- FLASK PROXY --------------------
+# -------------------- PROXY FLASK --------------------
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=["GET", "POST"])
 def proxy(path):
@@ -350,29 +342,27 @@ def proxy(path):
             r = requests.post(full_url, data=data, headers=headers)
             return Response(r.content, status=r.status_code, content_type=r.headers.get("Content-Type"))
         except Exception as e:
-            return Response(f"[POST ERROR] {e}", status=502)
+            return Response(f"[ERRO POST] {e}", status=502)
 
     if os.path.exists(local_file):
         mime = mimetypes.guess_type(local_file)[0] or "application/octet-stream"
         try:
             return send_file(local_file, mimetype=mime, conditional=True)
         except Exception as e:
-        	return send_file(local_file, mimetype=mime, conditional=True)
-        except Exception as e:
-            log(f"[ERROR] Sending file {local_file}: {e}", "ERROR")
-            return Response(f"Error reading file {local_file}", status=500)
+            log(f"[ERRO] Enviando arquivo {local_file}: {e}", "ERROR")
+            return Response(f"Erro ao ler arquivo {local_file}", status=500)
 
-    # If file not found locally, try to fetch from remote site
+    # Se arquivo não existe localmente, tenta buscar do site remoto
     device = detect_device()
     headers = get_headers(device)
     try:
         log(f"[PROXY GET] {full_url} [{device}]")
         r = requests.get(full_url, headers=headers, timeout=15, stream=True)
         r.raise_for_status()
-        content = r.content  # Save raw compressed content as is (no decompression)
+        content = r.content  # Salva conteúdo comprimido bruto, sem decompressão
         save_file(full_url, content)
 
-        # Respond with original headers for correct content handling
+        # Responde com headers originais para correto tratamento do conteúdo
         response = Response(content, status=r.status_code)
         response.headers['Content-Type'] = r.headers.get('Content-Type', 'application/octet-stream')
         response.headers['Content-Encoding'] = r.headers.get('Content-Encoding', '')
@@ -381,16 +371,15 @@ def proxy(path):
         return response
 
     except requests.exceptions.RequestException as e:
-        log(f"[ERROR] Failed to proxy {full_url}: {e}", "ERROR")
-        return Response(f"Failed to fetch {full_url}", status=502)
-
-# -------------------- MAIN --------------------
+        log(f"[ERRO] Falha ao proxy {full_url}: {e}", "ERROR")
+        return Response(f"Falha ao buscar {full_url}", status=502)
+# -------------------- PRINCIPAL --------------------
 if __name__ == "__main__":
     if not OFFLINE_MODE and ENABLE_CRAWLING:
-        log(f"Starting crawl for {SITE_URL} ({device_type})")
+        log(f"Iniciando varredura para {SITE_URL} ({device_type})")
         auto_mode_crawl()
     else:
-        log("Offline mode or crawling disabled, serving cached files")
+        log("Modo offline ou crawling desabilitado, servindo arquivos em cache")
 
     os.makedirs(SRC_FOLDER, exist_ok=True)
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
