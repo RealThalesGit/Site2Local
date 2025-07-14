@@ -6,8 +6,6 @@ import hashlib
 import mimetypes
 import json
 import requests
-import brotli
-import gzip
 import time
 import colorama
 from colorama import Fore, Style
@@ -39,9 +37,9 @@ def log(msg, level="INFO"):
     print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
 
 # -------------------- USER CONFIGURATION --------------------
-raw_site_url = "web.whatsapp.com"  # Without http:// or https://
-PORT = 80
-HEADER_DEVICE = "desktop"  # desktop, mobile, tablet, bot, auto
+raw_site_url = "speedtest.net"  # Without http:// or https://
+PORT = 8080
+HEADER_DEVICE = "mobile" # desktop, mobile, tablet, bot, auto
 
 OFFLINE_MODE = False
 SAVE_TRAFFIC = False
@@ -128,17 +126,6 @@ def save_file(url, content):
     downloaded_files.add(url)
     return path
 
-def decompress_content(response):
-    try:
-        encoding = response.headers.get("Content-Encoding", "").lower()
-        if "br" in encoding:
-            return brotli.decompress(response.content)
-        if "gzip" in encoding:
-            return gzip.decompress(response.content)
-    except Exception as e:
-        log(f"Failed to decompress: {e}", "WARN")
-    return response.content
-
 def get_headers(device):
     base = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -204,9 +191,7 @@ def crawl_url(url):
         log(f"[GET] {url} [{device}]")
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        content = decompress_content(r)
-        if not content:
-            return
+        content = r.content  # Save raw content, no decompression
 
         # Save directly if not HTML
         if b"<html" not in content[:500].lower():
@@ -372,73 +357,40 @@ def proxy(path):
         try:
             return send_file(local_file, mimetype=mime, conditional=True)
         except Exception as e:
-            return Response(f"[ERROR SERVING FILE] {e}", status=500)
+        	return send_file(local_file, mimetype=mime, conditional=True)
+        except Exception as e:
+            log(f"[ERROR] Sending file {local_file}: {e}", "ERROR")
+            return Response(f"Error reading file {local_file}", status=500)
 
-    if OFFLINE_MODE:
-        if full_url in saved_traffic:
-            cache = saved_traffic[full_url]
-            content = bytes.fromhex(cache["content"])
-            return Response(content, status=cache.get("status", 200), content_type=cache.get("headers", {}).get("Content-Type", "text/html"))
-
+    # If file not found locally, try to fetch from remote site
+    device = detect_device()
+    headers = get_headers(device)
     try:
-        headers = get_headers(detect_device())
-        r = requests.get(full_url, headers=headers, timeout=15)
+        log(f"[PROXY GET] {full_url} [{device}]")
+        r = requests.get(full_url, headers=headers, timeout=15, stream=True)
         r.raise_for_status()
-        content = decompress_content(r)
-        os.makedirs(os.path.dirname(local_file), exist_ok=True)
-        with open(local_file, "wb") as f:
-            f.write(content)
-        if SAVE_TRAFFIC:
-            with traffic_lock:
-                saved_traffic[full_url] = {
-                    "content": content.hex(),
-                    "headers": dict(r.headers),
-                    "status": r.status_code,
-                    "timestamp": time.time()
-                }
-                save_traffic_cache()
-        return Response(content, status=r.status_code, content_type=r.headers.get("Content-Type", "text/html"))
-    except Exception as e:
-        return Response(f"[ERROR FETCHING] {full_url}: {e}", status=502)
+        content = r.content  # Save raw compressed content as is (no decompression)
+        save_file(full_url, content)
 
-# -------------------- TRAFFIC CACHE HANDLING --------------------
-def load_traffic_cache():
-    global saved_traffic
-    if os.path.exists(TRAFFIC_CACHE_FILE):
-        try:
-            with open(TRAFFIC_CACHE_FILE, "r") as f:
-                saved_traffic = json.load(f)
-            log(f"Cache loaded with {len(saved_traffic)} URLs", "DEBUG")
-        except Exception as e:
-            log(f"Failed to load cache: {e}", "WARN")
-            saved_traffic = {}
-    else:
-        saved_traffic = {}
+        # Respond with original headers for correct content handling
+        response = Response(content, status=r.status_code)
+        response.headers['Content-Type'] = r.headers.get('Content-Type', 'application/octet-stream')
+        response.headers['Content-Encoding'] = r.headers.get('Content-Encoding', '')
+        response.headers['Cache-Control'] = r.headers.get('Cache-Control', 'no-cache')
 
-def save_traffic_cache():
-    with traffic_lock:
-        try:
-            os.makedirs(DATA_FOLDER, exist_ok=True)
-            with open(TRAFFIC_CACHE_FILE, "w") as f:
-                json.dump(saved_traffic, f)
-            log(f"Cache saved with {len(saved_traffic)} URLs", "DEBUG")
-        except Exception as e:
-            log(f"Failed to save cache: {e}", "WARN")
+        return response
+
+    except requests.exceptions.RequestException as e:
+        log(f"[ERROR] Failed to proxy {full_url}: {e}", "ERROR")
+        return Response(f"Failed to fetch {full_url}", status=502)
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    load_traffic_cache()
-
-    device_type = HEADER_DEVICE if HEADER_DEVICE != "auto" else "desktop"
-
-    if ENABLE_CRAWLING:
-        if HEADER_DEVICE == "auto":
-            device_type = "desktop"
+    if not OFFLINE_MODE and ENABLE_CRAWLING:
         log(f"Starting crawl for {SITE_URL} ({device_type})")
-        if not OFFLINE_MODE:
-            auto_mode_crawl()
-        else:
-            log("OFFLINE MODE enabled, using cache only.")
+        auto_mode_crawl()
+    else:
+        log("Offline mode or crawling disabled, serving cached files")
 
-    log(f"Starting server at http://0.0.0.0:{PORT}")
+    os.makedirs(SRC_FOLDER, exist_ok=True)
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
