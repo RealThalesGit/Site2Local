@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# thank u chatgpt
+import os
+import sys
+import threading
+import hashlib
+import mimetypes
+import socket
+import queue
+import warnings
+import re
+from urllib.parse import urljoin, urlparse, urldefrag
+import cloudscraper
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from flask import Flask, Response, send_file
+import colorama
+from colorama import Fore, Style
+# =========================================================
+# GLOBAL SETUP
+# =========================================================
+
+sys.setrecursionlimit(20000)
+colorama.init(autoreset=True)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+class Colors:
+    RESET = Style.RESET_ALL
+    RED = Fore.RED
+    GREEN = Fore.GREEN
+    YELLOW = Fore.YELLOW
+    CYAN = Fore.CYAN
+    MAGENTA = Fore.MAGENTA
+
+def log(msg, level="INFO"):
+    color = {
+        "INFO": Colors.GREEN,
+        "WARN": Colors.YELLOW,
+        "ERROR": Colors.RED,
+        "DEBUG": Colors.CYAN,
+        "MIRROR": Colors.MAGENTA,
+    }.get(level, Colors.GREEN)
+    print(f"{color}[Site2Local] [{level}] {msg}{Colors.RESET}")
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+RAW_SITE_URL = "example.com"
+PORT = 8080
+HEADER_DEVICE = "desktop"   # mobile, tablet, desktop, macintosh, ie11, iphone, ipad, symbian, bot
+ENABLE_CRAWLING = True
+OFFLINE_MODE = False
+SAVE_TRAFFIC = False
+SAVE_ERROR_PAGES = False
+DUMP_FRENESIS = False
+REQUEST_TIMEOUT = 6
+MAX_WORKERS = 60
+MAX_FILENAME = 180
+
+CF_BLOCK_PATHS = (
+    "/cdn-cgi/",
+    "__cf_chl_",
+    "challenge-platform",
+    "orchestrate/chl",
+)
+
+CDN_BLACKLIST = () # you can block an cdn or site there.
+
+FRENESIS_TARGETS = {
+} # you can set an target to get everything from.
+
+# =========================================================
+# USER-AGENT PROFILES
+# =========================================================
+
+UA_PROFILES = {
+    "mobile": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+
+    "tablet": "Mozilla/5.0 (Linux; Android 13; SM-T837A) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+
+    "desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+
+    "macintosh": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/116.0.0.0 Safari/537.36",
+
+    "ie11": "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko",
+
+    "iphone": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+              "Version/16.6 Mobile/15E148 Safari/604.1",
+
+    "ipad": "Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.6 Mobile/15E148 Safari/604.1",
+
+    "symbian": "Mozilla/5.0 (Symbian/3; Series60/5.2 NokiaN8-00/012.002; "
+               "Profile/MIDP-2.1 Configuration/CLDC-1.1 ) "
+               "AppleWebKit/533.4 (KHTML, like Gecko) "
+               "NokiaBrowser/7.3.0 Mobile Safari/533.4 3gpp-gba",
+
+    "bot": "Googlebot/2.1 (+http://www.google.com/bot.html)",
+}
+
+# =========================================================
+# UA SANITIZATION
+# =========================================================
+
+def sanitize_ua(ua: str) -> str:
+    ua = re.sub(r"[\t\r\n]+", " ", ua).strip()
+    ua = ua.replace("; wv", "")
+    ua = re.sub(r" Version/[^ ]+", "", ua)
+
+    if "Android" in ua and "Chrome/" in ua:
+        ua = re.sub(r"Android [^;]+", "Android 10; K", ua)
+        ua = re.sub(r"Chrome/\d+\.\d+\.\d+\.\d+", "Chrome/116.0.0.0", ua)
+
+    return ua
+
+# =========================================================
+# HEADER SELECTOR
+# =========================================================
+
+def get_headers(device: str) -> dict:
+    if device not in UA_PROFILES:
+        log(f"Invalid HEADER_DEVICE '{device}', fallback to desktop...", "WARN")
+        device = "desktop"
+
+    return {
+        "User-Agent": sanitize_ua(UA_PROFILES[device]),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+    }
+
+# =========================================================
+# SCRAPER INIT
+# =========================================================
+
+scraper = cloudscraper.create_scraper()
+scraper.headers.update(get_headers(HEADER_DEVICE))
+
+# =========================================================
+# UTILS
+# =========================================================
+
+def strip_fragment(u):
+    return urldefrag(u)[0]
+
+def resolve_ip(host):
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return "unresolved"
+
+# =========================================================
+# RESPONSE DECODER
+# =========================================================
+
+def decode_response(resp):
+    return resp.content, resp.headers.get("Content-Type", "")
+
+# =========================================================
+# PATH HANDLING
+# =========================================================
+
+def safe_filename(name):
+    name = name.replace("\x00", "")
+    if len(name) <= MAX_FILENAME:
+        return name
+    base, ext = os.path.splitext(name)
+    h = hashlib.sha1(name.encode()).hexdigest()[:16]
+    return f"{base[:32]}_{h}{ext}"
+
+def local_path(u):
+    p = urlparse(strip_fragment(u))
+    path = p.path or "/"
+    if path.endswith("/") or not os.path.splitext(path)[1]:
+        path = path.rstrip("/") + "/index.html"
+    parts = [safe_filename(x) for x in path.split("/") if x]
+    return os.path.join(SRC_FOLDER, p.netloc.replace("www.", ""), *parts)
+
+# =========================================================
+# SITE INIT
+# =========================================================
+
+def build_base_url(raw):
+    for scheme in ("https://", "http://"):
+        try:
+            u = scheme + raw
+            r = scraper.get(u, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            log(f"Crawling {raw} with {HEADER_DEVICE} header. Target IP: {resolve_ip(urlparse(u).netloc)}")
+            if r.status_code < 500:
+                return r.url
+        except Exception:
+            pass
+    return None
+
+SITE_URL = build_base_url(RAW_SITE_URL)
+
+if not SITE_URL:
+    OFFLINE_MODE = True
+    SITE_URL = "http://" + RAW_SITE_URL
+    log("Offline mode enabled", "WARN")
+
+MAIN_HOST = urlparse(SITE_URL).netloc
+site_name = MAIN_HOST.replace("www.", "").replace(".", "_")
+
+SRC_FOLDER = os.path.join("site_src", site_name)
+DATA_FOLDER = os.path.join("site_data", site_name)
+
+os.makedirs(SRC_FOLDER, exist_ok=True)
+os.makedirs(DATA_FOLDER, exist_ok=True)
+
+# =========================================================
+# DOMAIN POLICY
+# =========================================================
+
+def is_allowed_domain(netloc):
+    if not netloc:
+        return True
+    if netloc == MAIN_HOST:
+        return True
+    if any(bad in netloc for bad in CDN_BLACKLIST):
+        return False
+    if not DUMP_FRENESIS:
+        return False
+    if not FRENESIS_TARGETS:
+        return True
+    return netloc in FRENESIS_TARGETS
+
+# =========================================================
+# STATE
+# =========================================================
+
+visited = set()
+visited_lock = threading.Lock()
+url_queue = queue.Queue()
+
+# =========================================================
+# CRAWLER
+# =========================================================
+
+def enqueue(u):
+    url_queue.put(strip_fragment(u))
+
+def save_file(u, data):
+    p = local_path(u)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "wb") as f:
+        f.write(data)
+    log(f"Saved: {p}", "DEBUG")
+
+def crawl(u):
+    with visited_lock:
+        if u in visited:
+            return
+        visited.add(u)
+
+    if any(x in u for x in CF_BLOCK_PATHS):
+        return
+
+    p = urlparse(u)
+    if not is_allowed_domain(p.netloc):
+        return
+
+    try:
+        r = scraper.get(u, timeout=REQUEST_TIMEOUT)
+    except Exception:
+        return
+
+    if r.status_code >= 400:
+        if SAVE_ERROR_PAGES:
+            save_file(u, r.content)
+        return
+
+    data, _ = decode_response(r)
+    save_file(u, data)
+
+    if b"<html" not in data[:2048].lower():
+        return
+
+    soup = BeautifulSoup(data.decode("utf-8", "ignore"), "lxml")
+
+    for tag in soup.find_all(["a", "script", "img", "link", "iframe", "source"]):
+        v = tag.get("href") or tag.get("src")
+        if v:
+            enqueue(urljoin(u, v))
+
+# =========================================================
+# THREADING
+# =========================================================
+
+def worker():
+    while True:
+        try:
+            u = url_queue.get(timeout=5)
+        except queue.Empty:
+            return
+        try:
+            crawl(u)
+        finally:
+            url_queue.task_done()
+
+def crawl_parallel():
+    for _ in range(MAX_WORKERS):
+        threading.Thread(target=worker, daemon=True).start()
+    url_queue.join()
+
+# =========================================================
+# PROXY
+# =========================================================
+
+app = Flask(__name__)
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def proxy(path):
+    target = urljoin(SITE_URL + "/", path)
+    p = local_path(target)
+
+    if os.path.isfile(p):
+        return send_file(p, mimetype=mimetypes.guess_type(p)[0])
+
+    try:
+        r = scraper.get(target, timeout=REQUEST_TIMEOUT)
+        data, ctype = decode_response(r)
+        save_file(target, data)
+
+        if is_allowed_domain(urlparse(target).netloc):
+            enqueue(target)
+
+        return Response(data, status=r.status_code, content_type=ctype)
+    except Exception:
+        return Response("Fetch failed", status=502)
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+    if ENABLE_CRAWLING and not OFFLINE_MODE:
+        enqueue(SITE_URL)
+        crawl_parallel()
+
+    log(f"Server running on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
+
