@@ -90,9 +90,9 @@ MIMETYPE_FILE = "mimetypes.csv" # loads all the static mimetypes! csv from iana
 ENABLE_CRAWLING = True # if you dont want to download it all again, just disable it
 OFFLINE_MODE = False # yes
 SAVE_ERROR_PAGES = False # deeeeeeebug
-DUMP_FRENESIS = False # get them
+DUMP_FRENESIS = True # get them
 DISABLE_INTERESTING_EXT_READ = False # you want to use only dynamic ext reading if you want to disable this
-ENABLE_RAINBOW_LOGS = False # fun mode
+ENABLE_RAINBOW_LOGS = True # fun mode
 REQUEST_TIMEOUT = 6 # strategic pause =)
 MAX_WORKERS = 60 # take care
 MAX_FILENAME = 180
@@ -345,6 +345,9 @@ def save_worker():
         if batch and (len(batch) >= SAVE_BATCH or time.time() - last_flush >= SAVE_FLUSH_TIME):
             for p, data in batch:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
+                # fs conflict guard
+                if os.path.isdir(p):
+                    p = os.path.join(p, "index.html")
                 with open(p, "wb") as f:
                     f.write(data)
                 log(f"Saved: {p}", "DEBUG")
