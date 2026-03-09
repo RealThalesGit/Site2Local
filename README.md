@@ -12,3 +12,5 @@ Yes, you can edit free like a bird, and again, dont use it for malicious purpose
 
 # Optional Things
 Dont forget to share, fork it and contribute to it!
+
+License: WTFPL
