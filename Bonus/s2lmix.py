@@ -66,7 +66,7 @@ def log(msg, level="INFO"):
     full = f"[Site2Local] [{level}] {msg}"
     print(lolcat_text(full) if ENABLE_RAINBOW_LOGS else f"{color}{full}{Colors.RESET}")
 
-RAW_SITE_URL = "web.whatsapp.com"
+RAW_SITE_URL = "example.com"
 HOST = "0.0.0.0"
 PORT = 8080
 HEADER_DEVICE = "desktop"
@@ -75,13 +75,12 @@ ENABLE_CRAWLING = True
 OFFLINE_MODE = False
 SAVE_TRAFFIC = False
 SAVE_ERROR_PAGES = False
-DUMP_FRENESIS = True
+DUMP_FRENESIS = False
 DISABLE_MIMETYPES_READING = False
 ENABLE_RAINBOW_LOGS = False
-SHOW_HIDDEN = True
-SCAN_HIDDEN_PATHS = True
+SHOW_HIDDEN = False
+SCAN_HIDDEN_PATHS = False
 ACCEPT_ALL_MIRRORS = True
-
 REQUEST_TIMEOUT = 6
 MAX_WORKERS = 60
 MAX_FILENAME = 180
