@@ -111,10 +111,10 @@ DOWNLOAD_OTHERS  = True   # download + proxy external assets (CDN/third-party)
                            # rewrites HTML so browser fetches them via /__s2l_ext__/
                            # also used as fallback upstream when MAIN_HOST returns 404
 DISABLE_MIMETYPES_READING = False
-ENABLE_RAINBOW_LOGS = True  # uses system lolcat if installed, else internal rainbow
+ENABLE_RAINBOW_LOGS = False  # uses system lolcat if installed, else internal rainbow
 SHOW_HIDDEN       = False  # strip display:none/hidden/disabled from HTML
 SCAN_HIDDEN_PATHS = False  # probe sensitive paths (admin, .git, .env…) at startup
-JUST_GIVEME_EVERYTHING = True  # dump every proxied request+response as JSON to DATA_FOLDER/captures/
+JUST_GIVEME_EVERYTHING = False  # dump every proxied request+response as JSON to DATA_FOLDER/captures/
 CAPTURE_REQUEST_BODY   = True   # include request body in capture (POST, PUT, PATCH…)
 CAPTURE_SKIP_STATIC    = True   # skip images/fonts/JS/CSS from capture (reduces noise)
 HIDDEN_PATHS_EXTRA: list = []
