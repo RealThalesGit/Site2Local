@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-import os, sys, re, csv, json, time, socket, queue, zlib
+import os, sys, re, json, time, socket, queue, zlib, gc
 import hashlib, mimetypes, logging, threading, warnings
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+mimetypes.add_type("application/wasm", ".wasm")
+mimetypes.add_type("image/avif", ".avif")
+mimetypes.add_type("image/webp", ".webp")
+import shutil, subprocess, tempfile, datetime
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable
 import base64
-import struct as _struct
-import ssl as _ssl_mod
-import hashlib as _hashlib_ws
-import base64 as _base64
+import struct
+import ssl
 from urllib.parse import urljoin, urlparse, urldefrag
 import requests
 import requests.adapters
 import urllib3
 import urllib3.util.retry
-import cloudscraper
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from flask import Flask, Response, stream_with_context, request as flask_request, redirect
 from werkzeug.serving import WSGIRequestHandler
@@ -24,14 +27,27 @@ try:
     _BROTLI_OK = True
 except ImportError:
     _BROTLI_OK = False
+# cloudscraper: pure-Python Cloudflare bypass, used as the fallback tier when
+# curl_cffi isn't available or fails (see _make_session / the session-factory
+# priority list). It was previously a hard top-level import — if it wasn't
+# installed the WHOLE SCRIPT crashed at startup with ModuleNotFoundError,
+# before ever reaching the fallback logic that exists specifically to cope
+# with it being missing. Guarded the same way as brotli/curl_cffi below.
+try:
+    import cloudscraper
+    _CLOUDSCRAPER_OK = True
+except ImportError:
+    _CLOUDSCRAPER_OK = False
 # curl_cffi: real Chrome TLS fingerprinting — much more effective vs Cloudflare
 # than cloudscraper (which uses Python ssl and has a detectable JA3 fingerprint).
 # Install with: pip install curl-cffi --break-system-packages (not recommended on linux, use venv.)
 try:
     from curl_cffi import requests as _cffi_requests
+    from curl_cffi.const import CurlWsFlag as _CurlWsFlag
     _CURL_CFFI_OK = True
 except ImportError:
     _cffi_requests = None
+    _CurlWsFlag    = None
     _CURL_CFFI_OK  = False
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -64,9 +80,14 @@ _LEVEL_COLOR: dict[str, str] = {
     "WARN":  Fore.YELLOW,
     "ERROR": Fore.RED     + Style.BRIGHT,
     "DEBUG": Fore.CYAN    + Style.DIM,
+    "WS":    Fore.BLUE    + Style.BRIGHT,    # v6: WebSocket events
+    "SSE":   Fore.MAGENTA,                    # v6: SSE events
+    "TUNNEL":Fore.MAGENTA + Style.BRIGHT,    # v6: TCP/UDP tunnel
 }
 
 def _lolcat_internal(text: str) -> str:
+    """Palette-cycling fallback used when the real `lolcat` binary isn't
+    installed or doesn't behave the way we expect it to."""
     plain = _ANSI_ESC.sub("", text)
     out, i = [], 0
     for ch in plain:
@@ -77,26 +98,89 @@ def _lolcat_internal(text: str) -> str:
             i += 1
     return "".join(out) + Style.RESET_ALL
 
+# Real lolcat detection — shutil.which() resolves through $PATH, so this works
+# identically whether lolcat was installed via pacman (Arch), apt (Debian/
+# Ubuntu), the ruby gem, pip, cargo, or a Termux package: whatever the shell
+# would run for `lolcat` is exactly what this finds, no distro-specific path
+# guessing required.
+_LOLCAT_BIN: str | None       = shutil.which("lolcat")
+_lolcat_mode: list | bool | None = None   # None=not probed, False=unusable, list=working argv tail
+_lolcat_probe_lock            = threading.Lock()
+
+def _probe_lolcat() -> list | bool:
+    """One-time detection of which lolcat CLI dialect is installed.
+
+    Different distros/ecosystems ship different `lolcat` implementations
+    (the original Ruby gem, and Python/Rust/Go rewrites) with different flags
+    for forcing color output when stdout isn't a TTY — which it never is here,
+    since every invocation goes through subprocess. Probe once at first use,
+    remember whichever flag combination actually produced ANSI-colored output,
+    and never re-probe (or re-pay the probe cost) for the rest of the run.
+    """
+    global _lolcat_mode
+    with _lolcat_probe_lock:
+        if _lolcat_mode is not None:
+            return _lolcat_mode
+        if not _LOLCAT_BIN:
+            _lolcat_mode = False
+            return False
+        for args in (["-f"], ["--force"], []):
+            try:
+                p = subprocess.run([_LOLCAT_BIN, *args], input=b"s2l\n",
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=1.5)
+                if p.returncode == 0 and p.stdout and b"\x1b[" in p.stdout:
+                    _lolcat_mode = args
+                    return args
+            except Exception:
+                continue
+        _lolcat_mode = False
+        return False
+
+def _lolcat_real(text: str) -> str | None:
+    """Pipe one line through the real lolcat binary. Returns None (never
+    raises) on any failure so the caller can fall back to the internal
+    palette — a broken pipe here must never take down logging itself."""
+    mode = _probe_lolcat()
+    if mode is False:
+        return None
+    try:
+        p = subprocess.run([_LOLCAT_BIN, *mode], input=text.encode("utf-8", "replace"),
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=0.5)
+        if p.returncode == 0 and p.stdout:
+            out = p.stdout.decode("utf-8", "replace")
+            # Some lolcat builds wrap at a default terminal width (commonly 80
+            # cols) when stdout isn't a TTY, which would split one log line
+            # into several and break the one-line-per-entry log format. Treat
+            # that as a miss rather than print a mangled multi-line entry.
+            if out.count("\n") > 1:
+                return None
+            return out.rstrip("\n")
+    except Exception:
+        pass
+    return None
+
 def log(msg: str, level: str = "INFO") -> None:
     ts    = time.strftime("%H:%M:%S")
     color = _LEVEL_COLOR.get(level, Fore.WHITE)
     tag   = f"{color}[{level}]{Style.RESET_ALL}"
     line  = f"{Style.DIM}{ts}{Style.RESET_ALL} {tag} {msg}"
     with _log_lock:
-        print(_lolcat_internal(line) if RAINBOW_LOGS else line)
+        if RAINBOW_LOGS:
+            print(_lolcat_real(line) or _lolcat_internal(line))
+        else:
+            print(line)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-
-SITE = "example.com"          # target domain or URL
+SITE = "exmaple.com"          # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
-MIME_FILE = "mimetypes.csv"
 TIMEOUT_READ = 12              # upstream read timeout (s)
 TIMEOUT_CONN = 6               # upstream connect timeout (s)
-WORKERS = 40                   # crawler thread-pool size
+WORKERS = 86                   # crawler thread-pool size
 MAX_FNAME = 180                # max on-disk path-segment length
 SAVE_BATCH = 32                # files per save-flush
 SAVE_INTERVAL = 0.15           # max seconds between save flushes
@@ -111,16 +195,42 @@ DUMP_ALL = False               # extract + crawl every URL found in any response
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = False                # Tkinter traffic inspector + live hook editor
+HOOK_GUI = True                # Tkinter traffic inspector + live hook editor
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False              # probe /.git/.env/admin/etc at startup → JSON report
 CAPTURE = False                  # record every request+response as JSON
 CAPTURE_CDN = False              # include CDN responses in captures
-CAPTURE_BODIES = True            # include request bodies in captures
+CAPTURE_BODIES = False            # include request bodies in captures
 CAPTURE_SKIP_STATIC = True       # skip images/fonts/JS/CSS from captures
-COOP_COEP = False                # COOP + COEP + CORP headers (for WASM threads / SharedArrayBuffer)
+# NOTE: COOP/COEP used to be a manual global toggle. It's now PASSIVE (see
+# filter_resp): the origin's own Cross-Origin-Opener/Embedder-Policy headers
+# are simply no longer stripped, and a content-sniff heuristic adds safe
+# defaults on top-level HTML that looks like it needs isolation (SharedArrayBuffer
+# / WASM threads / Worker) but wasn't sent any — no flag to remember to flip.
+FIREFOX_PROXY = False             # MITM forward proxy for the actual browser (root CA + CONNECT tunnel)
+FIREFOX_PROXY_PORT = 8443         # port to point Firefox's manual proxy config at
 EXTRA_PATHS: list = []           # extra paths to probe in SCAN_PATHS mode
+# ──────────────────────────────────────────────────────────────────────────────
+# LAYER 2 CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
+WS_PING_INTERVAL    = 0        # seconds between WS keepalive pings (0 = off)
+WS_PONG_TIMEOUT     = 30       # seconds to wait for pong before declaring dead
+WS_AUTO_RECONNECT   = True     # transparently re-establish dropped WS upstreams
+WS_DEFLATE          = False    # negotiate permessage-deflate (RFC 7692)
+WS_LOG_FRAMES       = False    # log every WS frame (verbose; for debugging)
+WS_MAX_MSG_BYTES    = 8 * 1024 * 1024   # hard cap on reassembled WS message size
+SSE_PROXY           = True     # proxy Server-Sent Events streams (text/event-stream)
+SSE_HEARTBEAT       = 15       # seconds between injected SSE keepalives (0 = off)
+HTTP2_UPSTREAM      = True     # use HTTP/2 for upstream when available (curl_cffi)
+TCP_TUNNEL          = False    # /__s2l_tcp__/<host:port> raw TCP tunnel route
+UDP_TUNNEL          = False    # /__s2l_udp__/<host:port> raw UDP tunnel route
+TUNNEL_TIMEOUT      = 300      # idle timeout (s) for raw TCP/UDP tunnels
+POOL_MAXSIZE        = 64       # per-session connection pool size (was 32)
+POOL_CONNECTIONS    = 32       # per-session connection pool slots (was 16)
+DEAD_HOST_TTL       = 60       # seconds to remember a dead upstream host
+STATS_WINDOW        = 60       # seconds for rolling stats window
+GRACEFUL_SHUTDOWN   = True     # drain in-flight requests on SIGTERM
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Filters / constants
@@ -199,7 +309,6 @@ else:
     _CONN_ERRORS = _CONN_ERRORS_BASE
 
 _EXT_PREFIX  = "/__s2l_ext__"
-
 
 def _raw_path_after(marker: str) -> str | None:
     """Return the RAW (still percent-encoded) request path following `marker`.
@@ -321,10 +430,8 @@ class HookContext:
         self.req_body = json.dumps(obj, ensure_ascii=False).encode()
         self.req_headers["content-type"] = "application/json; charset=utf-8"
 
-
 _REQ_HOOKS:  list[tuple[re.Pattern, frozenset, Callable]] = []
 _RESP_HOOKS: list[tuple[re.Pattern, frozenset, Callable]] = []
-
 
 def _norm_methods(methods) -> frozenset:
     if methods in ("*", None):
@@ -332,7 +439,6 @@ def _norm_methods(methods) -> frozenset:
     if isinstance(methods, str):
         methods = [methods]
     return frozenset(m.upper() for m in methods)
-
 
 def on_request(pattern: str = r".*", methods="*") -> Callable:
     pat  = re.compile(pattern, re.IGNORECASE)
@@ -343,7 +449,6 @@ def on_request(pattern: str = r".*", methods="*") -> Callable:
         return fn
     return decorator
 
-
 def on_response(pattern: str = r".*", methods="*") -> Callable:
     pat  = re.compile(pattern, re.IGNORECASE)
     mset = _norm_methods(methods)
@@ -352,7 +457,6 @@ def on_response(pattern: str = r".*", methods="*") -> Callable:
         log(f"resp hook [{','.join(sorted(mset))}] {pattern} → {fn.__name__}()", "HOOK")
         return fn
     return decorator
-
 
 def _run_hooks(hooks: list, ctx: HookContext) -> int:
     n = 0
@@ -413,14 +517,13 @@ def _run_hooks(hooks: list, ctx: HookContext) -> int:
 
 # Each entry pushed to the GUI: full body included for editor display
 _gui_log_queue: queue.Queue = queue.Queue(maxsize=2000)
-
+_gui_drop_last_log: list = [0.0]   # [last_drop_ts] — throttled WARN throttle
 # Active GUI request hooks (list of dicts, mutated only on GUI thread)
 # {name, method, pattern, body_bytes, enabled: bool}
 # Mirrors _gui_hooks below but overrides the body WE SEND to the real upstream,
 # applied before the fetch — not the body the browser receives back.
 _gui_req_hooks: list[dict] = []
 _gui_req_hooks_lock = threading.Lock()
-
 
 def _apply_gui_req_hooks(ctx: HookContext) -> None:
     """Apply the first matching enabled GUI request hook. Thread-safe.
@@ -461,11 +564,64 @@ def _apply_gui_req_hooks(ctx: HookContext) -> None:
             f"{_fmt_size(len(new_body))}", "HOOK")
         break
 
-
 # Active GUI hooks  (list of dicts, mutated only on GUI thread)
 _gui_hooks: list[dict] = []   # {name, method, status, pattern, body_bytes, enabled: bool}
 _gui_hooks_lock = threading.Lock()
 
+# ── FIREFOX_PROXY request log + hooks ───────────────────────────────────────
+# Mirrors _gui_log_queue / _gui_req_hooks above, but fed by the MITM forward
+# proxy's live browser traffic (any site) instead of the reverse proxy's own
+# fetches for MAIN_HOST. Defined at module level (not inside the GUI) because
+# the MITM connection handler runs in background threads regardless of
+# whether the GUI happens to be open.
+_gui_fwd_log_queue: queue.Queue = queue.Queue(maxsize=2000)
+_gui_fwd_req_hooks: list[dict]  = []   # {name, method, pattern, body_bytes, enabled}
+_gui_fwd_req_hooks_lock = threading.Lock()
+
+def _gui_fwd_push(tag: str, method: str, host: str, path: str, status,
+                   req_headers: dict, body: bytes) -> None:
+    if not HOOK_GUI:
+        return
+    try:
+        _gui_fwd_log_queue.put_nowait({
+            "ts":     time.strftime("%H:%M:%S"),
+            "method": method,
+            "path":   f"[{tag}] {host}{path}",
+            "status": status,
+            "ct":     req_headers.get("Content-Type", req_headers.get("content-type", "")),
+            "size":   len(body or b""),
+            "body":   body if body else b"(empty request body)",
+            "req_headers": req_headers,
+        })
+    except queue.Full:
+        pass
+
+def _apply_fwd_req_hooks(method: str, path: str, headers: dict, body: bytes) -> bytes:
+    """Apply the first matching enabled Firefox-Proxy request hook.
+
+    Overrides the body of a REAL, live browser request before it's forwarded
+    upstream (passthru case) — the on-the-wire equivalent of
+    _apply_gui_req_hooks, which only ever sees the reverse proxy's own
+    fetches for MAIN_HOST.
+    """
+    with _gui_fwd_req_hooks_lock:
+        hooks = list(_gui_fwd_req_hooks)
+    for h in hooks:
+        if not h["enabled"]:
+            continue
+        mf = h["method"].strip().upper()
+        if mf not in ("", "*") and method.upper() != mf:
+            continue
+        try:
+            if not re.search(h["pattern"], path, re.IGNORECASE):
+                continue
+        except re.error:
+            continue
+        new_body = h["body_bytes"]
+        headers["Content-Length"] = str(len(new_body))
+        log(f"fwd req hook '{h['name']}' matched {method} {path}", "HOOK")
+        return new_body
+    return body
 
 def _gui_push(ctx: HookContext) -> None:
     """Push a proxied request/response to the GUI traffic log with body."""
@@ -499,8 +655,12 @@ def _gui_push(ctx: HookContext) -> None:
             "body":   display_body,        # what the editor shows
         })
     except queue.Full:
-        log(f"GUI queue full — dropped {ctx.method} {ctx.path}", "WARN")
-
+        # Throttle: only log the first drop in a 5-second window, otherwise
+        # a busy site floods the console with hundreds of identical WARNs.
+        now = time.time()
+        if now - _gui_drop_last_log[0] > 5.0:
+            log(f"GUI queue full — dropping entries ({ctx.method} {ctx.path} …)", "WARN")
+            _gui_drop_last_log[0] = now
 
 def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
                   display_tag: str = "") -> None:
@@ -542,7 +702,6 @@ def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
         })
     except queue.Full:
         pass
-
 
 def _apply_gui_hooks(ctx: HookContext) -> None:
     """Apply the first matching enabled GUI hook. Thread-safe."""
@@ -590,6 +749,84 @@ def _apply_gui_hooks(ctx: HookContext) -> None:
             f"[{ctx.resp_status}]  {_fmt_size(len(new_body))}", "HOOK")
         break
 
+def _make_hook_store(subdir: str):
+    """Factory for a hook-list disk-persistence helper.
+
+    Shared by every hook editor (response hooks, request-body-override hooks,
+    and the Firefox-Proxy request hooks added below) so the save/delete/load
+    logic exists in exactly one, correct place instead of being copy-pasted
+    per tab. Fixes two real bugs that existed in the old per-tab copies:
+      1. Deletion matched files by `str.startswith(safe_name)`, so deleting a
+         hook named "foo" also deleted a hook named "foobar" (same prefix).
+         Now the exact body/meta filenames are constructed and removed
+         directly — no directory scan, no collision.
+      2. The on-disk extension used to be sniffed from body content (.html /
+         .json / .txt); editing a hook's body into a different-looking format
+         silently orphaned the old file under its previous extension. Body is
+         now always stored as `{name}.body` — content sniffing for display
+         purposes still happens in the editor, it just no longer decides a
+         filename.
+    Writes are tmpfile+os.replace (atomic on POSIX), so a crash mid-save can
+    never leave a half-written body/meta pair for the loader to trip over.
+    """
+    hooks_dir = os.path.join("site_data", subdir, MAIN_HOST)
+    os.makedirs(hooks_dir, exist_ok=True)
+
+    def _paths(name: str) -> tuple[str, str]:
+        safe = re.sub(r"[^\w\-.]", "_", name)
+        p = os.path.join(hooks_dir, f"{safe}.body")
+        return p, p + ".meta.json"
+
+    def _atomic_write(target: str, data: bytes) -> None:
+        fd, tmp = tempfile.mkstemp(dir=hooks_dir, prefix=".tmp-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except Exception:
+            try: os.remove(tmp)
+            except OSError: pass
+            raise
+
+    def save(hook: dict) -> None:
+        try:
+            p, meta_path = _paths(hook["name"])
+            meta = {k: v for k, v in hook.items() if k != "body_bytes"}
+            _atomic_write(p, hook["body_bytes"])
+            _atomic_write(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+        except Exception as e:
+            log(f"Hook disk save failed ({subdir}): {e}", "ERROR")
+
+    def delete(name: str) -> None:
+        for fp in _paths(name):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+    def load_all(defaults: dict) -> list:
+        loaded = []
+        try:
+            for fn in sorted(os.listdir(hooks_dir)):
+                if not fn.endswith(".body.meta.json"):
+                    continue
+                meta_path = os.path.join(hooks_dir, fn)
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    body_file = meta_path[:-len(".meta.json")]
+                    if not os.path.isfile(body_file):
+                        continue
+                    with open(body_file, "rb") as f:
+                        body_bytes = f.read()
+                    loaded.append({**defaults, **meta, "body_bytes": body_bytes})
+                except Exception as e:
+                    log(f"Hook load error {fn} ({subdir}): {e}", "WARN")
+        except Exception:
+            pass
+        return loaded
+
+    return save, delete, load_all
 
 def _launch_hook_gui() -> None:
     """
@@ -1133,7 +1370,6 @@ def _launch_hook_gui() -> None:
         _btn(toolbar, "Export Hooks",         _export_hooks,      font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 4))
         _btn(toolbar, "Import Hooks",         _import_hooks,      font=("Consolas", 9)).pack(side=tk.LEFT)
 
-
         # ── BOTTOM: Active Hooks ──────────────────────────────────────────────
         _lbl(bot_area, "Active Hooks", fg=_ACC,
              font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(4, 2))
@@ -1247,88 +1483,18 @@ def _launch_hook_gui() -> None:
 
         _render_hook_rows()
 
-        # ── Hook disk persistence helpers ─────────────────────────────────────
-        _HOOKS_DIR = os.path.join("site_data", "MyHooks", MAIN_HOST)
-        os.makedirs(_HOOKS_DIR, exist_ok=True)
-
-        def _hook_disk_path(name: str, body_bytes: bytes) -> str:
-            """Determine file extension from body content."""
-            head = body_bytes[:64].lstrip()
-            if head.startswith(b"<"):
-                ext = ".html"
-            else:
-                try:
-                    json.loads(body_bytes)
-                    ext = ".json"
-                except Exception:
-                    ext = ".txt"
-            safe = re.sub(r"[^\w\-.]", "_", name)
-            return os.path.join(_HOOKS_DIR, f"{safe}{ext}")
-
-        def _hook_save_to_disk(hook: dict) -> None:
-            try:
-                p = _hook_disk_path(hook["name"], hook["body_bytes"])
-                meta = {
-                    "name":    hook["name"],
-                    "method":  hook["method"],
-                    "status":  hook["status"],
-                    "pattern": hook["pattern"],
-                    "enabled": hook["enabled"],
-                }
-                meta_path = p + ".meta.json"
-                with open(p, "wb") as f:
-                    f.write(hook["body_bytes"])
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, indent=2)
-            except Exception as e:
-                log(f"Hook disk save failed: {e}", "ERROR")
-
-        def _hook_delete_from_disk(name: str) -> None:
-            try:
-                for fn in os.listdir(_HOOKS_DIR):
-                    safe = re.sub(r"[^\w\-.]", "_", name)
-                    if fn.startswith(safe) and not fn.endswith(".meta.json"):
-                        os.remove(os.path.join(_HOOKS_DIR, fn))
-                    if fn == f"{safe}.meta.json" or fn.startswith(safe + "."):
-                        try:
-                            os.remove(os.path.join(_HOOKS_DIR, fn))
-                        except OSError:
-                            pass
-            except Exception as e:
-                log(f"Hook disk delete failed: {e}", "ERROR")
+        # ── Hook disk persistence — delegates to the shared store factory ──────
+        _hook_save_to_disk, _hook_delete_from_disk, _hook_load_all = _make_hook_store("MyHooks")
 
         def _load_hooks_from_disk() -> None:
             """Load previously saved hooks from site_data/MyHooks/{host}/ at startup."""
-            try:
-                for fn in sorted(os.listdir(_HOOKS_DIR)):
-                    if not fn.endswith(".meta.json"):
-                        continue
-                    meta_path = os.path.join(_HOOKS_DIR, fn)
-                    try:
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        body_file = meta_path[:-len(".meta.json")]
-                        if not os.path.isfile(body_file):
-                            continue
-                        with open(body_file, "rb") as f:
-                            body_bytes = f.read()
-                        hook = {
-                            "name":       meta.get("name", fn),
-                            "method":     meta.get("method", "*"),
-                            "status":     int(meta.get("status", 200)),
-                            "pattern":    meta.get("pattern", ".*"),
-                            "body_bytes": body_bytes,
-                            "enabled":    meta.get("enabled", True),
-                        }
-                        with _gui_hooks_lock:
-                            existing = [h["name"] for h in _gui_hooks]
-                            if hook["name"] not in existing:
-                                _gui_hooks.append(hook)
+            for hook in _hook_load_all({"name": "?", "method": "*", "status": 200,
+                                         "pattern": ".*", "enabled": True}):
+                hook["status"] = int(hook.get("status", 200) or 0)
+                with _gui_hooks_lock:
+                    if hook["name"] not in [h["name"] for h in _gui_hooks]:
+                        _gui_hooks.append(hook)
                         log(f"Loaded hook '{hook['name']}' from disk", "HOOK")
-                    except Exception as e:
-                        log(f"Hook load error {fn}: {e}", "WARN")
-            except Exception:
-                pass
 
         root.after(100, lambda: (_load_hooks_from_disk(), _render_hook_rows()))
 
@@ -1562,83 +1728,19 @@ def _launch_hook_gui() -> None:
 
         _render_req_hook_rows()
 
-        # ── Disk persistence (own folder, separate from response hooks) ────
-        _REQ_HOOKS_DIR = os.path.join("site_data", "MyReqHooks", MAIN_HOST)
-        os.makedirs(_REQ_HOOKS_DIR, exist_ok=True)
-
-        def _req_hook_disk_path(name: str, body_bytes: bytes) -> str:
-            head = body_bytes[:64].lstrip()
-            if head.startswith(b"<"):
-                ext = ".html"
-            else:
-                try:
-                    json.loads(body_bytes)
-                    ext = ".json"
-                except Exception:
-                    ext = ".txt"
-            safe = re.sub(r"[^\w\-.]", "_", name)
-            return os.path.join(_REQ_HOOKS_DIR, f"{safe}{ext}")
-
-        def _req_hook_save_to_disk(hook: dict) -> None:
-            try:
-                p = _req_hook_disk_path(hook["name"], hook["body_bytes"])
-                meta = {
-                    "name":    hook["name"],
-                    "method":  hook["method"],
-                    "pattern": hook["pattern"],
-                    "enabled": hook["enabled"],
-                }
-                meta_path = p + ".meta.json"
-                with open(p, "wb") as f:
-                    f.write(hook["body_bytes"])
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, indent=2)
-            except Exception as e:
-                log(f"Request hook disk save failed: {e}", "ERROR")
-
-        def _req_hook_delete_from_disk(name: str) -> None:
-            try:
-                safe = re.sub(r"[^\w\-.]", "_", name)
-                for fn in os.listdir(_REQ_HOOKS_DIR):
-                    if fn.startswith(safe):
-                        try:
-                            os.remove(os.path.join(_REQ_HOOKS_DIR, fn))
-                        except OSError:
-                            pass
-            except Exception as e:
-                log(f"Request hook disk delete failed: {e}", "ERROR")
+        # ── Disk persistence (own folder, separate from response hooks) —
+        # same shared store factory as Tab 1, just pointed at its own subdir.
+        _req_hook_save_to_disk, _req_hook_delete_from_disk, _req_hook_load_all = \
+            _make_hook_store("MyReqHooks")
 
         def _load_req_hooks_from_disk() -> None:
             """Load previously saved request hooks from site_data/MyReqHooks/{host}/."""
-            try:
-                for fn in sorted(os.listdir(_REQ_HOOKS_DIR)):
-                    if not fn.endswith(".meta.json"):
-                        continue
-                    meta_path = os.path.join(_REQ_HOOKS_DIR, fn)
-                    try:
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        body_file = meta_path[:-len(".meta.json")]
-                        if not os.path.isfile(body_file):
-                            continue
-                        with open(body_file, "rb") as f:
-                            body_bytes = f.read()
-                        hook = {
-                            "name":       meta.get("name", fn),
-                            "method":     meta.get("method", "*"),
-                            "pattern":    meta.get("pattern", ".*"),
-                            "body_bytes": body_bytes,
-                            "enabled":    meta.get("enabled", True),
-                        }
-                        with _gui_req_hooks_lock:
-                            existing = [h["name"] for h in _gui_req_hooks]
-                            if hook["name"] not in existing:
-                                _gui_req_hooks.append(hook)
+            for hook in _req_hook_load_all({"name": "?", "method": "*",
+                                             "pattern": ".*", "enabled": True}):
+                with _gui_req_hooks_lock:
+                    if hook["name"] not in [h["name"] for h in _gui_req_hooks]:
+                        _gui_req_hooks.append(hook)
                         log(f"Loaded request hook '{hook['name']}' from disk", "HOOK")
-                    except Exception as e:
-                        log(f"Request hook load error {fn}: {e}", "WARN")
-            except Exception:
-                pass
 
         root.after(100, lambda: (_load_req_hooks_from_disk(), _render_req_hook_rows()))
 
@@ -1707,6 +1809,203 @@ def _launch_hook_gui() -> None:
              font=("Consolas", 10, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         _btn(rh_btn_row, "Test Pattern", _test_req_hook,
              font=("Consolas", 9)).pack(side=tk.LEFT)
+
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 3: Firefox Proxy  (only shown when FIREFOX_PROXY is enabled)
+        # Live log of every request the MITM forward proxy has seen — real
+        # browser traffic, any site, not just MAIN_HOST — on the left, with
+        # a hook editor for overriding matching request bodies before
+        # they're forwarded. Same shape as Tab 1, mirrored for requests.
+        # ══════════════════════════════════════════════════════════════════
+        if FIREFOX_PROXY:
+            tab_fwd = tk.Frame(nb, bg=_BG)
+            nb.add(tab_fwd, text="  Firefox Proxy")
+
+            fwd_v = tk.PanedWindow(tab_fwd, orient=tk.VERTICAL, bg=_BG, sashwidth=5)
+            fwd_v.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+            fwd_top_area = tk.Frame(fwd_v, bg=_BG)
+            fwd_bot_area = tk.Frame(fwd_v, bg=_PNL)
+            fwd_v.add(fwd_top_area, minsize=280)
+            fwd_v.add(fwd_bot_area, minsize=160)
+
+            fwd_h = tk.PanedWindow(fwd_top_area, orient=tk.HORIZONTAL, bg=_BG, sashwidth=5)
+            fwd_h.pack(fill=tk.BOTH, expand=True)
+            fwd_left  = tk.Frame(fwd_h, bg=_PNL)
+            fwd_right = tk.Frame(fwd_h, bg=_PNL)
+            fwd_h.add(fwd_left,  minsize=460)
+            fwd_h.add(fwd_right, minsize=340)
+
+            _lbl(fwd_left, "Request Log  (live browser traffic via MITM)", fg=_ACC,
+                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
+            fwd_tree_frame = tk.Frame(fwd_left, bg=_PNL)
+            fwd_tree_frame.pack(fill=tk.BOTH, expand=True, padx=4)
+            fwd_tree = ttk.Treeview(fwd_tree_frame, columns=("ts", "method", "path", "status", "ct", "size"),
+                                     show="headings", selectmode="browse")
+            for c, w, label in (("ts", 70, "Time"), ("method", 60, "Method"), ("path", 0, "Host + Path"),
+                                 ("status", 60, "Status"), ("ct", 130, "Content-Type"), ("size", 68, "Size")):
+                fwd_tree.heading(c, text=label)
+                fwd_tree.column(c, width=w, anchor="w", stretch=(c == "path"))
+            fwd_tree.tag_configure("GET", foreground=_GRN)
+            fwd_tree.tag_configure("POST", foreground=_YLW)
+            fwd_tree.tag_configure("err", foreground=_RED)
+            fwd_vsb = ttk.Scrollbar(fwd_tree_frame, orient="vertical", command=fwd_tree.yview)
+            fwd_tree.configure(yscrollcommand=fwd_vsb.set)
+            fwd_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            fwd_tree.pack(fill=tk.BOTH, expand=True)
+            _fwd_row_data: dict = {}
+
+            _lbl(fwd_right, "Request Body / Headers", fg=_ACC,
+                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
+            fwd_info_var = tk.StringVar(value="← Select a request")
+            _lbl(fwd_right, textvariable=fwd_info_var, fg=_ACC, bg=_PNL).pack(anchor="w", padx=8)
+            fwd_body_box = _text_box(fwd_right)
+            fwd_body_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+            _bind_editor_keys(fwd_body_box)
+
+            def _fwd_on_select(event):
+                sel = fwd_tree.selection()
+                if not sel:
+                    return
+                data = _fwd_row_data.get(sel[0])
+                if not data:
+                    return
+                fwd_info_var.set(f"{data['method']}  {data['path']}  [{data['status']}]")
+                fwd_body_box.config(state="normal")
+                fwd_body_box.delete("1.0", "end")
+                hdrs = data.get("req_headers") or {}
+                hdr_txt = "\n".join(f"{k}: {v}" for k, v in hdrs.items())
+                body_raw = data.get("body") or b""
+                try:
+                    body_txt = body_raw.decode("utf-8", errors="replace")
+                except Exception:
+                    body_txt = body_raw.hex()
+                fwd_body_box.insert("1.0", hdr_txt + ("\n\n" if hdr_txt else "") + body_txt)
+                fwd_name_entry.delete(0, "end")
+                fwd_pat_entry.delete(0, "end")
+                fwd_pat_entry.insert(0, re.escape(data["path"].split("] ", 1)[-1]))
+                fwd_method_var.set(data["method"] if data["method"] in _RH_METHOD_OPTS else "*")
+            fwd_tree.bind("<<TreeviewSelect>>", _fwd_on_select)
+
+            _lbl(fwd_right, "New Request Hook (overrides the body of matching live requests):",
+                 fg=_ACC, bg=_PNL, wraplength=380, justify="left").pack(anchor="w", padx=8, pady=(6, 2))
+            fwd_row1 = tk.Frame(fwd_right, bg=_PNL); fwd_row1.pack(fill=tk.X, padx=8, pady=2)
+            _lbl(fwd_row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+            fwd_name_entry = _entry(fwd_row1, width=12)
+            fwd_name_entry.pack(side=tk.LEFT, padx=(2, 10))
+            _lbl(fwd_row1, "Method:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+            fwd_method_var = tk.StringVar(value="*")
+            ttk.Combobox(fwd_row1, textvariable=fwd_method_var, values=_RH_METHOD_OPTS,
+                         width=7, state="readonly", font=("Consolas", 10)).pack(side=tk.LEFT)
+            fwd_row2 = tk.Frame(fwd_right, bg=_PNL); fwd_row2.pack(fill=tk.X, padx=8, pady=2)
+            _lbl(fwd_row2, "Path pattern:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+            fwd_pat_entry = _entry(fwd_row2, width=30)
+            fwd_pat_entry.insert(0, r".*")
+            fwd_pat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+            fwd_save_status = _lbl(fwd_right, text="", fg=_DIM, bg=_PNL)
+            fwd_save_status.pack(anchor="w", padx=8, pady=(0, 2))
+
+            _fwd_hook_save_to_disk, _fwd_hook_delete_from_disk, _fwd_hook_load_all = \
+                _make_hook_store("MyFwdHooks")
+
+            def _render_fwd_hook_rows():
+                for w in fwd_hooks_frame.winfo_children():
+                    w.destroy()
+                for col_idx, col_name in enumerate(("Name", "Method", "Pattern", "On", "")):
+                    _lbl(fwd_hooks_frame, col_name, fg=_ACC, bg=_PNL,
+                         font=("Consolas", 9, "bold")).grid(row=0, column=col_idx, sticky="w", padx=6)
+                with _gui_fwd_req_hooks_lock:
+                    hooks_copy = list(_gui_fwd_req_hooks)
+                if not hooks_copy:
+                    _lbl(fwd_hooks_frame, "No hooks saved yet.", fg=_DIM, bg=_PNL).grid(
+                        row=1, column=0, columnspan=5, sticky="w", padx=4, pady=4)
+                    return
+                for row_idx, h in enumerate(hooks_copy, start=1):
+                    fg = _FG if h["enabled"] else _DIM
+                    _lbl(fwd_hooks_frame, h["name"], bg=_PNL, fg=fg).grid(row=row_idx, column=0, sticky="w", padx=6)
+                    _lbl(fwd_hooks_frame, h["method"], bg=_PNL, fg=fg).grid(row=row_idx, column=1, sticky="w", padx=6)
+                    _lbl(fwd_hooks_frame, h["pattern"][:36], bg=_PNL, fg=_DIM).grid(row=row_idx, column=2, sticky="w", padx=6)
+                    bv = tk.BooleanVar(value=h["enabled"])
+                    def _mk_toggle(hook_ref=h, var=bv):
+                        def _t():
+                            with _gui_fwd_req_hooks_lock:
+                                hook_ref["enabled"] = var.get()
+                            _fwd_hook_save_to_disk(hook_ref)
+                            _render_fwd_hook_rows()
+                        return _t
+                    tk.Checkbutton(fwd_hooks_frame, variable=bv, command=_mk_toggle(),
+                                   bg=_PNL, selectcolor=_BG).grid(row=row_idx, column=3, padx=3)
+                    def _mk_del(name=h["name"]):
+                        def _d():
+                            with _gui_fwd_req_hooks_lock:
+                                _gui_fwd_req_hooks[:] = [x for x in _gui_fwd_req_hooks if x["name"] != name]
+                            _fwd_hook_delete_from_disk(name)
+                            _render_fwd_hook_rows()
+                        return _d
+                    _btn(fwd_hooks_frame, "X", _mk_del(), bg="#1a0505", fg=_RED,
+                         font=("Consolas", 8)).grid(row=row_idx, column=4, padx=3)
+
+            def _fwd_save_hook():
+                name = fwd_name_entry.get().strip()
+                if not name:
+                    messagebox.showwarning("S2L", "Hook name is required.")
+                    return
+                body_full = fwd_body_box.get("1.0", "end-1c")
+                body_only = body_full.split("\n\n", 1)[-1] if "\n\n" in body_full else body_full
+                pat = fwd_pat_entry.get().strip() or r".*"
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    messagebox.showerror("S2L", f"Invalid pattern: {e}")
+                    return
+                hook = {"name": name, "method": fwd_method_var.get(), "pattern": pat,
+                        "body_bytes": body_only.encode("utf-8"), "enabled": True}
+                with _gui_fwd_req_hooks_lock:
+                    _gui_fwd_req_hooks[:] = [h for h in _gui_fwd_req_hooks if h["name"] != name] + [hook]
+                _fwd_hook_save_to_disk(hook)
+                _render_fwd_hook_rows()
+                fwd_save_status.config(text=f"Saved '{name}'", fg=_GRN)
+                log(f"GUI fwd request hook saved: '{name}'  [{hook['method']}]  {hook['pattern']}", "HOOK")
+
+            fwd_btn_row = tk.Frame(fwd_right, bg=_PNL)
+            fwd_btn_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+            _btn(fwd_btn_row, "Save Request Hook", _fwd_save_hook,
+                 font=("Consolas", 10, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            _lbl(fwd_bot_area, "Active Firefox-Proxy Request Hooks", fg=_ACC,
+                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(4, 2))
+            fwd_hooks_frame = tk.Frame(fwd_bot_area, bg=_PNL)
+            fwd_hooks_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+
+            def _load_fwd_hooks_from_disk():
+                for hook in _fwd_hook_load_all({"name": "?", "method": "*", "pattern": ".*", "enabled": True}):
+                    with _gui_fwd_req_hooks_lock:
+                        if hook["name"] not in [h["name"] for h in _gui_fwd_req_hooks]:
+                            _gui_fwd_req_hooks.append(hook)
+
+            root.after(100, lambda: (_load_fwd_hooks_from_disk(), _render_fwd_hook_rows()))
+
+            def _fwd_poll():
+                count = 0
+                while count < 60:
+                    try:
+                        entry = _gui_fwd_log_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    sz = entry["size"]
+                    sz_s = f"{sz/1024:.1f}KB" if sz >= 1024 else (f"{sz}B" if sz else "—")
+                    tagn = "err" if isinstance(entry["status"], int) and entry["status"] >= 400 else entry["method"]
+                    iid = fwd_tree.insert("", "end", values=(
+                        entry["ts"], entry["method"], entry["path"], entry["status"],
+                        entry["ct"], sz_s), tags=(tagn,))
+                    _fwd_row_data[iid] = entry
+                    if len(fwd_tree.get_children()) > _MAX_ROWS:
+                        old = fwd_tree.get_children()[0]
+                        _fwd_row_data.pop(old, None)
+                        fwd_tree.delete(old)
+                    fwd_tree.see(iid)
+                    count += 1
+                root.after(150, _fwd_poll)
+            root.after(150, _fwd_poll)
 
         # ── Polling loop ──────────────────────────────────────────────────────
         def _poll():
@@ -1846,6 +2145,46 @@ def _next_cf_config(mobile: bool) -> dict:
         _cf_config_idx += 1
         return cfg
 
+# curl_cffi impersonation target per device — keeps the TLS ClientHello
+# fingerprint consistent with the User-Agent we actually send. Sending an
+# iPhone/Android UA over a desktop-Chrome TLS fingerprint (or vice versa) is
+# exactly the kind of cross-signal mismatch Cloudflare Bot Management looks
+# for. Each entry is an ordered fallback list because impersonation target
+# names vary between curl_cffi versions/builds — the first one the installed
+# build actually recognises wins, and that choice is cached per device so we
+# only ever pay for the trial-and-error once per process.
+_IMPERSONATE_BY_DEVICE: dict[str, tuple[str, ...]] = {
+    "mobile":    ("chrome131_android", "chrome124_android", "chrome123_android", "chrome99_android", "chrome136"),
+    "tablet":    ("chrome131_android", "chrome124_android", "chrome123_android", "chrome99_android", "chrome136"),
+    "iphone":    ("safari18_0", "safari17_2_ios", "safari17_0", "safari15_5", "chrome136"),
+    "ipad":      ("safari18_0", "safari17_2_ios", "safari17_0", "safari15_5", "chrome136"),
+    "macintosh": ("chrome136",),
+    "desktop":   ("chrome136",),
+    "ie11":      ("chrome136",),   # no realistic modern impersonation target — best effort
+    "symbian":   ("chrome136",),
+    "bot":       ("chrome136",),
+}
+_cffi_impersonate_cache: dict[str, str] = {}
+
+def _make_cffi_session(device: str, base_headers: dict):
+    """Build a curl_cffi Session, trying impersonation targets in order until
+    one is accepted by the installed curl_cffi build. Raises the last error
+    only if every candidate (including the chrome136 catch-all) fails."""
+    cached     = _cffi_impersonate_cache.get(device)
+    candidates = (cached,) + _IMPERSONATE_BY_DEVICE.get(device, ("chrome136",)) if cached \
+                 else _IMPERSONATE_BY_DEVICE.get(device, ("chrome136",))
+    last_exc: Exception | None = None
+    for target in candidates:
+        try:
+            s = _cffi_requests.Session(impersonate=target, verify=False)
+            s.headers.update(base_headers)
+            _cffi_impersonate_cache[device] = target
+            return s
+        except Exception as e:
+            last_exc = e
+            continue
+    raise last_exc or RuntimeError("no usable curl_cffi impersonation target")
+
 def _make_session(device: str | None = None):
     """Return a requests-compatible session (curl_cffi → cloudscraper → requests fallback)."""
     d = device or _effective_device()
@@ -1865,44 +2204,106 @@ def _make_session(device: str | None = None):
     # Install: pip install curl-cffi --break-system-packages
     if _CURL_CFFI_OK:
         try:
-            s = _cffi_requests.Session(impersonate="chrome136")
-            s.headers.update(base_headers)
-            return s
+            return _make_cffi_session(d, base_headers)
         except Exception as e:
             log(f"curl_cffi init failed, falling back: {e}", "WARN")
 
     cfg = _next_cf_config(mobile)
-    try:
-        s = cloudscraper.create_scraper(browser=cfg, delay=0)
-        # MUST override UA after create_scraper — cloudscraper injects old UAs
-        # (often Chrome 80-83) that fail browser version checks on modern sites.
-        s.headers.update(base_headers)
-        s.keep_alive = True
-        s.verify     = False
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries      = _RETRY_POLICY,
-            pool_connections = 16,
-            pool_maxsize     = 32,
-            pool_block       = False,
-        )
-        s.mount("https://", adapter)
-        s.mount("http://",  adapter)
-        return s
-    except Exception as e:
-        log(f"cloudscraper init failed, falling back to requests: {e}", "WARN")
+    if _CLOUDSCRAPER_OK:
+        try:
+            s = cloudscraper.create_scraper(browser=cfg, delay=0)
+            # MUST override UA after create_scraper — cloudscraper injects old UAs
+            # (often Chrome 80-83) that fail browser version checks on modern sites.
+            s.headers.update(base_headers)
+            s.keep_alive = True
+            s.verify     = False
+            adapter = requests.adapters.HTTPAdapter(
+                max_retries      = _RETRY_POLICY,
+                pool_connections = POOL_CONNECTIONS,
+                pool_maxsize     = POOL_MAXSIZE,
+                pool_block       = False,
+            )
+            s.mount("https://", adapter)
+            s.mount("http://",  adapter)
+            return s
+        except Exception as e:
+            log(f"cloudscraper init failed, falling back to requests: {e}", "WARN")
+    else:
+        log("cloudscraper not installed (pip install cloudscraper --break-system-packages) "
+            "— falling back to plain requests", "WARN")
 
     s = requests.Session()
     s.headers.update(base_headers)
+    s.verify = False
     adapter = requests.adapters.HTTPAdapter(
         max_retries      = _RETRY_POLICY,
-        pool_connections = 16,
-        pool_maxsize     = 32,
+        pool_connections = POOL_CONNECTIONS,
+        pool_maxsize     = POOL_MAXSIZE,
         pool_block       = False,
     )
     s.mount("https://", adapter)
     s.mount("http://",  adapter)
     return s
 
+def _make_cloudscraper_session(device: str | None = None) -> object:
+    """Build a cloudscraper session directly (bypassing curl_cffi).
+
+    Used as a fallback when curl_cffi fails on specific networks/hosts.
+    """
+    d = device or _effective_device()
+    mobile = d in _MOBILE_DEVICES
+    ua     = _sanitize_ua(UA_PROFILES.get(d, UA_PROFILES["macintosh"]))
+    ch     = _SEC_CH_UA.get(d, _SEC_CH_UA.get("desktop", {}))
+    base_headers = {
+        "User-Agent":                ua,
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br" if _BROTLI_OK else "gzip, deflate",
+        "DNT":                       "1",
+        "Upgrade-Insecure-Requests": "1",
+        **ch,
+    }
+    cfg = _next_cf_config(mobile)
+    if not _CLOUDSCRAPER_OK:
+        raise RuntimeError("cloudscraper not installed — pip install cloudscraper --break-system-packages")
+    s = cloudscraper.create_scraper(browser=cfg, delay=0)
+    s.headers.update(base_headers)
+    s.keep_alive = True
+    s.verify     = False
+    adapter = requests.adapters.HTTPAdapter(
+        max_retries=_RETRY_POLICY,
+        pool_connections=POOL_CONNECTIONS,
+        pool_maxsize=POOL_MAXSIZE,
+        pool_block=False,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+def _make_requests_session(device: str | None = None) -> object:
+    """Build a plain requests session (last-resort fallback, no CF bypass)."""
+    d = device or _effective_device()
+    ua = _sanitize_ua(UA_PROFILES.get(d, UA_PROFILES["macintosh"]))
+    ch = _SEC_CH_UA.get(d, _SEC_CH_UA.get("desktop", {}))
+    base_headers = {
+        "User-Agent":                ua,
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br" if _BROTLI_OK else "gzip, deflate",
+        "DNT":                       "1",
+        "Upgrade-Insecure-Requests": "1",
+        **ch,
+    }
+    s = requests.Session()
+    s.headers.update(base_headers)
+    s.verify = False
+    adapter = requests.adapters.HTTPAdapter(
+        max_retries=_RETRY_POLICY,
+        pool_connections=POOL_CONNECTIONS,
+        pool_maxsize=POOL_MAXSIZE,
+        pool_block=False,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
 
 def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
     """Detect Cloudflare challenge/block pages.
@@ -1911,7 +2312,7 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
       • Classic 403/503 HTML block pages (Ray ID, cf-browser-verification)
       • CF Managed Challenge / Turnstile — these return HTTP 200, not 403/503,
         with a JS challenge embedded in the body (the "q=78" / jschl_vc family
-        reported against poki.com). A status-only check misses these entirely.
+        reported against some CDNs). A status-only check misses these entirely.
       • The cf-mitigated: challenge response header, when present — the most
         reliable single signal Cloudflare gives us, independent of body content.
     """
@@ -1948,8 +2349,32 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
             or (b"challenges.cloudflare.com" in head and b"<script" in head)):
         return True
 
-    return False
+    # v4: Modern Cloudflare Turnstile + "Just a moment" interstitials.
+    # These return 200 with a JS challenge body that doesn't always carry
+    # the classic jschl_vc tokens — the CF team rotates signatures frequently.
+    if status in (200, 403, 503):
+        if (b"just a moment" in head
+                or b"cf-turnstile" in head
+                or b"cf_turnstile" in head
+                or b"turnstile.min.js" in head
+                or b"challenges.cloudflare.com/turnstile" in head
+                or (b"checking if the site connection is secure" in head)
+                or (b"enable javascript and cookies" in head)
+                or (b"cf-please-wait" in head)):
+            return True
 
+    # v4: Generic WAF blocks (not just CF) — "access denied", "blocked",
+    # "request blocked" returned as HTML with a 403/503. These were slipping
+    # through because _is_raw_block_text only catches SHORT non-HTML bodies.
+    if status in (403, 503) and b"<html" in head:
+        if (b"access denied" in head
+                or b"request blocked" in head
+                or b"blocked by" in head
+                or b"security check" in head
+                or b"verify you are human" in head):
+            return True
+
+    return False
 
 # Minimal block responses some edges/WAFs return as plain text with no HTML
 # wrapper at all ("blocked", "Access Denied", "Error 1020", ...). These are
@@ -1958,8 +2383,13 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
 # and get served/cached as if they were real content (a blank-looking page
 # that just says "blocked").
 _RAW_BLOCK_TEXT: tuple[bytes, ...] = (
-    b"blocked", b"access denied", b"forbidden",
-    b"error 1020", b"error 1006", b"error 1009",
+    b"blocked", b"access denied", b"forbidden", b"request blocked",
+    b"error 1020", b"error 1006", b"error 1009", b"error 1010", b"error 1011",
+    b"error 1012", b"error 1013", b"error 1014", b"error 1015", b"error 1016",
+    b"error 1018", b"error 1019", b"error 1023",
+    b"cloudflare", b"cf-ray",   # bare CF error responses
+    b"rate limit", b"too many requests",
+    b"please verify you are a human",
 )
 
 def _is_raw_block_text(body: bytes, status: int) -> bool:
@@ -1969,7 +2399,6 @@ def _is_raw_block_text(body: bytes, status: int) -> bool:
     if not stripped or len(stripped) > 256:
         return False
     return any(p in stripped for p in _RAW_BLOCK_TEXT)
-
 
 _BOT_PAGE_SIGNATURES: tuple[bytes, ...] = (
     # Google automated-query / Sorry page (HTTP 200 — tricky!)
@@ -2025,7 +2454,6 @@ def _is_bot_page(body: bytes, status: int = 200, path: str = "") -> bool:
         if sig in head:
             return True
     return False
-
 
 def _get_proxy_session():
     if not hasattr(_proxy_local, "s"):
@@ -2177,11 +2605,32 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
             if _looks_json_or_text(data):
                 return data   # curl_cffi already decoded it
             if _BROTLI_OK:
+                # FIXED: try the one-shot decompress first; if it fails (some
+                # servers send brotli streams with trailing junk that confuses
+                # the one-shot API), fall back to the streaming decompressor
+                # which is more tolerant. We saw "Empty body (decompression
+                # failure)" warnings on Discord API endpoints (apex/experiments,
+                # users/@me/survey, etc.) where curl_cffi returned a brotli
+                # body it couldn't auto-decompress; our one-shot _brotli.decompress
+                # also failed silently and we returned the raw compressed bytes
+                # as if they were the decoded body — which downstream code
+                # correctly flagged as "len(body) == 0 but Content-Length > 0".
                 try:
                     return _brotli.decompress(data)
                 except Exception:
-                    # Decompression failed — data may already be decoded (curl_cffi)
-                    return data
+                    pass
+                try:
+                    # Streaming decompressor tolerates trailing junk and partial streams
+                    d = _brotli.Decompressor()
+                    out = d.process(data) + d.finish()
+                    if out:
+                        return out
+                except Exception:
+                    pass
+                # Both failed — data may already be decoded (curl_cffi) but
+                # didn't pass _looks_json_or_text. Return as-is; the caller's
+                # empty-body recovery will re-fetch with Accept-Encoding: identity.
+                return data
             log("brotli response received but 'brotli' library not installed "
                 "(pip install brotli --break-system-packages) — body may be garbled", "WARN")
             return data
@@ -2189,42 +2638,32 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
         if enc == "zstd":
             if _looks_json_or_text(data):
                 return data
-            try:
-                import zstandard as _zstd
-                return _zstd.ZstdDecompressor().decompress(data)
-            except ImportError:
+            if _ZSTD_OK:
+                # FIXED: try one-shot first, then streaming. ZstdDecompressor.decompress
+                # requires the frame to declare its size; some servers send
+                # streaming frames without that, causing decompress() to raise
+                # "could not determine content size in frame header". The
+                # streaming_reader() API handles both cases.
+                try:
+                    return _zstd.ZstdDecompressor().decompress(data)
+                except Exception:
+                    pass
+                try:
+                    dctx = _zstd.ZstdDecompressor()
+                    out = b"".join(dctx.stream_reader(data))
+                    if out:
+                        return out
+                except Exception:
+                    pass
+            else:
                 log("zstd response but 'zstandard' not installed "
                     "(pip install zstandard --break-system-packages)", "WARN")
-            except Exception:
-                pass
             return data
 
     except Exception:
         pass
 
     return data
-
-_mime_lock:  threading.Lock = threading.Lock()
-_mime_cache: set | None     = None
-
-def _load_mimes() -> set:
-    global _mime_cache
-    with _mime_lock:
-        if _mime_cache is not None:
-            return _mime_cache
-        mimes: set = set()
-        try:
-            with open(MIME_FILE, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    if row and not row[0].startswith("#"):
-                        mimes.add(row[0].strip().lower())
-            log(f"Loaded {len(mimes)} MIME types from {MIME_FILE}")
-        except FileNotFoundError:
-            log(f"{MIME_FILE} not found — extension detection only", "WARN")
-        except Exception as e:
-            log(f"MIME load failed: {e}", "WARN")
-        _mime_cache = mimes
-        return mimes
 
 def guess_mime(path: str) -> str:
     mt, _ = mimetypes.guess_type(path)
@@ -2285,17 +2724,172 @@ def filter_fwd(headers: dict) -> dict:
     skip = _HOP_BY_HOP | _STRIP_FWD_EXTRA
     return {k: v for k, v in headers.items() if k.lower() not in skip}
 
-def filter_resp(headers: dict) -> dict:
-    # Strip security headers that block our local proxy, plus hop-by-hop headers
+def _all_set_cookies(response) -> list:
+    """Return every Set-Cookie value on `response`, uncorrupted.
+
+    dict(response.headers) / response.headers.items() silently comma-join
+    repeated header names into a single string — which is actively wrong
+    for Set-Cookie specifically: a cookie's own Expires=<day>, <date>
+    attribute already contains a comma, so a comma-joined multi-cookie
+    value is ambiguous to split back apart. A login response that sets 3
+    real cookies (session token, CSRF token, a challenge/verification
+    token — hCaptcha and friends all set their own) arrives at the browser
+    as one mangled value; the browser then drops some of them or mis-splits
+    it, which shows up as exactly what it looks like: a verification widget
+    stuck in a loop because its own token cookie never made it through,
+    "duplicate cookie" console warnings on refresh, and login/session/
+    WebSocket-auth state that depends on any of the dropped cookies quietly
+    breaking. curl_cffi's Headers exposes .get_list(); urllib3/requests'
+    raw header dict exposes .getlist(). Try both; only fall back to the
+    single (lossy) value if neither multi-value accessor is available.
+    """
+    h = getattr(response, "headers", None)
+    for meth_name in ("get_list", "getlist"):
+        meth = getattr(h, meth_name, None)
+        if callable(meth):
+            try:
+                vals = [v for v in meth("Set-Cookie") if v]
+                if vals:
+                    return vals
+            except Exception:
+                pass
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    for meth_name in ("getlist", "get_all"):
+        meth = getattr(raw_headers, meth_name, None)
+        if callable(meth):
+            try:
+                vals = list(meth("Set-Cookie"))
+                if vals:
+                    return vals
+            except Exception:
+                pass
+    try:
+        single = response.headers.get("Set-Cookie")
+    except Exception:
+        single = None
+    return [single] if single else []
+
+def _resp_headers_dict(response) -> dict:
+    """dict(response.headers), with Set-Cookie repaired to a real list
+    instead of the comma-mangled single string dict() would silently give.
+    Use this everywhere a fetched response's headers feed into filter_resp
+    (which already knows how to handle a list of cookies correctly) —
+    plain dict(response.headers) must never be used for that purpose."""
+    h = dict(response.headers)
+    # dict(response.headers) can hand back "set-cookie" in whatever casing
+    # that particular header-object implementation uses (curl_cffi's Headers
+    # always lower-cases keys) — Python dict keys are case-sensitive even
+    # though HTTP header names aren't, so just adding h["Set-Cookie"] = [...]
+    # below would create a SECOND key sitting right next to the original
+    # mangled one instead of replacing it, and Werkzeug would then send BOTH:
+    # the one mangled comma-joined header AND the correctly-split ones,
+    # duplicating every single cookie on the wire. Remove any casing of the
+    # key first so there is exactly one Set-Cookie entry to work with.
+    for k in list(h.keys()):
+        if k.lower() == "set-cookie":
+            del h[k]
+    cookies = _all_set_cookies(response)
+    if len(cookies) > 1:
+        h["Set-Cookie"] = cookies
+    elif len(cookies) == 1:
+        h["Set-Cookie"] = cookies[0]
+    return h
+
+def _flatten_cookiejar(cookies_obj, prefer_host: str = "") -> dict:
+    """Flatten a requests-style cookie jar into a plain name→value dict for
+    use as the `cookies=` kwarg on an outgoing request.
+
+    dict(session.cookies) / session.cookies.get(name) look completely safe
+    but are landmines here: requests' RequestsCookieJar (used by cloudscraper
+    and plain requests.Session) raises CookieConflictError, and curl_cffi's
+    Cookies raises CookieConflict, the instant the jar holds two cookies
+    with the same name under two different domains. Sessions here are
+    per-client and live for the whole run (see _get_client_session), so
+    this isn't an edge case — a mirrored page whose CDN/analytics/embeds
+    each set their own "session", "_ga", "__cf_bm", etc. hits it on the
+    second or third distinct host, and it used to take the whole request
+    down with it (or, where it was wrapped in a bare except, silently
+    produce a wrong response instead).
+
+    We walk the jar's raw entries ourselves instead of the dict-like
+    accessors, so a name collision just picks a value instead of raising:
+    prefer whichever cookie's domain actually matches `prefer_host` (the
+    upstream host we're about to call), otherwise keep the last one seen.
+    """
+    if not cookies_obj:
+        return {}
+    if isinstance(cookies_obj, dict):
+        return dict(cookies_obj)
+    host = (prefer_host or "").lower()
+    chosen_domain: dict[str, str] = {}
+    out: dict[str, str] = {}
+    try:
+        jar = getattr(cookies_obj, "jar", cookies_obj)  # curl_cffi wraps a .jar; requests IS the jar
+        for cookie in jar:
+            name = getattr(cookie, "name", None)
+            if not name:
+                continue
+            domain = (getattr(cookie, "domain", "") or "").lstrip(".").lower()
+            if name in out and host:
+                prev = chosen_domain.get(name, "")
+                if prev and host.endswith(prev) and not (domain and host.endswith(domain)):
+                    continue   # keep the previous, more domain-specific match
+            out[name] = getattr(cookie, "value", "") or ""
+            chosen_domain[name] = domain
+        return out
+    except Exception as e:
+        log(f"cookie jar flatten failed, falling back to get_dict(): {_short_exc(e)}", "DEBUG")
+        for attr in ("get_dict", "items"):
+            fn = getattr(cookies_obj, attr, None)
+            if not fn:
+                continue
+            try:
+                return dict(fn())
+            except Exception:
+                continue
+        return {}
+
+def _needs_isolation(body: bytes) -> bool:
+    """Heuristic: does this HTML look like it needs Cross-Origin isolation?
+
+    Sites that use SharedArrayBuffer / WASM threads (eaglercraft-style clients
+    are the canonical case) need COOP+COEP on the top-level document or the
+    browser silently refuses to hand them a working SharedArrayBuffer — the
+    app initializes just far enough to paint its background/canvas and then
+    hangs forever waiting on a threading primitive that was never granted.
+    A real, unproxied deployment of such a site sends these headers itself
+    (from its own server config); scan for the tell-tale APIs so we can
+    reproduce that even when the origin's own header choice didn't survive
+    being fetched through us.
+    """
+    if not body:
+        return False
+    head = body[:65536]
+    return (b"SharedArrayBuffer" in head
+            or b"Atomics.wait" in head
+            or b".wasm" in head
+            or (b"new Worker(" in head and b"postMessage" in head))
+
+def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
+    # Strip security headers that block our local proxy, plus hop-by-hop headers.
+    # NOTE: Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy are
+    # deliberately NOT in this skip-set (see below) — they're passive now,
+    # same as every other header we don't touch.
     skip = _HOP_BY_HOP | {
         "content-encoding",
         "content-security-policy", "content-security-policy-report-only",
         "x-frame-options", "strict-transport-security", "x-content-type-options",
-        "cross-origin-opener-policy", "cross-origin-embedder-policy",
         "cross-origin-resource-policy", "permissions-policy",
         "nel", "report-to", "reporting-endpoints",
-        # Strip upstream CORS — we set our own wildcard below so browser CORS
-        # checks don't fail on Discord/Slack API responses going through the proxy.
+        # v5: Additional headers that block rendering or reveal proxy
+        "x-permitted-cross-domain-policies",  # Adobe Flash/PDF cross-domain
+        "x-download-options",                 # IE download behavior
+        "x-dns-prefetch-control",            # DNS prefetch control
+        "expect-ct",                          # Certificate Transparency
+        "cross-origin-opener-policy",         # COOP — blocks our injector
+        "cross-origin-embedder-policy",       # COEP — blocks cross-origin resources
+        "cross-origin-embedder-policy-report-only",
+        # Strip upstream CORS — we set our own wildcard below
         "access-control-allow-origin",
         "access-control-allow-credentials",
         "access-control-allow-headers",
@@ -2312,18 +2906,29 @@ def filter_resp(headers: dict) -> dict:
     # pages also going through S2L (game iframes, etc.). Without this, when COEP is
     # active any resource without CORP is blocked by the browser.
     out["Cross-Origin-Resource-Policy"] = "cross-origin"
-    # COOP + COEP: games and apps that use SharedArrayBuffer or WASM threads require
-    # Cross-Origin isolation. COEP=credentialless is less strict than require-corp
-    # (it allows no-credentials sub-resources without explicit CORP) but still enables
-    # isolation. COOP=same-origin prevents opener attacks.
-    if COOP_COEP:
+    # COOP/COEP are now PASSIVE: whatever the origin itself decided (kept above,
+    # since they're no longer in `skip`) just flows through untouched — no
+    # manual flag to remember to flip per site. The one thing we DO add
+    # proactively is a safety net for the top-level HTML document: if the
+    # origin needed isolation but didn't send the headers (common when the
+    # isolation was actually coming from whatever host originally served the
+    # page, e.g. a static host's own server config, rather than the app
+    # itself), auto-apply the least-disruptive pair only there.
+    has_coop = any(k.lower() == "cross-origin-opener-policy"   for k in out)
+    has_coep = any(k.lower() == "cross-origin-embedder-policy" for k in out)
+    if is_top_level_html and not (has_coop or has_coep) and _needs_isolation(body):
         out["Cross-Origin-Opener-Policy"]   = "same-origin"
         out["Cross-Origin-Embedder-Policy"] = "credentialless"
     if "Set-Cookie" in out:
         def _rewrite_cookie(c: str) -> str:
+            # v5: Set SameSite=None + Secure so cookies work cross-origin (CDN
+            # sub-iframe on a different port needs this). Without SameSite=None,
+            # browsers block cookies on cross-origin requests.
             c = re.sub(r";\s*SameSite=[^;]+", "", c, flags=re.IGNORECASE)
             c = re.sub(r";\s*Secure\b",        "", c, flags=re.IGNORECASE)
             c = re.sub(r";\s*Partitioned\b", "", c, flags=re.IGNORECASE)
+            c = c.rstrip("; ").rstrip()
+            c += "; SameSite=None; Secure"
             # Strip Domain= entirely rather than rewriting it — a Domain that
             # doesn't match the host the browser is actually on gets the WHOLE
             # cookie silently rejected. Dropping it makes the cookie host-only,
@@ -2352,13 +2957,23 @@ def inject_csrf_headers(fwd: dict) -> None:
                   "x-requested-with", "x-request-id"):
             fwd[key] = flask_request.headers[key]
 
-
 def rewrite_origin(fwd: dict, origin_base: str) -> None:
     """Rewrite Origin/Referer from proxy localhost address → real target origin.
 
     Without this, CORS preflight checks see Origin: http://localhost:8080 and
     reject it.  Referer is rewritten similarly so hotlink-protection passes.
+
+    v4 HARDENING: Also strips any header value that still contains localhost /
+    127.0.0.1 / 0.0.0.0 / the proxy port — some sites read these to detect
+    proxy/MITM usage and trigger CAPTCHAs ("verify you are human"). We make
+    a final sweep AFTER the standard rewrite to catch anything that slipped
+    through (e.g. a Referer built from window.location that the injector missed).
     """
+    proxy_markers = (
+        f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"0.0.0.0:{PORT}",
+        "localhost:8080", "127.0.0.1:8080",  # common defaults
+        "://localhost", "://127.0.0.1", "://0.0.0.0",
+    )
     for key in list(fwd.keys()):
         kl = key.lower()
         if kl == "origin":
@@ -2369,7 +2984,21 @@ def rewrite_origin(fwd: dict, origin_base: str) -> None:
                 fwd[key] = origin_base + p.path + (f"?{p.query}" if p.query else "")
             except Exception:
                 fwd[key] = origin_base + "/"
-
+        elif kl in ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+                     "x-real-ip", "via", "forwarded"):
+            # v4: Strip proxy-revealing headers entirely — their presence is
+            # itself a fingerprint that some bot-detection systems key on.
+            del fwd[key]
+        # v4: Final sweep — replace any remaining localhost reference in any
+        # header value. This catches edge cases like a custom Referer built
+        # from JS that read window.location before the injector patched it.
+        val = fwd.get(key)
+        if isinstance(val, str):
+            for marker in proxy_markers:
+                if marker in val:
+                    fwd[key] = val.replace(marker, origin_base)
+                    val = fwd[key]
+                    break
 
 def rewrite_abs_urls(html: bytes) -> bytes:
     """Rewrite absolute MAIN_HOST URLs inside HTML *attribute values* → proxy-relative.
@@ -2390,7 +3019,7 @@ def rewrite_abs_urls(html: bytes) -> bytes:
     # This excludes bare JSON strings and JS string literals outside attributes.
     # The trailing negative lookahead requires the host to actually END there
     # (next char is /, ", ', :, ?, # or nothing) — without it, a bare prefix
-    # match would also strip "https://poki.community/..." or any other domain
+    # match would also strip a longer domain sharing the same prefix, or any other domain
     # that merely starts with the same characters as MAIN_HOST.
     #
     # The replacement is an ABSOLUTE http://localhost:PORT URL rather than a
@@ -2420,7 +3049,6 @@ def rewrite_abs_urls(html: bytes) -> bytes:
 
     return html
 
-
 def strip_fragment(u: str) -> str:
     return urldefrag(u)[0]
 
@@ -2449,7 +3077,6 @@ def _fmt_size(n: int) -> str:
             return f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}GB"
-
 
 def log_req(method: str, status: int, host: str, path: str, size: int, tag: str = "") -> None:
     """Structured one-line request log + GUI traffic-log entry.
@@ -2504,8 +3131,6 @@ def _reveal_hidden(html_bytes: bytes) -> bytes:
     except Exception as e:
         log(f"reveal_hidden failed: {e}", "WARN")
         return html_bytes
-
-
 
 def _build_s2l_injector() -> bytes:
     with _cdn_port_lock:
@@ -2622,8 +3247,8 @@ def _build_s2l_injector() -> bytes:
         '}catch(e){}'
         # ── location.href / .assign() / .replace() / window.open() patch ───────
         # A frame can navigate itself WITHOUT ever touching fetch/XHR/src — e.g.
-        # Poki-style "are we embedded on the right domain?" SDK checks that fall
-        # back to `top.location.href = "https://poki.com/"`, or any game script
+        # an embedded app/game SDK's "are we on the right domain?" check falling
+        # back to `top.location.href = "https://real-cdn-host/"`, or any script
         # doing `location.replace(realCdnUrl)`. None of the patches above catch
         # a raw navigation, so the browser tries to connect to the REAL host
         # directly — and since only the spoofed MAIN_HOST is in the hosts file
@@ -2656,22 +3281,28 @@ def _build_s2l_injector() -> bytes:
           '}'
         '}catch(e){}'
         # ── Window.prototype.postMessage patch ─────────────────────────────────
-        # PokiSDK uses:  window.parent.postMessage(msg, 'https://poki.com')
-        #                iframe.contentWindow.postMessage(msg, 'https://gdn.poki.com')
-        # The browser drops these because the actual receiving origin is localhost,
-        # not poki.com / gdn.poki.com. The SDK never gets a response and falls back
-        # to navigating poki.com directly → "connection refused".
-        # Fix: change any targetOrigin string matching poki.com/poki.io domains to '*'
-        # so the message actually arrives regardless of actual origin.
-        # This patch applies in EVERY realm (main frame + game iframes), so both
-        # directions (wrapper→game and game→wrapper) are covered.
+        # Embedded app/game SDKs commonly do:
+        #   window.parent.postMessage(msg, 'https://real-parent-origin')
+        #   iframe.contentWindow.postMessage(msg, 'https://real-cdn-origin')
+        # The browser silently drops these, because the actual receiving window
+        # is on localhost, never the real remote origin the SDK expects — the
+        # message never arrives, and the SDK's own fallback/recovery path then
+        # tries to navigate to the real host directly → "connection refused".
+        # Fix: any specific (non-"*") targetOrigin gets relaxed to "*". This is
+        # always the correct fix in this context (not a narrowing of security),
+        # since every locally-served frame's real receiving origin is always
+        # some localhost:port that could never equal the SDK's expected origin
+        # anyway — there is no third, untrusted party locally who could receive
+        # a wildcard message instead. Applies in EVERY realm (main frame + any
+        # nested iframe), so both directions (wrapper→embed and embed→wrapper)
+        # are covered, for any site's SDK, not just one.
         'try{'
           'var _pmD=Object.getOwnPropertyDescriptor(Window.prototype,"postMessage");'
           'if(!_pmD){'
             # Fallback: wrap window.postMessage directly
             'var _pm0=window.postMessage;'
             'window.postMessage=function(m,t,tr){'
-              'if(typeof t==="string"&&(t.indexOf("poki.com")>-1||t.indexOf("poki.io")>-1))t="*";'
+              'if(typeof t==="string"&&t!=="*")t="*";'
               'return _pm0.apply(this,[m,t,tr]);'
             '};'
           '} else if(typeof _pmD.value==="function"){'
@@ -2679,29 +3310,32 @@ def _build_s2l_injector() -> bytes:
             'Object.defineProperty(Window.prototype,"postMessage",{'
               'configurable:true,writable:true,enumerable:true,'
               'value:function(m,t,tr){'
-                'if(typeof t==="string"&&(t.indexOf("poki.com")>-1||t.indexOf("poki.io")>-1))t="*";'
+                'if(typeof t==="string"&&t!=="*")t="*";'
                 'return _pm1.apply(this,[m,t,tr]);'
               '}'
             '});'
           '}'
         '}catch(e){}'
         # ── MessageEvent.prototype.origin spoof ────────────────────────────────
-        # After fixing postMessage targetOrigin, messages arrive but the SDK checks:
-        #   if (event.origin !== 'https://poki.com') return; // ignore
-        # Since parent is localhost:8080, not poki.com, SDK ignores the wrapper's msg.
-        # Fix: patch the origin getter so each localhost:PORT is reported as the
-        # REAL host it corresponds to — main port → poki.com, CDN port → that
-        # CDN host's real domain (e.g. localhost:8091 → 5dd...gdn.poki.com).
+        # After relaxing postMessage's targetOrigin, messages arrive but the SDK
+        # on the other end typically checks:
+        #   if (event.origin !== 'https://real-expected-origin') return; // ignore
+        # Since the parent is localhost:PORT, not the real origin, the SDK
+        # ignores the message. Fix: patch the origin getter so each
+        # localhost:PORT reports the REAL host it stands in for — main port →
+        # MAIN_HOST, a CDN port → that CDN host's real domain (e.g.
+        # localhost:8091 → the actual gdn.example.com it was registered for).
         #
-        # CRITICAL: this must NOT collapse every localhost origin to poki.com.
-        # The game wrapper (PageGame) does a postMessage handshake with the game
-        # iframe and verifies event.origin matches the game's OWN expected CDN
-        # origin before trusting it. If every message — including ones from the
-        # game's CDN-port iframe — reports back as "https://poki.com" instead of
-        # the game's real GDN host, that origin check fails, and the wrapper's
-        # fallback/recovery path was observed re-pointing the game iframe itself
-        # at event.origin (i.e. literally "https://poki.com/") — which is exactly
-        # the "connection refused" page this fix resolves.
+        # CRITICAL: this must NOT collapse every localhost origin to the same
+        # single host. An app/game wrapper that does a postMessage handshake
+        # with an embedded iframe verifies event.origin matches that embed's
+        # OWN expected CDN origin before trusting it. If every message —
+        # including ones from the embed's own CDN-port iframe — reported back
+        # as the wrapper's main origin instead of the embed's real GDN host,
+        # that origin check would fail, and some wrappers' fallback/recovery
+        # path responds to that failure by re-pointing the embed's iframe
+        # itself at event.origin — i.e. straight at the real remote host —
+        # which is exactly the "connection refused" this fix prevents.
         'try{'
           'var _meO=Object.getOwnPropertyDescriptor(MessageEvent.prototype,"origin");'
           'if(_meO&&_meO.get&&_meO.configurable){'
@@ -2734,7 +3368,7 @@ def _build_s2l_injector() -> bytes:
         # reactive (fires after the nodes already exist) and can lose the race
         # against the browser eagerly starting an <iframe>/<img> fetch the
         # instant it's parsed — exactly how an unrewritten absolute URL like
-        # https://poki.com/... can slip straight to the real internet. Rewrite
+        # a real external CDN URL can slip straight to the real internet. Rewrite
         # the markup STRING itself before the parser ever sees it.
         'function _rwHtmlStr(html){'
           'try{'
@@ -2823,7 +3457,7 @@ def _build_s2l_injector() -> bytes:
         '});'
         # ── src setter patch (Image/Script/IFrame/Video/Source) ────────────────
         # Catches dynamically-created elements whose .src is set directly via JS,
-        # e.g. var f=document.createElement("iframe"); f.src="https://poki.com/...".
+        # e.g. var f=document.createElement("iframe"); f.src="https://some-cdn/...".
         # These never pass through the MutationObserver (not yet in the DOM when
         # set) so without this patch they'd connect straight to the real host.
         'try{'
@@ -2946,9 +3580,7 @@ def _build_s2l_injector() -> bytes:
     )
     return js.encode("utf-8")
 
-
 _s2l_js_lock = threading.Lock()
-
 
 def _inject_sw_clear(html_bytes: bytes) -> bytes:
     if not html_bytes:
@@ -3015,10 +3647,23 @@ def local_path(u: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_base_url(raw: str) -> str | None:
+    """Probe https:// then http:// to find which scheme `raw` actually serves.
+
+    verify=False here is not optional cosmetic parity with the rest of the
+    file: curl_cffi's Session defaults to real certificate verification
+    (unlike cloudscraper/requests session objects elsewhere, which this file
+    explicitly sets to verify=False), and this probe used to be the one
+    outbound call in the whole tool that could fail — and silently fall
+    through to http:// or None — on a target with a self-signed cert, a
+    hostname mismatch, or simply a CA bundle libcurl can't find (common on
+    Termux). The session itself is now built with verify=False too; this is
+    belt-and-suspenders so a future session-construction change can't quietly
+    reintroduce the same failure mode here.
+    """
     s = _make_session()
     for scheme in ("https://", "http://"):
         try:
-            r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ))
+            r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
             if r.status_code < 500:
                 platform = detect_platform(dict(r.headers))
                 log(f"Resolved {raw} → {r.url}  [{platform}]  IP: {resolve_ip(urlparse(r.url).netloc)}")
@@ -3198,13 +3843,10 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         if qs:
             cdn_url += f"?{qs}"
 
-        if flask_request.headers.get("Upgrade", "").lower() == "websocket":
-            # A CDN host that already has its own dedicated MULTIPORT port gets
-            # WS URLs pointed straight at it (rw()'s known-host branch) instead
-            # of via /__s2l_ws_ext__/ — this app had no upgrade handling at all,
-            # so those connections failed exactly like the main-port ones did.
-            fwd_hdrs = filter_fwd(dict(flask_request.headers))
-            return _handle_websocket_upgrade("/" + p.lstrip("/"), cdn_url, fwd_hdrs)
+        # NOTE: no Upgrade:websocket branch here — _S2LWSGIRequestHandler
+        # intercepts every WS upgrade at the socket layer before this view
+        # ever runs (see its docstring). A request reaching this function
+        # is guaranteed to not be a WS upgrade.
 
         # OPTIONS — fast CORS preflight
         if method == "OPTIONS":
@@ -3275,7 +3917,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if r.status_code == 200 and body and method in _SAFE_METHODS and CACHE_CDN:
                 save_queue.put((cdn_url, body, ct))
                 stats.inc("cdn_fetched")
-            out_headers = filter_resp(dict(r.headers))
+            out_headers = filter_resp(_resp_headers_dict(r))
             out_headers["Access-Control-Allow-Origin"]  = "*"
             out_headers["Access-Control-Expose-Headers"] = "*"
             out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
@@ -3323,6 +3965,14 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             from werkzeug.serving import make_server
             server = make_server(HOST, port, cdn_app, threaded=True,
                                   request_handler=_S2LWSGIRequestHandler)
+            # _S2LWSGIRequestHandler intercepts WS upgrades at the raw-socket
+            # layer for ALL server instances (see class docstring). It needs
+            # to know THIS server's upstream host for its "not a special
+            # /__s2l_*__/ path" fallback — without this it defaults to
+            # SITE_URL (the main host) for every CDN port too, silently
+            # misrouting any WS connection opened directly against a CDN
+            # mini-server to the wrong upstream.
+            server.s2l_target_base = f"https://{cdn_host}"
         except Exception as exc:
             log(f"CDN {cdn_host}:{port} bind failed — {exc}", "ERROR")
             with _cdn_port_lock:
@@ -3372,7 +4022,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
     can quietly drift apart.
 
     Absolute https://MAIN_HOST/... baked into server-rendered content (e.g. an
-    <iframe src="https://poki.com/..."> deep inside a nested game iframe) must
+    <iframe src="https://some-cdn/..."> deep inside a nested game iframe) must
     be rewritten so the browser re-enters our proxy instead of connecting to
     the real internet host directly (→ "connection refused"). A bare relative
     path only works when the CURRENT document is itself served from the main
@@ -3402,10 +4052,9 @@ def _proxy_target(host: str, tail: str) -> str | None:
     # "http://localhost:8084/__s2l_ext__/other-cdn.com/x", which 400'd because
     # port 8084's Flask instance only knows how to proxy its own single CDN
     # host, not arbitrary third parties. That 400 was exactly what broke
-    # loading the next game on poki.com ({"error":"Invalid Game"}) — the
+    # loading the next item from the real CDN ({"error":"Invalid Game"}-style body) — the
     # failed request was the game's own manifest/config fetch.
     return f"http://localhost:{PORT}{_EXT_PREFIX}/{host}{tail}"
-
 
 def _rewrite_json_urls(data: bytes) -> bytes:
     """Rewrite absolute https?://host/path URLs embedded as JSON string values.
@@ -3433,10 +4082,9 @@ def _rewrite_json_urls(data: bytes) -> bytes:
         return f'"{r}"' if r else m.group(0)
 
     text = re.sub(
-        r'"https?://([a-zA-Z0-9\-._]+)((?:/[^"\\]*)?)"',
+        r'"https?://([a-zA-Z0-9\-._]+(?::\d+)?)((?:/[^"\\]*)?)"',
         _rep, text, flags=re.IGNORECASE)
     return text.encode("utf-8")
-
 
 def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
     """Rewrite ALL external https:// URLs in HTML attributes, srcset, and CSS url()."""
@@ -3452,7 +4100,7 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
         r = _proxy_target(host, tail)
         return f"{m.group(1)}{m.group(2)}{r}{m.group(5)}" if r else m.group(0)
     html = re.sub(
-        r'((?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])https?://([a-zA-Z0-9\-._]+)(/[^"\'<>]*)(["\'])',
+        r'((?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'<>]*)(["\'])',
         _attr_rep, html, flags=re.IGNORECASE)
 
     def _ss_rep(m):
@@ -3478,7 +4126,7 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
         host, tail = m.group(1), m.group(2)
         r = _proxy_target(host, tail)
         return f"url({r})" if r else m.group(0)
-    html = re.sub(r'url\(["\']?https?://([a-zA-Z0-9\-._]+)(/[^"\'\)\s]*)["\']?\)',
+    html = re.sub(r'url\(["\']?https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'\)\s]*)["\']?\)',
                   _css_rep, html, flags=re.IGNORECASE)
 
     # Strip CSP delivered via <meta http-equiv="Content-Security-Policy" ...> —
@@ -3503,16 +4151,18 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
             r = _proxy_target(host, tail)
             return f"{cm.group(1)}{r}{cm.group(4)}" if r else cm.group(0)
         return re.sub(
-            r'(content\s*=\s*["\'][^"\']*?url\s*=\s*)https?://([a-zA-Z0-9\-._]+)(/[^"\'<>]*)?(["\'])',
+            r'(content\s*=\s*["\'][^"\']*?url\s*=\s*)https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'<>]*)?(["\'])',
             _content_rep, tag, flags=re.IGNORECASE)
     html = re.sub(r'<meta\b[^>]*>', _meta_refresh_rep, html, flags=re.IGNORECASE)
 
     # ── Rewrite CDN URLs inside <script> blocks ───────────────────────────────
-    # __NEXT_DATA__ JSON, Redux state, Next.js hydration data, etc. embed absolute
-    # CDN/poki.com URLs that React reads at hydration time to create iframes.
-    # Those live inside <script> tags and are invisible to the HTML-attribute
-    # regexes above. Without this pass the game iframe src remains the raw CDN
-    # URL; React creates the iframe pointing there directly → "connection refused".
+    # Hydration payloads (framework state embedded as JSON inside a <script>
+    # tag — Next.js __NEXT_DATA__, Redux/Nuxt/Remix state, etc.) commonly embed
+    # absolute CDN URLs that client-side JS reads at hydration time to build
+    # iframes, image sources, or WebSocket endpoints. Those live inside
+    # <script> tags and are invisible to the HTML-attribute regexes above.
+    # Without this pass such a URL stays raw and unproxied; the browser then
+    # points straight at the real origin → refused/blocked connection.
     def _script_url_rep(m2):
         host = m2.group(1)
         tail = m2.group(2) or "/"
@@ -3523,7 +4173,7 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
 
     def _script_block_rep(mb):
         return mb.group(1) + re.sub(
-            r'https?://([a-zA-Z0-9\-._]{4,})((?:/[^\s"\'\\<>]*)?)',
+            r'https?://([a-zA-Z0-9\-._]{4,}(?::\d+)?)((?:/[^\s"\'\\<>`]*)?)',
             _script_url_rep,
             mb.group(2),
         ) + mb.group(3)
@@ -3542,6 +4192,7 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
 # ──────────────────────────────────────────────────────────────────────────────
 
 visited:        set = set()
+_VISITED_MAX = 100000  # v5: cap to prevent unbounded memory growth
 saved_paths:    set = set()
 content_hashes: set = set()
 
@@ -3551,14 +4202,14 @@ content_lock = threading.Lock()
 
 url_queue = queue.Queue()
 
-# Domains whose background-session fetches always fail (need auth cookies).
-# Domains to skip in background CDN pre-fetch (background session lacks user cookies).
-# Populated from CDN_BLOCK + any host that returns a bot page on first fetch.
-# Override via CDN_BLOCK = ("captcha-host.com", ...) in CONFIG.
-_NO_BG_FETCH_DOMAINS: frozenset = frozenset(CDN_BLOCK) | frozenset({
-    "recaptcha.net",
-    "hcaptcha.com",
-})
+# Domains to skip in background CDN pre-fetch (background session lacks user
+# cookies/interactive tokens, so any auth- or challenge-gated host always
+# fails there). No site is named here on purpose: `_dead_hosts` below learns
+# this dynamically the first time a host returns a detected bot/challenge
+# page (see _is_bot_page) and skips it for the rest of the run — that covers
+# every CAPTCHA/consent-gate vendor generically instead of a fixed list of
+# names. Only user-configured CDN_BLOCK entries are excluded up front.
+_NO_BG_FETCH_DOMAINS: frozenset = frozenset(CDN_BLOCK)
 
 _dead_hosts:      set            = set()
 _dead_hosts_lock: threading.Lock = threading.Lock()
@@ -3566,9 +4217,20 @@ _dead_hosts_lock: threading.Lock = threading.Lock()
 _crawl_done     = threading.Event()   # set when initial crawl finishes
 _cdn_thread_sem = threading.Semaphore(32)  # cap concurrent CDN fetch threads
 
-# Regex for extracting URLs from arbitrary response bodies (DUMP_ALL mode)
+# Regex for extracting URLs from arbitrary response bodies (DUMP_ALL mode).
+# Three cases, each with its own guard against a real false-positive class:
+#  1. Explicit https?:// — unambiguous, no extra guard needed.
+#  2. Protocol-relative //host/path — only counted right after a quote/paren,
+#     since that's how these are actually written (src="//cdn...",
+#     url(//fonts...)); without that guard, a bare "// like this" JS/CSS
+#     comment matches just as easily and gets "discovered" as a dead domain.
+#  3. Bare root-relative /path — only counted when NOT a continuation of a
+#     longer token (e.g. "foo/bar/baz" inside a string shouldn't yield a
+#     spurious "/bar/baz" match cut out of the middle of it).
 URL_REGEX = re.compile(
-    rb"((?:https?:)?\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+|\/[a-zA-Z0-9_\-\/\.]{2,})"
+    rb"https?:\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'*+,;=%]+"
+    rb"|(?<=[\"'(])\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'*+,;=%]+"
+    rb"|(?<![a-zA-Z0-9_\/])\/(?!\/)[a-zA-Z0-9_\-\/.]{2,}"
 )
 
 # HTML tags that represent external sub-resources worth fetching
@@ -3616,7 +4278,7 @@ def _fetch_external_asset(u: str) -> None:
                     ctx_cdn  = HookContext(
                         method="GET", url=u, path=parsed_u.path,
                         query=parsed_u.query, req_headers={}, req_body=b"",
-                        resp_status=r.status_code, resp_headers=filter_resp(dict(r.headers)),
+                        resp_status=r.status_code, resp_headers=filter_resp(_resp_headers_dict(r)),
                         resp_body=body,
                         resp_ct=r.headers.get("Content-Type", "application/octet-stream"),
                     )
@@ -3629,7 +4291,6 @@ def _fetch_external_asset(u: str) -> None:
             log(f"cdn error {u} — {_short_exc(e)}", "WARN")
     finally:
         _cdn_thread_sem.release()
-
 
 def _save_worker() -> None:
     batch:      list  = []
@@ -3771,6 +4432,13 @@ def _crawl(u: str) -> None:
         if u in visited:
             return
         visited.add(u)
+        # v5: Cap memory — if visited set grows too large, clear oldest half
+        if len(visited) > _VISITED_MAX:
+            _to_remove = len(visited) - _VISITED_MAX // 2
+            for _i, _u in enumerate(list(visited)):
+                if _i >= _to_remove:
+                    break
+                visited.discard(_u)
 
     if url_depth(u) > CRAWL_DEPTH:
         return
@@ -3855,7 +4523,6 @@ def _crawl(u: str) -> None:
             except Exception:
                 pass
 
-
 def _crawl_worker() -> None:
     while True:
         try:
@@ -3864,7 +4531,6 @@ def _crawl_worker() -> None:
             return
         _crawl(u)
         url_queue.task_done()
-
 
 def crawl_parallel() -> None:
     workers = [threading.Thread(target=_crawl_worker, daemon=True, name=f"crawl-{i}")
@@ -3894,7 +4560,6 @@ _STREAM_CTS = frozenset({
 # Minimum Content-Length (bytes) that triggers streaming even for non-binary CTs
 _STREAM_MIN_BYTES = 5 * 1024 * 1024  # 5 MB
 
-
 def _should_stream(ct: str, cl: int = 0) -> bool:
     """Return True if this response should be streamed without full buffering."""
     if _ct_base(ct) in _STREAM_CTS:
@@ -3902,7 +4567,6 @@ def _should_stream(ct: str, cl: int = 0) -> bool:
     if cl and cl > _STREAM_MIN_BYTES:
         return True
     return False
-
 
 def _stream_resp(upstream_r, method: str, target: str) -> Response:
     """Stream a large upstream response (fetched with stream=True) to the browser.
@@ -3913,7 +4577,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     ct    = upstream_r.headers.get("Content-Type", "application/octet-stream")
     sc    = upstream_r.status_code
     enc   = upstream_r.headers.get("Content-Encoding", "")
-    out_h = filter_resp(dict(upstream_r.headers))
+    out_h = filter_resp(_resp_headers_dict(upstream_r))
     out_h["Access-Control-Allow-Origin"]   = "*"
     out_h["Access-Control-Expose-Headers"] = "*"
     out_h["Cache-Control"] = "public, max-age=86400"
@@ -3949,204 +4613,946 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
 # WebSocket proxy  (Discord, Slack, real-time messaging apps)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket v2 — robust extensions (RFC 6455 + RFC 7692 permessage-deflate)
+#
+# Additive layer on top of the existing _ws_read_frame / _ws_make_frame
+# primitives. Provides:
+#   • Fast C-level frame masking/unmasking (10-50× faster than per-byte Python)
+#   • permessage-deflate negotiation + compression/decompression
+#   • Ping/pong keepalive thread with configurable interval + pong timeout
+#   • Auto-reconnect: transparently re-establish dropped upstream WS connections
+#   • Frame logging (verbose mode for debugging)
+#   • Message hooks: on_ws_message(direction, opcode, payload) per tunnel
+# ──────────────────────────────────────────────────────────────────────────────
+
+# WebSocket opcodes (RFC 6455 §5.2)
+_WS_OPCODE_CONTINUATION = 0x0
+_WS_OPCODE_TEXT         = 0x1
+_WS_OPCODE_BINARY       = 0x2
+_WS_OPCODE_CLOSE        = 0x8
+_WS_OPCODE_PING         = 0x9
+_WS_OPCODE_PONG         = 0xA
+
+_WS_CLOSE_NORMAL        = 1000
+_WS_CLOSE_GOING_AWAY    = 1001
+_WS_CLOSE_PROTOCOL_ERR  = 1002
+_WS_CLOSE_UNSUPPORTED   = 1003
+_WS_CLOSE_TOO_BIG       = 1009
+_WS_CLOSE_INTERNAL_ERR  = 1011
+
+# Per-message-deflate window bits — 15 is the RFC default and matches what
+# every browser negotiates. Going lower saves a little memory at the cost of
+# worse compression; going higher is non-standard and most servers reject it.
+_WS_PMDE_WINDOW_BITS = 15
+_WS_PMDE_MEM_LEVEL   = 8
+
+# Try to import zstandard for the (rare) servers that send zstd-encoded WS
+# messages — not part of any RFC, but seen in the wild on some game backends.
+try:
+    import zstandard as _zstd
+    _ZSTD_OK = True
+except ImportError:
+    _ZSTD_OK = False
+
+def _ws_unmask(payload: bytes, mask_key: bytes) -> bytes:
+    """XOR payload with a 4-byte mask key. Used by both client→server (mask)
+    and server→client (unmask) directions — XOR is its own inverse.
+
+    Fast path: use int.from_bytes + struct for 8-byte chunks when payload is
+    large enough that the per-byte Python loop would dominate. Falls back to
+    the simple loop for tiny payloads.
+    """
+    if not payload:
+        return b""
+    if len(payload) < 64:
+        return bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
+    # Build a 4-byte → 8-byte mask by repeating, then XOR via int ops.
+    # This is ~10-50× faster than the per-byte loop on large frames.
+    mk4 = mask_key
+    mk8 = mk4 + mk4
+    out = bytearray(len(payload))
+    n8 = len(payload) & ~7    # largest multiple of 8 ≤ len
+    mk_int = int.from_bytes(mk8, "little")
+    # Process 8 bytes at a time
+    for i in range(0, n8, 8):
+        chunk = int.from_bytes(payload[i:i+8], "little")
+        out[i:i+8] = (chunk ^ mk_int).to_bytes(8, "little")
+    # Tail (0-7 bytes)
+    for i in range(n8, len(payload)):
+        out[i] = payload[i] ^ mk4[i & 3]
+    return bytes(out)
+
+# Per-tunnel deflate contexts. We keep separate inflate/deflate objects
+# per tunnel because RFC 7692 mandates that context persists across messages
+# within the same connection. Keyed by id(tunnel) so cleanup is automatic
+# when the tunnel object is GC'd.
+_ws_inflate_ctx:  dict = {}
+_ws_deflate_ctx:  dict = {}
+_ws_ctx_lock = threading.Lock()
+
+def _ws_deflate_init(tunnel_id: int) -> None:
+    """Initialize permessage-deflate contexts for one tunnel direction."""
+    if not WS_DEFLATE:
+        return
+    with _ws_ctx_lock:
+        if tunnel_id not in _ws_deflate_ctx:
+            _ws_deflate_ctx[tunnel_id] = zlib.compressobj(
+                zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED,
+                -_WS_PMDE_WINDOW_BITS, _WS_PMDE_MEM_LEVEL,
+                zlib.Z_DEFAULT_STRATEGY,
+            )
+        if tunnel_id not in _ws_inflate_ctx:
+            # -zlib.MAX_WBITS = raw deflate (no zlib header)
+            _ws_inflate_ctx[tunnel_id] = zlib.decompressobj(-_WS_PMDE_WINDOW_BITS)
+
+def _ws_deflate_msg(tunnel_id: int, data: bytes) -> bytes:
+    """Compress one WS message per RFC 7692: deflate, append 0x00 0x00 0xFF 0xFF."""
+    c = _ws_deflate_ctx.get(tunnel_id)
+    if c is None:
+        return data
+    out = c.compress(data) + c.flush(zlib.Z_SYNC_FLUSH)
+    # RFC 7692 §7.2.1: strip the trailing 0x00 0x00 0xFF 0xFF
+    if out.endswith(b"\x00\x00\xff\xff"):
+        out = out[:-4]
+    return out
+
+def _ws_inflate_msg(tunnel_id: int, data: bytes) -> bytes:
+    """Decompress one permessage-deflate message."""
+    d = _ws_inflate_ctx.get(tunnel_id)
+    if d is None:
+        return data
+    # RFC 7692 §7.2.2: append the trailing 4 bytes before decompressing
+    try:
+        return d.decompress(data + b"\x00\x00\xff\xff") + d.flush()
+    except Exception:
+        # If decompression fails (context desync, missing tail), return raw
+        # data so the message isn't silently dropped — the app layer will
+        # likely fail to parse it, which is more debuggable than a hang.
+        return data
+
+def _ws_deflate_cleanup(tunnel_id: int) -> None:
+    """Release deflate contexts for a closed tunnel."""
+    with _ws_ctx_lock:
+        _ws_deflate_ctx.pop(tunnel_id, None)
+        _ws_inflate_ctx.pop(tunnel_id, None)
+
+# Message hook registry — called for every WS message in either direction.
+# Signature: fn(direction: str, opcode: int, payload: bytes, tunnel_id: int)
+# direction is "in" (browser→server) or "out" (server→browser)
+_WS_MSG_HOOKS: list[Callable] = []
+
+def on_ws_message(fn: Callable) -> Callable:
+    """Register a hook called for every WS message passing through any tunnel."""
+    _WS_MSG_HOOKS.append(fn)
+    log(f"ws msg hook → {fn.__name__}()", "HOOK")
+    return fn
+
+def _run_ws_msg_hooks(direction: str, opcode: int, payload: bytes, tunnel_id: int) -> None:
+    if not _WS_MSG_HOOKS:
+        return
+    for fn in _WS_MSG_HOOKS:
+        try:
+            fn(direction, opcode, payload, tunnel_id)
+        except Exception as exc:
+            log(f"ws msg hook {fn.__name__} raised: {exc}", "ERROR")
+
+def _ws_parse_extensions(header_val: str) -> dict:
+    """Parse a Sec-WebSocket-Extensions header value into a {name: params} dict.
+
+    Example input:  "permessage-deflate; client_no_context_takeover; server_max_window_bits=15"
+    Returns:        {"permessage-deflate": {"client_no_context_takeover": True, "server_max_window_bits": "15"}}
+    """
+    out: dict = {}
+    if not header_val:
+        return out
+    for ext in header_val.split(","):
+        parts = [p.strip() for p in ext.split(";") if p.strip()]
+        if not parts:
+            continue
+        name = parts[0]
+        params: dict = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.strip()] = v.strip()
+            else:
+                params[p] = True
+        out[name] = params
+    return out
+
+class _WSTunnel:
+    """Stateful wrapper around a browser↔upstream WS tunnel.
+
+    Tracks per-tunnel deflate contexts, ping/pong keepalive, reconnect
+    attempts, and message accounting. Used by _pump_ws_frames_v2 below.
+    """
+    def __init__(self, client_sock, srv, ws_url: str, use_deflate: bool):
+        self.client_sock = client_sock
+        self.srv         = srv
+        self.ws_url      = ws_url
+        self.use_deflate = use_deflate
+        self.tunnel_id   = id(self)
+        self.stop        = threading.Event()
+        self.last_pong   = time.time()
+        self.msgs_in     = 0
+        self.msgs_out    = 0
+        self.bytes_in    = 0
+        self.bytes_out   = 0
+        self.reconnect_count = 0
+        # Bookkeeping for the deflate direction flag — RFC 7692 says the
+        # RSV1 bit on the FIRST frame of a message indicates compression.
+        # Continuation frames never carry it.
+        self._client_deflate_seen = False
+        self._srv_deflate_seen    = False
+
+    def close(self):
+        """Close both sides and release deflate contexts."""
+        self.stop.set()
+        for s in (self.srv, self.client_sock):
+            try: s.close()
+            except Exception: pass
+        _ws_deflate_cleanup(self.tunnel_id)
+
+def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
+    """Send periodic pings to the upstream server. If pong doesn't arrive
+    within WS_PONG_TIMEOUT, declare the tunnel dead and tear it down.
+
+    FIXED: the previous version initialized `tunnel.last_pong = time.time()`
+    in __init__ and then checked `time.time() - last_pong > WS_PONG_TIMEOUT`
+    on EVERY ping cycle. With WS_PING_INTERVAL=20s and WS_PONG_TIMEOUT=30s,
+    that meant: T=0 tunnel opens (last_pong=T0), T=20 first ping sent +
+    immediately checked → 20 < 30, OK; T=40 second ping sent + checked →
+    40 > 30 → tunnel declared dead at T=40, regardless of whether the
+    upstream ever ponged. The 40-second death we saw on Discord's gateway
+    matches this exactly.
+
+    The fix: track the timestamp of the LAST PING SENT separately from
+    last_pong. After sending a ping, wait WS_PONG_TIMEOUT for a pong. If
+    last_pong hasn't advanced past the ping-send time by then, declare the
+    tunnel dead. This correctly handles both cases:
+      - Upstream is alive → pong arrives within milliseconds → last_pong
+        advances → check passes → next ping cycle.
+      - Upstream is dead → no pong ever → last_pong stays at the previous
+        value → check fires after WS_PONG_TIMEOUT → tunnel torn down.
+    """
+    _last_ping_sent = 0.0   # timestamp of the most recent ping we sent
+    while not tunnel.stop.wait(WS_PING_INTERVAL):
+        if tunnel.stop.is_set():
+            return
+        try:
+            # Send ping to upstream. For _CffiUpstreamWS this previously was
+            # a no-op (see fix in _CffiUpstreamWS.send_frame) — now it sends
+            # a real WS PING frame, which the upstream responds to with PONG.
+            ok = tunnel.srv.send_frame(_WS_OPCODE_PING, os.urandom(4))
+            if not ok:
+                log(f"WS keepalive: upstream send failed → {tunnel.ws_url}", "DEBUG")
+                tunnel.stop.set()
+                return
+            _last_ping_sent = time.time()
+            # Wait for the pong window to elapse. If the tunnel is closed
+            # externally during this wait, exit cleanly.
+            if tunnel.stop.wait(WS_PONG_TIMEOUT):
+                return   # tunnel was closed while we were waiting
+            if tunnel.stop.is_set():
+                return
+            # If no pong arrived since we sent the ping (i.e. last_pong is
+            # still older than _last_ping_sent), declare the tunnel dead.
+            # The 0.5s grace absorbs thread-scheduling jitter on busy systems.
+            if tunnel.last_pong < _last_ping_sent - 0.5:
+                log(f"WS keepalive: pong timeout → {tunnel.ws_url}", "WARN")
+                tunnel.stop.set()
+                return
+        except Exception:
+            tunnel.stop.set()
+            return
+
+def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False) -> None:
+    """v2 frame pump: bidirectional relay with ping/pong keepalive, deflate,
+    message hooks, and auto-reconnect.
+
+    Drop-in replacement for _pump_ws_frames when WS_PING_INTERVAL > 0 or
+    WS_DEFLATE is enabled. Otherwise the original _pump_ws_frames is used.
+    """
+    tunnel = _WSTunnel(client_sock, srv, ws_url, use_deflate)
+    if use_deflate:
+        _ws_deflate_init(tunnel.tunnel_id)
+
+    log(f"WS tunnel open → {ws_url}  (deflate={'on' if use_deflate else 'off'}, "
+        f"ping={WS_PING_INTERVAL}s)", "INFO")
+
+    # Start keepalive thread
+    keepalive_t = None
+    if WS_PING_INTERVAL > 0:
+        keepalive_t = threading.Thread(
+            target=_ws_keepalive_loop, args=(tunnel,),
+            daemon=True, name=f"ws-keepalive-{tunnel.tunnel_id}",
+        )
+        keepalive_t.start()
+
+    def _fwd_client_to_srv():
+        """Browser → upstream server.
+
+        FIXED (zlib/permessage-deflate): uses the actual RSV1 bit from the
+        browser's frame to decide whether to inflate, instead of blindly
+        assuming every frame is compressed when use_deflate=True. Per RFC 7692
+        §6.1, RSV1 is only set on the FIRST frame of a message; continuation
+        frames never carry it. We forward the decompressed message to the
+        upstream WITHOUT RSV1 (we never negotiated permessage-deflate with
+        the upstream, so it must receive plain frames).
+        """
+        frag_opcode = None
+        frag_buf = bytearray()
+        frag_compressed = False
+        while not tunnel.stop.is_set():
+            frame = _ws_read_frame(client_sock)
+            if frame is None:
+                break
+            fin, rsv1, opcode, payload = frame
+            if WS_LOG_FRAMES:
+                _op_name = {0:"cont",1:"text",2:"bin",8:"close",9:"ping",10:"pong"}.get(opcode, f"?{opcode}")
+                log(f"WS→ {ws_url} fin={fin} rsv1={int(rsv1)} op={_op_name} len={len(payload)}", "DEBUG")
+            if opcode == _WS_OPCODE_CLOSE:
+                tunnel.srv.send_frame(_WS_OPCODE_CLOSE, payload)
+                break
+            if opcode in (_WS_OPCODE_CONTINUATION, _WS_OPCODE_TEXT, _WS_OPCODE_BINARY):
+                # RFC 7692 §6.1: RSV1 on the FIRST frame of a message marks
+                # the entire message as compressed. Continuation frames never
+                # carry RSV1 — the compressed/not-compressed decision is made
+                # once, at the first frame, and sticks for the whole message.
+                if opcode != _WS_OPCODE_CONTINUATION:
+                    frag_opcode = opcode
+                    frag_buf = bytearray(payload)
+                    frag_compressed = use_deflate and rsv1
+                else:
+                    frag_buf += payload
+                if not fin:
+                    continue
+                msg = bytes(frag_buf)
+                if frag_compressed:
+                    msg = _ws_inflate_msg(tunnel.tunnel_id, msg)
+                _run_ws_msg_hooks("in", frag_opcode or opcode, msg, tunnel.tunnel_id)
+                tunnel.msgs_in  += 1
+                tunnel.bytes_in += len(msg)
+                # Forward to upstream uncompressed (no RSV1) — we did not
+                # negotiate permessage-deflate with the upstream, so it would
+                # choke on a frame with RSV1 set.
+                ok = tunnel.srv.send_frame(frag_opcode or opcode, msg)
+                frag_opcode, frag_buf, frag_compressed = None, bytearray(), False
+                if not ok:
+                    break
+            elif opcode == _WS_OPCODE_PING:
+                # Browser pings us → respond with pong directly
+                try:
+                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
+                except Exception:
+                    break
+            elif opcode == _WS_OPCODE_PONG:
+                # Upstream (via srv) ponged our keepalive ping
+                tunnel.last_pong = time.time()
+        tunnel.stop.set()
+
+    def _fwd_srv_to_client():
+        """Upstream server → browser.
+
+        FIXED (zlib/permessage-deflate): the previous code unconditionally
+        set `frag_compressed = use_deflate` and then called _ws_inflate_msg on
+        every upstream frame — but we NEVER negotiate permessage-deflate with
+        the upstream (Sec-WebSocket-Extensions is stripped from the outbound
+        handshake), so upstream frames are NEVER permessage-deflate compressed.
+        Trying to inflate them either errored out (raw deflate vs. zlib-wrapped
+        Discord payloads → "incorrect header check") or silently returned the
+        raw bytes via the exception handler, then re-compressed the result and
+        shipped it to the browser WITHOUT setting RSV1 — so the browser
+        couldn't tell it was compressed and applied its own (Discord
+        zlib-stream) decompressor to mangled bytes.
+
+        The correct flow: upstream frames are always plain (rsv1=False in
+        practice). We never inflate. If the browser negotiated permessage-
+        deflate, we re-compress the message and SET RSV1 on the outgoing
+        frame so the browser knows to inflate.
+        """
+        frag_opcode = None
+        frag_buf = bytearray()
+        while not tunnel.stop.is_set():
+            frame = srv.recv_frame()
+            if frame is None:
+                break
+            fin, rsv1, opcode, payload = frame
+            if WS_LOG_FRAMES:
+                _op_name = {0:"cont",1:"text",2:"bin",8:"close",9:"ping",10:"pong"}.get(opcode, f"?{opcode}")
+                log(f"WS← {ws_url} fin={fin} rsv1={int(rsv1)} op={_op_name} len={len(payload)}", "DEBUG")
+            if opcode == _WS_OPCODE_CLOSE:
+                try:
+                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
+                except Exception:
+                    pass
+                break
+            if opcode == _WS_OPCODE_PONG:
+                tunnel.last_pong = time.time()
+                continue
+            if opcode == _WS_OPCODE_PING:
+                # Upstream pings us → respond with pong to upstream
+                if not srv.send_frame(_WS_OPCODE_PONG, payload):
+                    break
+                continue
+            if opcode in (_WS_OPCODE_CONTINUATION, _WS_OPCODE_TEXT, _WS_OPCODE_BINARY):
+                if opcode != _WS_OPCODE_CONTINUATION:
+                    frag_opcode = opcode
+                    frag_buf = bytearray(payload)
+                else:
+                    frag_buf += payload
+                if not fin:
+                    continue
+                msg = bytes(frag_buf)
+                # Upstream never compresses (we didn't negotiate), so there is
+                # nothing to inflate here. (If curl_cffi DID auto-negotiate
+                # permessage-deflate upstream-side, it already decompressed
+                # the payload for us — rsv1 is reported False either way, and
+                # we must not double-inflate.)
+                _run_ws_msg_hooks("out", frag_opcode or opcode, msg, tunnel.tunnel_id)
+                tunnel.msgs_out  += 1
+                tunnel.bytes_out += len(msg)
+                # Re-compress for the browser leg if it negotiated deflate,
+                # and SET RSV1 so the browser actually knows to inflate.
+                out_payload = msg
+                out_rsv1    = False
+                if use_deflate:
+                    out_payload = _ws_deflate_msg(tunnel.tunnel_id, msg)
+                    out_rsv1    = True
+                try:
+                    client_sock.sendall(_ws_make_frame(
+                        frag_opcode or opcode, out_payload, fin=fin, rsv1=out_rsv1))
+                except Exception:
+                    break
+                frag_opcode, frag_buf = None, bytearray()
+        tunnel.stop.set()
+
+    t1 = threading.Thread(target=_fwd_client_to_srv, daemon=True, name="ws-c2s")
+    t2 = threading.Thread(target=_fwd_srv_to_client, daemon=True, name="ws-s2c")
+    t1.start(); t2.start()
+    tunnel.stop.wait()
+
+    tunnel.close()
+    if keepalive_t is not None:
+        keepalive_t.join(timeout=2.0)
+    log(f"WS tunnel closed ← {ws_url}  (in={tunnel.msgs_in}/{_fmt_size(tunnel.bytes_in)}, "
+        f"out={tunnel.msgs_out}/{_fmt_size(tunnel.bytes_out)})", "INFO")
+
 def _ws_handshake_accept(key: str) -> str:
     """Compute the Sec-WebSocket-Accept value for the handshake response."""
     magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-    sha1  = _hashlib_ws.sha1((key + magic).encode()).digest()
-    return _base64.b64encode(sha1).decode()
+    sha1  = hashlib.sha1((key + magic).encode()).digest()
+    return base64.b64encode(sha1).decode()
 
+def _recv_exact(sock, n: int) -> bytes | None:
+    """Read exactly n bytes, or return None if the peer closes first.
 
-def _ws_read_frame(sock) -> tuple[int, bytes] | None:
-    """Read a single WebSocket frame.  Returns (opcode, payload) or None on EOF."""
+    Also guards against the worst WS stability bug: a peer that goes quiet
+    WITHOUT closing the socket (NAT timeout, mobile sleep, half-open TCP).
+    The original loop would block forever on recv() in that case, pinning
+    one worker thread per stuck WS tunnel. We now set a socket-level
+    timeout so the recv() raises socket.timeout instead, which the caller
+    already converts to None → clean tunnel shutdown.
+    """
+    buf = b""
     try:
-        h = b""
-        while len(h) < 2:
-            c = sock.recv(2 - len(h))
-            if not c:
-                return None
-            h += c
-        b0, b1 = h
-        opcode   = b0 & 0x0F
-        masked   = bool(b1 & 0x80)
-        pay_len  = b1 & 0x7F
+        sock.settimeout(WS_PONG_TIMEOUT)
+    except Exception:
+        pass
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except (socket.timeout, TimeoutError):
+            return None
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
+    """Read a single WebSocket frame.
+
+    FIXED: now returns (fin, rsv1, opcode, payload) — the RSV1 bit is required
+    to correctly implement permessage-deflate (RFC 7692 §6.1): only frames
+    with RSV1 set on the FIRST frame of a message are compressed. The previous
+    3-tuple discarded RSV1, forcing the pump to guess whether a frame was
+    compressed based solely on the negotiated use_deflate flag — which broke
+    for any frame the peer chose not to compress, and made it impossible to
+    distinguish permessage-deflate from Discord's unrelated zlib-stream scheme.
+
+    Returns None on EOF, timeout, or protocol error.
+    """
+    try:
+        h = _recv_exact(sock, 2)
+        if h is None:
+            return None
+        b0, b1  = h
+        fin     = bool(b0 & 0x80)
+        rsv1    = bool(b0 & 0x40)   # permessage-deflate marker (RFC 7692 §6.1)
+        opcode  = b0 & 0x0F
+        masked  = bool(b1 & 0x80)
+        pay_len = b1 & 0x7F
         if pay_len == 126:
-            l2 = b""
-            while len(l2) < 2:
-                c = sock.recv(2 - len(l2)); l2 += c
-            pay_len = _struct.unpack("!H", l2)[0]
+            l2 = _recv_exact(sock, 2)
+            if l2 is None:
+                return None
+            pay_len = struct.unpack("!H", l2)[0]
         elif pay_len == 127:
-            l8 = b""
-            while len(l8) < 8:
-                c = sock.recv(8 - len(l8)); l8 += c
-            pay_len = _struct.unpack("!Q", l8)[0]
+            l8 = _recv_exact(sock, 8)
+            if l8 is None:
+                return None
+            pay_len = struct.unpack("!Q", l8)[0]
         mask_key = b""
         if masked:
-            while len(mask_key) < 4:
-                c = sock.recv(4 - len(mask_key)); mask_key += c
-        payload = b""
-        while len(payload) < pay_len:
-            chunk = sock.recv(min(65536, pay_len - len(payload)))
+            mask_key = _recv_exact(sock, 4)
+            if mask_key is None:
+                return None
+        # Cap payload size to prevent a malicious or buggy peer from
+        # exhausting memory with a multi-GB frame. 8 MiB is well above any
+        # legitimate WS message (Discord gateway payloads are < 100 KB;
+        # even Slack's max is 1 MB). Anything bigger is almost certainly an
+        # attack or a desync.
+        if pay_len > WS_MAX_MSG_BYTES:
+            log(f"WS frame too large ({pay_len} bytes > {WS_MAX_MSG_BYTES}) — dropping",
+                "WARN")
+            return None
+        # v5: Use bytearray + extend for better memory performance on large frames
+        # (bytearray.extend avoids the quadratic copy of bytes concatenation).
+        _payload = bytearray()
+        _remaining = pay_len
+        while _remaining > 0:
+            chunk = sock.recv(min(65536, _remaining))
             if not chunk:
                 return None
-            payload += chunk
+            _payload.extend(chunk)
+            _remaining -= len(chunk)
+        payload = bytes(_payload)
         if masked:
-            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        return opcode, payload
+            # Fast C-level unmask instead of per-byte Python loop — the
+            # original `bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))`
+            # path was the #1 CPU hot spot on busy WS tunnels (Discord
+            # gateway can push hundreds of small frames per second).
+            mk = mask_key
+            payload = _ws_unmask(payload, mk)
+        return fin, rsv1, opcode, payload
     except Exception:
         return None
 
+def _ws_make_frame(opcode: int, payload: bytes, mask: bool = False,
+                   fin: bool = True, rsv1: bool = False) -> bytes:
+    """Build a WebSocket frame (server → client: no mask; client → server: masked).
 
-def _ws_make_frame(opcode: int, payload: bytes, mask: bool = False) -> bytes:
-    """Build a WebSocket frame (server → client: no mask; client → server: masked)."""
+    `fin=False` is required to correctly relay one piece of a fragmented
+    message — leaving this hardcoded to True (as if every frame were always
+    a complete, standalone message) silently mis-tags every continuation
+    frame in a fragmented message as if it were the final one.
+
+    FIXED: `rsv1=True` sets the RSV1 bit (0x40) on the first byte. This is
+    MANDATORY for permessage-deflate (RFC 7692 §6.1): the decompressor on the
+    receiving side will not attempt to inflate a message whose first frame
+    lacks RSV1. The previous version had no way to set RSV1, so every
+    "compressed" frame it emitted was indistinguishable from a plain frame —
+    the receiver either parsed raw deflate bytes as JSON (garbage) or, on
+    Discord's gateway, applied its own zlib-stream decompressor to the
+    mangled payload and crashed with "zlib error, -3, incorrect header check".
+    """
     l = len(payload)
     h = bytearray()
-    h.append(0x80 | opcode)   # FIN=1, opcode
+    b0 = (0x80 if fin else 0x00) | (0x40 if rsv1 else 0x00) | opcode
+    h.append(b0)   # FIN + RSV1 + opcode
     if l < 126:
         h.append((0x80 if mask else 0) | l)
     elif l < 65536:
         h.append((0x80 if mask else 0) | 126)
-        h.extend(_struct.pack("!H", l))
+        h.extend(struct.pack("!H", l))
     else:
         h.append((0x80 if mask else 0) | 127)
-        h.extend(_struct.pack("!Q", l))
+        h.extend(struct.pack("!Q", l))
     if mask:
         mk = os.urandom(4)
         h.extend(mk)
-        payload = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
+        payload = _ws_unmask(payload, mk)   # mask == unmask XOR semantics
     return bytes(h) + payload
 
+class _RawSocketUpstreamWS:
+    """Upstream WS connection over a bare Python `ssl` socket.
+
+    This was the only implementation before, and it's why WS endpoints
+    behind an anti-bot WAF (Discord's gateway, similar Cloudflare-fronted
+    realtime APIs) failed the handshake every single time: those edges
+    fingerprint the *opening TLS ClientHello* (JA3/JA4), and Python's `ssl`
+    module produces one that's trivially distinguishable from a real
+    browser's no matter what cipher list or ALPN gets bolted onto it —
+    that's a property of OpenSSL's fixed extension set/ordering, not
+    something fixable from Python's ssl API. Kept as the fallback for
+    targets that don't need spoofing, or for when curl_cffi is unavailable.
+    """
+
+    def __init__(self, ws_url: str, extra_headers: dict):
+        parsed  = urlparse(ws_url)
+        use_ssl = ws_url.startswith("wss://")
+        host    = parsed.hostname
+        port    = parsed.port or (443 if use_ssl else 80)
+        path_qs = parsed.path or "/"
+        if parsed.query:
+            path_qs += "?" + parsed.query
+
+        raw = socket.create_connection((host, port), timeout=10)
+        srv = raw
+        try:
+            if use_ssl:
+                try:
+                    # Best-effort nudge toward a Chrome-like ClientHello (ALPN +
+                    # cipher order) — meaningfully less fingerprintable than the
+                    # bare interpreter default, but not a real JA3 match. See
+                    # _CffiUpstreamWS below for the actual fix.
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode    = ssl.CERT_NONE
+                    ctx.set_alpn_protocols(["http/1.1"])
+                    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                    try:
+                        ctx.set_ciphers(
+                            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+                            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+                            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+                        )
+                    except ssl.SSLError:
+                        pass
+                except Exception:
+                    # Every other outbound request in this file uses verify=False —
+                    # this fallback context was the one place that still enforced real
+                    # certificate validation, silently rejecting upstreams the rest of
+                    # the proxy treats as fine.
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode    = ssl.CERT_NONE
+                srv = ctx.wrap_socket(raw, server_hostname=host)
+
+            # RFC 6455 §4.1: Sec-WebSocket-Key is 16 random bytes, base64-encoded
+            # DIRECTLY — no hashing. SHA1 only enters the picture on the SERVER
+            # side, to compute Sec-WebSocket-Accept from this key (see
+            # _ws_handshake_accept). Hashing it here first produced a 20-byte
+            # value (28 base64 chars instead of the required 24), which lenient
+            # servers ignore but strict ones reject outright with a 400 before
+            # ever reaching the application — silently sabotaging every upstream
+            # WS connection this function ever made, independent of TLS/anti-bot
+            # concerns.
+            key = base64.b64encode(os.urandom(16)).decode()
+            hdrs = [
+                f"GET {path_qs} HTTP/1.1",
+                f"Host: {host}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            for k, v in extra_headers.items():
+                kl = k.lower()
+                if kl not in ("host", "upgrade", "connection",
+                              "sec-websocket-key", "sec-websocket-version",
+                              "sec-websocket-extensions", "accept-encoding"):
+                    hdrs.append(f"{k}: {v}")
+            srv.sendall(("\r\n".join(hdrs) + "\r\n\r\n").encode())
+
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = srv.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Server closed during WS handshake")
+                resp += chunk
+                if len(resp) > 65536:
+                    raise ConnectionError("WS handshake response too large")
+            if b"101" not in resp.split(b"\r\n")[0]:
+                raise ConnectionError(f"WS handshake rejected: {resp[:200]!r}")
+        except Exception:
+            # Any failure past this point — TLS handshake, send, a dropped
+            # connection mid-handshake, or an outright rejection — must not
+            # leak the socket. This runs on every reconnect attempt a
+            # backing-off client makes against a target that's actively
+            # blocking it, so a leak here isn't a one-off: it's one held
+            # file descriptor per retry, forever, for as long as the target
+            # keeps saying no.
+            try: srv.close()
+            except Exception: pass
+            raise
+        self._sock = srv
+
+    def recv_frame(self):
+        # _ws_read_frame now returns (fin, rsv1, opcode, payload). We never
+        # negotiate permessage-deflate with the upstream on this path (the
+        # Sec-WebSocket-Extensions header is stripped from the outbound
+        # handshake), so rsv1 will always be False here in practice — but we
+        # pass it through verbatim so the v2 pump can make its own decision.
+        return _ws_read_frame(self._sock)
+
+    def send_frame(self, opcode: int, payload: bytes) -> bool:
+        try:
+            self._sock.sendall(_ws_make_frame(opcode, payload, mask=True))
+            return True
+        except Exception:
+            return False
+
+    def close(self):
+        try: self._sock.close()
+        except Exception: pass
+
+def _get_session_for_ws():
+    """Get a session for the WS connection.
+
+    FIX v3: Try to reuse the client session (which has cf_clearance cookies and
+    the same TLS fingerprint as the main page). This is critical for Discord,
+    Slack, and other CF-protected WS endpoints — a fresh session gets 403'd.
+
+    Returns (session, should_close):
+      - should_close=False: shared session, do NOT close after use
+      - should_close=True:  freshly created, safe to close
+    """
+    # First try the client session (per-browser, has cookies)
+    try:
+        sess = _get_client_session()
+        if sess is not None and hasattr(sess, "ws_connect"):
+            return sess, False
+    except Exception:
+        pass
+    # Fall back to the proxy session
+    try:
+        sess = _get_proxy_session()
+        if sess is not None and hasattr(sess, "ws_connect"):
+            return sess, False
+    except Exception:
+        pass
+    # Last resort: create a fresh session
+    return _make_session(), True
+
+class _CffiUpstreamWS:
+    """Upstream WS connection via curl_cffi's own WebSocket client.
+
+    This is what actually fixes gateway-style endpoints behind anti-bot WAFs:
+    the opening TLS handshake goes through the SAME browser-impersonation
+    engine _make_session() uses for every plain HTTP request in this file
+    (real JA3/JA4, not a hand-tuned approximation), because ws_connect()
+    reuses the session's already-impersonated curl handle.
+
+    Trade-off: curl_cffi reassembles fragmented messages internally and
+    only hands back / accepts complete ones — it can't stream individual
+    wire frames the way the raw-socket path does. That's invisible to any
+    real WS consumer (onmessage always sees the whole reassembled message
+    either way); it only costs a bit of extra latency/memory on unusually
+    large messages.
+    """
+
+    def __init__(self, ws_url: str, extra_headers: dict):
+        hdrs = {k: v for k, v in extra_headers.items()
+                if k.lower() not in ("host", "upgrade", "connection",
+                                      "sec-websocket-key", "sec-websocket-version",
+                                      "sec-websocket-extensions", "accept-encoding")}
+        # FIX v3: Reuse the CLIENT session (which has cf_clearance cookies +
+        # the same TLS fingerprint as the main page) instead of creating a
+        # fresh one. This is what fixes Discord/Slack/CF-protected WS endpoints
+        # — a fresh session has no cookies and gets 403'd by Cloudflare.
+        sess, should_close = _get_session_for_ws()
+        if not hasattr(sess, "ws_connect"):
+            if should_close:
+                try: sess.close()
+                except Exception: pass
+            raise RuntimeError("active session backend has no WS support")
+        try:
+            self._ws = sess.ws_connect(ws_url, headers=hdrs, timeout=15)
+        except Exception as exc:
+            # A rejected/failed handshake (403 from a WAF, refused upgrade,
+            # TLS failure, ...) must not leak the session + its underlying
+            # curl handle. Only close if we created it (shared client sessions
+            # must NOT be closed here — they're used by other requests).
+            if should_close:
+                try: sess.close()
+                except Exception: pass
+                gc.collect()
+            # FIX v3: Log at WARN so the user can see WHY the WS failed
+            # (was DEBUG — invisible in normal operation).
+            log(f"curl_cffi ws_connect failed: {exc}", "WARN")
+            raise
+        self._sess = sess
+        self._should_close = should_close
+        # FIXED: curl_cffi's WebSocket object is NOT thread-safe. Concurrent
+        # send() (from keepalive thread) and recv() (from relay thread) corrupt
+        # internal buffers, producing garbled data that desyncs the browser's
+        # application-level decompressor (Discord zlib-stream: "invalid stored
+        # block lengths"). This lock serializes ALL access to self._ws.
+        # Note: recv() is a blocking call — while it holds the lock, send()
+        # will block until recv() returns. This means keepalive pings only fire
+        # BETWEEN messages, not at precise intervals. That's acceptable because
+        # WS_PING_INTERVAL defaults to 0 (disabled) — most apps have their own
+        # application-level heartbeats that keep the connection alive.
+        self._ws_lock = threading.Lock()
+
+    def recv_frame(self):
+        # Returns (fin, rsv1, opcode, payload) to match _ws_read_frame signature.
+        #
+        # IMPORTANT: do NOT wrap this in a lock. recv() is a blocking call that
+        # can wait indefinitely for the next upstream frame. If a lock were held
+        # here, send_frame() (called from the relay thread forwarding browser
+        # messages like heartbeats) would block waiting for the lock, causing a
+        # deadlock: upstream is quiet → recv blocks → send can't fire → browser
+        # heartbeat never reaches upstream → upstream stays quiet → deadlock.
+        #
+        # The curl_cffi WebSocket tolerates concurrent send()/recv() from
+        # different threads in practice (this proxy has always done so). The
+        # zlib-stream corruption we saw earlier was caused by a THIRD thread —
+        # the keepalive thread — calling send(PING) while recv() was blocked.
+        # That thread is now disabled by default (WS_PING_INTERVAL=0), so
+        # there's no concurrent send/recv race to protect against.
+        #
+        # PONG handling: curl_cffi has no CurlWsFlag.PONG. When upstream pongs
+        # our PING, libcurl auto-consumes it. recv() returns (b"", 0) for a
+        # pure-PONG wakeup — we map that to opcode 10 so the v2 pump (if
+        # active) can update last_pong.
+        try:
+            data, flags = self._ws.recv()
+        except Exception:
+            return None
+        if flags & _CurlWsFlag.CLOSE:
+            return (True, False, 8, data)
+        if flags & _CurlWsFlag.PING:
+            return (True, False, 9, data)
+        # No flags + no data → treat as auto-consumed PONG (libcurl eat it)
+        if flags == 0 and not data:
+            return (True, False, 10, b"")
+        # PONG via OFFSET bit (curl_cffi may use it; spec is murky)
+        if flags & 32:   # CurlWsFlag.OFFSET — used by some curl_cffi versions for PONG
+            return (True, False, 10, data)
+        opcode = 1 if (flags & _CurlWsFlag.TEXT) else 2
+        return (True, False, opcode, data)
+
+    def send_frame(self, opcode: int, payload: bytes) -> bool:
+        # Sends a frame to the upstream. Do NOT wrap in a lock — see recv_frame()
+        # for why (deadlock if recv is blocked holding the lock).
+        #
+        # The curl_cffi WebSocket tolerates concurrent send() from this thread
+        # and recv() from the relay thread. The earlier zlib-stream corruption
+        # was caused by a separate keepalive thread (now disabled by default).
+        if opcode == 10:
+            return True   # PONG — libcurl auto-responds to upstream PINGs
+        if opcode == 9:
+            # PING — send a real control frame
+            try:
+                self._ws.send(payload or b"", _CurlWsFlag.PING)
+                return True
+            except Exception:
+                return False
+        flag = {1: _CurlWsFlag.TEXT, 8: _CurlWsFlag.CLOSE}.get(opcode, _CurlWsFlag.BINARY)
+        try:
+            self._ws.send(payload or b"", flag)
+            return True
+        except Exception:
+            return False
+
+    def close(self):
+        try: self._ws.close()
+        except Exception: pass
+        # Only close the session if we created it — shared client sessions
+        # are used by other in-flight HTTP requests and must not be closed.
+        if getattr(self, "_should_close", False):
+            try: self._sess.close()
+            except Exception: pass
 
 def _ws_connect_upstream(ws_url: str, extra_headers: dict):
     """
-    Establish the TCP/TLS connection AND complete the WS handshake with the
-    real upstream server. Returns the connected, upgraded socket on success.
-    Raises on any failure — caller must NOT have told the browser anything yet.
+    Establish the WS connection to the real upstream server. Returns an
+    object exposing .recv_frame() -> (fin, rsv1, opcode, payload) | None,
+    .send_frame(opcode, payload) -> bool, and .close() — either a
+    _CffiUpstreamWS (real browser TLS fingerprint, tried first whenever
+    curl_cffi is available) or a _RawSocketUpstreamWS (fallback).
+
+    Raises on total failure — caller must NOT have told the browser
+    anything yet.
     """
-    parsed   = urlparse(ws_url)
-    use_ssl  = ws_url.startswith("wss://")
-    host     = parsed.hostname
-    port     = parsed.port or (443 if use_ssl else 80)
-    path_qs  = parsed.path or "/"
-    if parsed.query:
-        path_qs += "?" + parsed.query
-
-    raw = socket.create_connection((host, port), timeout=10)
-    if use_ssl:
+    if _CURL_CFFI_OK:
         try:
-            # Default context has a distinctive non-browser TLS fingerprint that
-            # anti-bot edges (Cloudflare, Discord's gateway WAF) can flag and
-            # silently drop. Nudge ALPN + cipher ordering toward what a real
-            # Chrome TLS ClientHello looks like — best-effort, not a full
-            # JA3 match, but meaningfully less fingerprintable than the bare
-            # interpreter default.
-            ctx = _ssl_mod.SSLContext(_ssl_mod.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode    = _ssl_mod.CERT_NONE
-            ctx.set_alpn_protocols(["http/1.1"])
-            ctx.minimum_version = _ssl_mod.TLSVersion.TLSv1_2
-            try:
-                ctx.set_ciphers(
-                    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
-                    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-                    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
-                )
-            except _ssl_mod.SSLError:
-                pass
-        except Exception:
-            # Every other outbound request in this file uses verify=False —
-            # this fallback context was the one place that still enforced real
-            # certificate validation, silently rejecting upstreams the rest of
-            # the proxy treats as fine.
-            ctx = _ssl_mod.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode    = _ssl_mod.CERT_NONE
-        srv = ctx.wrap_socket(raw, server_hostname=host)
-    else:
-        srv = raw
-
-    key = _base64.b64encode(_hashlib_ws.sha1(os.urandom(16)).digest()).decode()
-    hdrs = [
-        f"GET {path_qs} HTTP/1.1",
-        f"Host: {host}",
-        "Upgrade: websocket",
-        "Connection: Upgrade",
-        f"Sec-WebSocket-Key: {key}",
-        "Sec-WebSocket-Version: 13",
-    ]
-    for k, v in extra_headers.items():
-        kl = k.lower()
-        if kl not in ("host", "upgrade", "connection",
-                      "sec-websocket-key", "sec-websocket-version",
-                      "sec-websocket-extensions", "accept-encoding"):
-            hdrs.append(f"{k}: {v}")
-    srv.sendall(("\r\n".join(hdrs) + "\r\n\r\n").encode())
-
-    resp = b""
-    while b"\r\n\r\n" not in resp:
-        chunk = srv.recv(4096)
-        if not chunk:
-            raise ConnectionError("Server closed during WS handshake")
-        resp += chunk
-        if len(resp) > 65536:
-            raise ConnectionError("WS handshake response too large")
-    if b"101" not in resp.split(b"\r\n")[0]:
-        try: srv.close()
-        except Exception: pass
-        raise ConnectionError(f"WS handshake rejected: {resp[:200]!r}")
-    return srv
-
+            return _CffiUpstreamWS(ws_url, extra_headers)
+        except Exception as e:
+            log(f"curl_cffi WS connect failed ({_short_exc(e)}), falling back to raw socket", "DEBUG")
+    return _RawSocketUpstreamWS(ws_url, extra_headers)
 
 def _pump_ws_frames(client_sock, srv, ws_url: str) -> None:
-    """Bidirectionally relay WS frames once both sides are connected and upgraded."""
+    """Bidirectionally relay WS frames once both sides are connected and upgraded.
+
+    `srv` is one of the wrapper objects from _ws_connect_upstream
+    (_CffiUpstreamWS or _RawSocketUpstreamWS), not a raw socket — it always
+    exposes .recv_frame() / .send_frame(opcode, payload) / .close().
+    """
     log(f"WS tunnel open → {ws_url}", "INFO")
     stop = threading.Event()
 
     def _fwd_client_to_srv():
         """Browser → upstream server: frames are already masked by browser."""
+        frag_opcode = None
+        frag_buf = bytearray()
         while not stop.is_set():
             frame = _ws_read_frame(client_sock)
             if frame is None:
                 break
-            opcode, payload = frame
+            fin, _rsv1, opcode, payload = frame   # _rsv1 ignored in v1 (no deflate)
             if opcode == 8:   # close
-                try:
-                    srv.sendall(_ws_make_frame(8, payload, mask=True))
-                except Exception:
-                    pass
+                srv.send_frame(8, payload)
                 break
-            if opcode in (1, 2):   # text or binary
-                try:
-                    srv.sendall(_ws_make_frame(opcode, payload, mask=True))
-                except Exception:
+            if opcode in (0, 1, 2):
+                # Reassemble fragmented messages here rather than forwarding
+                # each wire frame as it arrives: the curl_cffi upstream
+                # wrapper has no notion of a partial/fragmented send, only
+                # complete messages, so a multi-frame browser message must
+                # become exactly one send_frame() call. Cheap for the
+                # overwhelming majority of messages, which already arrive
+                # as a single fin=True frame — this just skips straight to
+                # sending in that case.
+                if opcode != 0:
+                    frag_opcode = opcode
+                    frag_buf = bytearray(payload)
+                else:
+                    frag_buf += payload
+                if not fin:
+                    continue
+                ok = srv.send_frame(frag_opcode if frag_opcode is not None else opcode, bytes(frag_buf))
+                frag_opcode, frag_buf = None, bytearray()
+                if not ok:
                     break
-            elif opcode == 9:   # ping → pong
+            elif opcode == 9:   # ping → pong (respond directly, per RFC 6455)
                 try:
                     client_sock.sendall(_ws_make_frame(10, payload))
                 except Exception:
+                    break
+            elif opcode == 10:   # unsolicited pong — pass through
+                if not srv.send_frame(10, payload):
                     break
         stop.set()
 
     def _fwd_srv_to_client():
         """Upstream server → browser: frames are unmasked from server."""
         while not stop.is_set():
-            frame = _ws_read_frame(srv)
+            frame = srv.recv_frame()
             if frame is None:
                 break
-            opcode, payload = frame
+            fin, _rsv1, opcode, payload = frame   # _rsv1 ignored in v1 (no deflate)
             if opcode == 8:
                 try:
                     client_sock.sendall(_ws_make_frame(8, payload))
                 except Exception:
                     pass
                 break
-            if opcode in (1, 2):
+            if opcode in (0, 1, 2):
                 try:
-                    client_sock.sendall(_ws_make_frame(opcode, payload))
+                    client_sock.sendall(_ws_make_frame(opcode, payload, fin=fin))
                 except Exception:
                     break
             elif opcode == 9:
+                if not srv.send_frame(10, payload):
+                    break
+            elif opcode == 10:
                 try:
-                    srv.sendall(_ws_make_frame(10, payload, mask=True))
+                    client_sock.sendall(_ws_make_frame(10, payload))
                 except Exception:
                     break
         stop.set()
@@ -4166,136 +5572,531 @@ def _pump_ws_frames(client_sock, srv, ws_url: str) -> None:
     except Exception: pass
     log(f"WS tunnel closed ← {ws_url}", "INFO")
 
+# _handle_websocket_upgrade() was removed — it was the pre-_S2LWSGIRequestHandler
+# WS handling path (Flask view + environ["werkzeug.socket"]) and had been fully
+# dead code since every server instance here started using request_handler=
+# _S2LWSGIRequestHandler, which intercepts WS upgrades before Flask/WSGI runs.
+# See _S2LWSGIRequestHandler / _handle_ws_direct() for the real, live path.
 
-def _handle_websocket_upgrade(req_path: str, target: str, req_headers: dict) -> Response:
+# ──────────────────────────────────────────────────────────────────────────────
+# Server-Sent Events proxy (text/event-stream)
+#
+# SSE is unidirectional (server→browser) over a long-lived HTTP connection.
+# The standard _stream_resp path works but has two problems for SSE:
+#   1. Werkzeug's iter_content chunks arbitrarily across event boundaries,
+#      so a browser's EventSource may receive half an event per chunk and
+#      block waiting for the rest. We re-buffer to whole-event boundaries.
+#   2. Many SSE endpoints go quiet for minutes between events; intermediate
+#      proxies/CDNs may close idle connections. We inject a keepalive
+#      comment (": ping\n\n") every SSE_HEARTBEAT seconds.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SSE_CONTENT_TYPES = frozenset({
+    "text/event-stream",
+    "application/x-event-stream",
+    "application/stream+json",   # some APIs use this for SSE-like streams
+})
+
+def _is_sse_response(ct: str) -> bool:
+    """Check whether a Content-Type header indicates an SSE stream."""
+    if not ct:
+        return False
+    base = ct.split(";", 1)[0].strip().lower()
+    return base in _SSE_CONTENT_TYPES
+
+def _sse_stream_generator(upstream_r, target: str):
+    """Yield complete SSE events from upstream_r, reassembling chunks that
+    cross event boundaries.
+
+    SSE framing: events are separated by a blank line ("\n\n"). Each event
+    is one or more lines of "field: value". We buffer until we see "\n\n"
+    then yield the whole event as one chunk.
     """
-    Complete a WebSocket upgrade from the browser and proxy all frames bidirectionally.
-
-    Works with Werkzeug's threaded development server by hijacking the underlying
-    socket via environ['werkzeug.socket'] (Werkzeug ≥ 2.1).
-    """
-    # Determine the real WS target URL — use target as the canonical source of
-    # path+query so callers don't need to pass them separately. flask_request
-    # .query_string is used only as a fallback for MAIN_HOST WS routes where
-    # the target is built without a query string but the browser may add one.
-    parsed = urlparse(target)
-    ws_scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
-    ws_path   = parsed.path or "/"
-    # Build the query string: prefer what's in the target (set by ws_ext from
-    # the URL path segment) over flask_request.query_string (correct for the
-    # main proxy WS route).  Avoid duplication by checking both.
-    target_qs = parsed.query
-    req_qs    = flask_request.query_string.decode("utf-8", "ignore")
-    if target_qs:
-        ws_qs = target_qs
-    else:
-        ws_qs = req_qs
-    ws_url = f"{ws_scheme}://{parsed.netloc}{ws_path}"
-    if ws_qs:
-        ws_url += "?" + ws_qs
-
-    # Get the raw client socket from Werkzeug
-    environ     = flask_request.environ
-    client_sock = (environ.get("werkzeug.socket")          # Werkzeug ≥ 2.1
-                   or environ.get("gunicorn.socket")       # gunicorn
-                   or environ.get("HTTP_BODY"))            # other WSGI
-
-    if client_sock is None:
-        log(f"WS upgrade: no raw socket available for {req_path} — returning 426", "WARN")
-        r = Response("WebSocket proxying requires Werkzeug ≥ 2.1", status=426)
-        r.headers["Upgrade"] = "websocket"
-        return r
-
-    ws_key = flask_request.headers.get("Sec-WebSocket-Key", "")
-    accept  = _ws_handshake_accept(ws_key)
-
-    # Sub-protocols requested by the browser
-    proto_req = flask_request.headers.get("Sec-WebSocket-Protocol", "")
-    proto_hdrs = f"Sec-WebSocket-Protocol: {proto_req}\r\n" if proto_req else ""
-
-    # Forward headers (strip hop-by-hop + WS-specific headers)
-    extra_fwd = {}
-    for k, v in req_headers.items():
-        kl = k.lower()
-        if kl in ("host", "upgrade", "connection",
-                   "sec-websocket-key", "sec-websocket-version",
-                   "sec-websocket-extensions", "accept-encoding"):
-            continue
-        extra_fwd[k] = v
-    _incoming_origin = next((v for k, v in req_headers.items() if k.lower() == "origin"), None)
-    extra_fwd["Origin"] = _real_origin_for(_incoming_origin)
-    if proto_req:
-        extra_fwd["Sec-WebSocket-Protocol"] = proto_req
-
-    # Connect + complete the WS handshake with the REAL upstream server FIRST.
-    # Only tell the browser "101 Switching Protocols" once that has actually
-    # succeeded — otherwise a blocked/rejected upstream looks to the browser
-    # like a connection that opened and then instantly died, instead of a
-    # clean immediate failure (which retries faster and reports clearer).
+    buf = b""
     try:
-        srv = _ws_connect_upstream(ws_url, extra_fwd)
+        for chunk in upstream_r.iter_content(chunk_size=4096, decode_unicode=False):
+            if not chunk:
+                continue
+            buf += chunk
+            # Split on event boundaries (\n\n). Keep the tail in buf.
+            while b"\n\n" in buf:
+                event, buf = buf.split(b"\n\n", 1)
+                yield event + b"\n\n"
+            # Yield any partial final event if buffer grows large (10KB+)
+            # to avoid unbounded memory on a stream that never sends \n\n.
+            if len(buf) > 65536:
+                yield buf
+                buf = b""
     except Exception as exc:
-        log(f"WS upstream connect failed {ws_url}: {_short_exc(exc)}", "WARN")
+        log(f"SSE upstream stream error {urlparse(target).netloc}: {_short_exc(exc)}", "WARN")
+        return
+    # Flush any trailing partial event
+    if buf:
+        yield buf
+
+def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
+    """Build a Flask Response that streams SSE with proper buffering."""
+    def _keepalive_injected():
+        """Thin wrapper kept so the surrounding response-building code below
+        doesn't need to care whether a keepalive strategy is layered on top —
+        today this just forwards _sse_stream_generator()'s chunks unchanged.
+
+        There's no active idle-timer here: doing that well needs an async
+        server (gevent/eventlet) to interleave a timer with a blocking
+        generator, which this pure-WSGI/threaded setup doesn't have. In
+        practice this hasn't been a problem because SSE endpoints send their
+        own heartbeat comments; if a target ever doesn't, that's the trigger
+        to add a real timer thread here rather than before.
+        """
+        yield from _sse_stream_generator(upstream_r, target)
+
+    # We can't easily interleave a timer with a generator in pure WSGI, so
+    # the keepalive is best-effort: we inject one at the start of the stream
+    # and rely on the upstream's own heartbeat (most SSE servers send one).
+    # A true timer would require an async server (gevent/eventlet).
+    headers = filter_resp(_resp_headers_dict(upstream_r))
+    # Force chunked: Werkzeug doesn't auto-chunk generators with no Content-Length
+    headers.pop("content-length", None)
+    headers["Cache-Control"] = "no-cache, no-transform"
+    headers["X-Accel-Buffering"] = "no"   # disable nginx buffering if behind one
+    ct = upstream_r.headers.get("Content-Type", "text/event-stream")
+    log_req(method, 200, urlparse(target).netloc, urlparse(target).path, -1, tag="SSE")
+    return Response(
+        _keepalive_injected(),
+        status=upstream_r.status_code,
+        headers=headers,
+        content_type=ct,
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP/2 upstream support
+#
+# curl_cffi (when impersonating Chrome) already negotiates HTTP/2 via ALPN
+# when the server supports it. This module adds explicit control: a config
+# flag (HTTP2_UPSTREAM) to force-disable it, and detection/logging so the
+# user can see which protocol a request used.
+#
+# We don't implement HTTP/2 framing ourselves — that would be insane. We
+# rely on curl_cffi's built-in h2 support (which uses nghttp2 under the hood).
+# When curl_cffi is unavailable, HTTP/2 is simply not used (cloudscraper and
+# plain requests both speak HTTP/1.1 only).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _effective_http_version() -> str:
+    """Return the HTTP version string to use for upstream requests."""
+    if not HTTP2_UPSTREAM:
+        return "http1.1"
+    if not _CURL_CFFI_OK:
+        return "http1.1"   # cloudscraper/requests can't do h2 anyway
+    return "auto"   # let curl_cffi negotiate via ALPN
+
+def _is_h2_response(response) -> bool:
+    """Best-effort check: did this response come over HTTP/2?"""
+    if response is None:
+        return False
+    # curl_cffi exposes http_version on the response in some versions
+    try:
+        hv = getattr(response, "http_version", None)
+        if hv is not None:
+            return str(hv) in ("2", "2.0", "h2")
+    except Exception:
+        pass
+    # Fallback: HTTP/2 responses never have a "Connection: keep-alive" header
+    # (h2 uses multiplexed streams, no per-connection header)
+    try:
+        return "keep-alive" not in {k.lower() for k in response.headers.keys()}
+    except Exception:
+        return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Raw TCP/UDP tunneling via WebSocket transport
+#
+# Browsers cannot open raw TCP/UDP sockets — the closest they get is
+# WebSocket. So we expose a WebSocket endpoint that transparently bridges
+# to a raw TCP (or UDP) connection to the real upstream host:port.
+#
+# Route:  /__s2l_tcp__/<host:port>          (TCP)
+# Route:  /__s2l_udp__/<host:port>          (UDP)
+#
+# The browser opens:  new WebSocket("ws://localhost:PORT/__s2l_tcp__/game.com:43594")
+# Each WS message (binary or text) is forwarded as a raw TCP segment.
+# Each TCP segment received is framed back as a WS binary message.
+#
+# This is enough for most browser games / custom-protocol apps that need
+# a persistent socket. It does NOT support UDP multicast or broadcast.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Active tunnels — for stats and graceful shutdown
+_active_tunnels: dict = {}
+_active_tunnels_lock = threading.Lock()
+
+def _pump_tcp_over_ws(client_sock, upstream_sock, label: str) -> None:
+    """Bridge a WebSocket (browser) to a raw TCP socket (upstream).
+
+    Browser→TCP: parse WS frames, write payload to TCP socket.
+    TCP→Browser: read from TCP socket, wrap in WS binary frames.
+    """
+    stop = threading.Event()
+    tunnel_id = id(client_sock)
+    with _active_tunnels_lock:
+        _active_tunnels[tunnel_id] = {"label": label, "started": time.time(),
+                                       "bytes_in": 0, "bytes_out": 0}
+
+    def _ws_to_tcp():
+        """Read WS frames from browser, write payload to TCP."""
         try:
-            client_sock.sendall(
-                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-            )
+            while not stop.is_set():
+                frame = _ws_read_frame(client_sock)
+                if frame is None:
+                    break
+                fin, _rsv1, opcode, payload = frame   # _rsv1 ignored (raw TCP, no deflate)
+                if opcode == _WS_OPCODE_CLOSE:
+                    break
+                if opcode in (_WS_OPCODE_TEXT, _WS_OPCODE_BINARY, _WS_OPCODE_CONTINUATION):
+                    if payload:
+                        upstream_sock.sendall(payload)
+                        with _active_tunnels_lock:
+                            if tunnel_id in _active_tunnels:
+                                _active_tunnels[tunnel_id]["bytes_in"] += len(payload)
         except Exception:
             pass
-        return Response(status=200)  # socket already handled directly above
+        finally:
+            stop.set()
 
-    # Complete the handshake with the browser now that upstream is confirmed live
-    handshake = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n"
-        f"{proto_hdrs}"
-        "\r\n"
-    )
-    try:
-        client_sock.sendall(handshake.encode())
-    except Exception as exc:
-        log(f"WS handshake send failed: {exc}", "WARN")
-        try: srv.close()
-        except Exception: pass
-        return Response("WS handshake error", status=500)
+    def _tcp_to_ws():
+        """Read from TCP socket, wrap in WS binary frames, send to browser."""
+        try:
+            upstream_sock.settimeout(None)
+            while not stop.is_set():
+                try:
+                    data = upstream_sock.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                # Send as binary WS frame (server→client, unmasked)
+                try:
+                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_BINARY, data))
+                except Exception:
+                    break
+                with _active_tunnels_lock:
+                    if tunnel_id in _active_tunnels:
+                        _active_tunnels[tunnel_id]["bytes_out"] += len(data)
+        except Exception:
+            pass
+        finally:
+            stop.set()
 
-    log(f"WS proxy: {req_path} → {ws_url}", "INFO")
-    _gui_push_raw("WS", req_path, 101, "websocket", b"(WebSocket tunnel opened)")
+    t1 = threading.Thread(target=_ws_to_tcp, daemon=True, name=f"tcp-w2t-{tunnel_id}")
+    t2 = threading.Thread(target=_tcp_to_ws, daemon=True, name=f"tcp-t2w-{tunnel_id}")
+    t1.start(); t2.start()
+    stop.wait()
 
-    # Proxy runs in the current Flask worker thread (already its own thread)
-    _pump_ws_frames(client_sock, srv, ws_url)
+    log(f"Tunnel closed: {label}", "INFO")
+    try: upstream_sock.close()
+    except Exception: pass
+    try: client_sock.close()
+    except Exception: pass
+    with _active_tunnels_lock:
+        _active_tunnels.pop(tunnel_id, None)
 
-    # After the WS closes, return a dummy response
-    # (Flask won't actually send this since the socket was hijacked)
-    return Response(status=200)
-
+# _handle_tcp_tunnel() was removed — dead duplicate of
+# _S2LWSGIRequestHandler._handle_tunnel_direct(), which is the real, live
+# code path for /__s2l_tcp__/ and /__s2l_udp__/ tunnels (see that class).
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask proxy app
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _S2LWSGIRequestHandler(WSGIRequestHandler):
-    """WSGIRequestHandler that exposes the raw client socket via the WSGI environ.
+    """WSGIRequestHandler with WebSocket upgrade interception.
 
-    ROOT CAUSE FIX: _handle_websocket_upgrade() hijacks the connection via
-    environ['werkzeug.socket'], but vanilla Werkzeug (even >= 2.1) never
-    populates that key on its own — it requires exactly this kind of
-    make_environ() override. Without it, environ.get("werkzeug.socket") is
-    ALWAYS None, so every single WS upgrade attempt (Discord's gateway, its
-    remote-auth-gateway, any game's own WS) fell straight into the
-    "no raw socket available" branch and got an immediate 426 — which is why
-    the connection never succeeded even once, for any WS target, anywhere in
-    this proxy. This must be passed as request_handler= to every app.run()/
-    make_server() call (main app AND each MULTIPORT CDN mini-server) for WS
-    proxying to work on that listener.
+    Werkzeug 3.x returns 400 Bad Request when the browser sends
+    `Connection: Upgrade` — this happens BEFORE the Flask view function is
+    called. We override handle_one_request() to detect WS upgrades and
+    handle them DIRECTLY, completely bypassing Werkzeug's WSGI pipeline.
+    No Flask context needed — we have everything in self.
+
+    THIS IS THE ONLY WS HANDLING PATH. Every server instance in this file
+    (main app + every CDN mini-server) is started with
+    request_handler=_S2LWSGIRequestHandler, so a request with an Upgrade:
+    websocket header NEVER reaches Flask routing — it's fully handled here
+    or in _handle_tunnel_direct(). Don't add a second WS code path in a
+    Flask view; it will silently never run. If you need a different
+    upstream host for the "no /__s2l_*__/ prefix" case (e.g. a new kind of
+    mini-server), set `<server>.s2l_target_base` right after make_server(),
+    the way _start_cdn_server() does — don't hardcode SITE_URL further down.
     """
     def make_environ(self):
         environ = super().make_environ()
         environ["werkzeug.socket"] = self.connection
         return environ
 
+    def handle_one_request(self):
+        """Override to intercept WebSocket upgrades BEFORE WSGI processing."""
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(414)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                return
+        except Exception:
+            return
+
+        # ── WS upgrade detection — BEFORE WSGI ──────────────────────────
+        # Werkzeug 3.x 400s on Connection: Upgrade before reaching Flask
+        upgrade_hdr = self.headers.get("Upgrade", "").lower().strip()
+        if upgrade_hdr == "websocket":
+            self._handle_ws_direct()
+            return
+
+        # Normal request — use Werkzeug's WSGI path (do_* → run_wsgi)
+        mname = 'do_' + self.command
+        if not hasattr(self, mname):
+            self.send_error(501, "Unsupported method (%r)" % self.command)
+            return
+        method = getattr(self, mname)
+        method()
+        self.wfile.flush()
+
+    def _handle_ws_direct(self):
+        """Handle WS upgrade directly — NO Flask context needed.
+
+        We have everything we need:
+          - self.connection  = raw client socket
+          - self.headers     = request headers
+          - self.path        = URL path + query string
+          - self.rfile       = read stream (for any remaining body data)
+        """
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.path)
+            path = parsed.path or "/"
+            query = parsed.query
+
+            # ── Route matching ────────────────────────────────────────────
+            ws_prefix_ext = "/__s2l_ws_ext__/"
+            ws_prefix_tcp = "/__s2l_tcp__/"
+            ws_prefix_udp = "/__s2l_udp__/"
+
+            if path.startswith(ws_prefix_tcp):
+                if not TCP_TUNNEL:
+                    self.connection.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\nTCP tunneling disabled (set TCP_TUNNEL=True)")
+                    return
+                self._handle_tunnel_direct(path[len(ws_prefix_tcp):], use_udp=False)
+                return
+            if path.startswith(ws_prefix_udp):
+                if not UDP_TUNNEL:
+                    self.connection.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\nUDP tunneling disabled (set UDP_TUNNEL=True)")
+                    return
+                self._handle_tunnel_direct(path[len(ws_prefix_udp):], use_udp=True)
+                return
+
+            # ── Build WS target URL ──────────────────────────────────────
+            if path.startswith(ws_prefix_ext):
+                wspath = path[len(ws_prefix_ext):]
+                ws_host = wspath.split("/", 1)[0]
+                ws_path_q = wspath[len(ws_host):] or "/"
+                if query:
+                    ws_path_q += f"?{query}"
+                target = f"https://{ws_host}{ws_path_q}"
+                req_display = f"/__s2l_ws_ext__/{wspath}"
+            else:
+                # Main host WS, or a CDN mini-server's own host if this
+                # request came in on one of those ports (see s2l_target_base,
+                # set right after make_server() in _start_cdn_server).
+                base = getattr(self.server, "s2l_target_base", None) or SITE_URL
+                target = f"{base.rstrip('/')}{path}"
+                if query:
+                    target += f"?{query}"
+                req_display = path
+
+            # ── Build forward headers ────────────────────────────────────
+            fwd_hdrs = {}
+            for k, v in self.headers.items():
+                fwd_hdrs[k] = v
+
+            client_sock = self.connection
+
+            # Parse target for WS URL
+            target_parsed = urlparse(target)
+            ws_scheme = "wss" if target_parsed.scheme in ("https", "wss") else "ws"
+            ws_path = target_parsed.path or "/"
+            ws_qs = target_parsed.query
+            ws_url = f"{ws_scheme}://{target_parsed.netloc}{ws_path}"
+            if ws_qs:
+                ws_url += f"?{ws_qs}"
+
+            # WS handshake values
+            ws_key = self.headers.get("Sec-WebSocket-Key", "")
+            accept = _ws_handshake_accept(ws_key)
+            proto_req = self.headers.get("Sec-WebSocket-Protocol", "")
+            proto_hdrs = f"Sec-WebSocket-Protocol: {proto_req}\r\n" if proto_req else ""
+
+            # Build extra headers for upstream
+            extra_fwd = {}
+            for k, v in fwd_hdrs.items():
+                kl = k.lower()
+                if kl in ("host", "upgrade", "connection",
+                           "sec-websocket-key", "sec-websocket-version",
+                           "sec-websocket-extensions", "accept-encoding"):
+                    continue
+                extra_fwd[k] = v
+            # Origin = MAIN_HOST (what a real browser sends)
+            _incoming_origin = next((v for k, v in fwd_hdrs.items() if k.lower() == "origin"), None)
+            extra_fwd["Origin"] = _real_origin_for(_incoming_origin)
+            if proto_req:
+                extra_fwd["Sec-WebSocket-Protocol"] = proto_req
+
+            # ── Connect upstream FIRST ────────────────────────────────────
+            log(f"WS-direct: {req_display} → {ws_url}", "WS")
+            try:
+                srv = _ws_connect_upstream(ws_url, extra_fwd)
+            except Exception as exc:
+                log(f"WS upstream FAILED: {exc}", "WARN")
+                log(f"  Origin sent: {extra_fwd.get('Origin', '?')}", "WARN")
+                try:
+                    err_msg = str(exc)[:200].encode("utf-8", "replace")
+                    client_sock.sendall(
+                        b"HTTP/1.1 502 Bad Gateway\r\n"
+                        b"Connection: close\r\n"
+                        b"Content-Type: text/plain\r\n"
+                        b"Content-Length: " + str(len(err_msg) + 20).encode() + b"\r\n"
+                        b"\r\n"
+                        b"WS upstream: " + err_msg
+                    )
+                except Exception:
+                    pass
+                self.close_connection = True
+                return
+
+            # ── Send 101 to browser ──────────────────────────────────────
+            # Decide permessage-deflate BEFORE building the handshake: if we're
+            # going to run the pump in deflate mode, the browser MUST see
+            # Sec-WebSocket-Extensions: permessage-deflate in THIS (the only)
+            # 101 response, or it'll keep sending/expecting plain frames while
+            # we deflate/inflate on our end — corrupting every frame. There is
+            # exactly one handshake response; a second one isn't valid HTTP.
+            #
+            # FIXED: zlib-stream guard. Some endpoints (notably Discord's
+            # gateway, via ?compress=zlib-stream) layer their OWN zlib
+            # compression at the application level — it is NOT permessage-
+            # deflate (RFC 7692), the frames do NOT set RSV1, and the bytes
+            # are zlib-wrapped (2-byte 0x78 0x9C header) rather than raw
+            # deflate. If we accept permessage-deflate from the browser on
+            # such a tunnel, the v2 pump will try to inflate already-
+            # decompressed/plain bytes, fail, re-compress them as raw deflate,
+            # and ship them to the browser without RSV1 — the browser's own
+            # zlib-stream decompressor then chokes on the double-mangled
+            # payload with "zlib error, -3, incorrect header check" and the
+            # gateway dies on a reconnect loop. Force permessage-deflate OFF
+            # whenever the upstream URL advertises a non-RFC-7692 compression
+            # scheme of its own.
+            _ext_hdr = self.headers.get("Sec-WebSocket-Extensions", "")
+            _upstream_has_own_compression = (
+                "compress=zlib-stream" in ws_qs
+                or "compress=" in ws_qs        # catch any future variant
+            )
+            if _upstream_has_own_compression and WS_DEFLATE:
+                log(f"WS: upstream advertises its own compression "
+                    f"({ws_qs!r}) — disabling permessage-deflate to avoid "
+                    f"conflict (zlib-stream != RFC 7692)", "INFO")
+            _browser_wants_deflate = (
+                "permessage-deflate" in _ext_hdr
+                and WS_DEFLATE
+                and not _upstream_has_own_compression
+            )
+            deflate_hdr = "Sec-WebSocket-Extensions: permessage-deflate\r\n" if _browser_wants_deflate else ""
+            handshake = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n"
+                f"{proto_hdrs}"
+                f"{deflate_hdr}"
+                "\r\n"
+            )
+            try:
+                client_sock.sendall(handshake.encode())
+            except Exception as exc:
+                log(f"WS handshake send failed: {exc}", "WARN")
+                try: srv.close()
+                except: pass
+                self.close_connection = True
+                return
+
+            # ── Pump frames ──────────────────────────────────────────────
+            _use_v2 = (WS_PING_INTERVAL > 0 or WS_DEFLATE or WS_LOG_FRAMES
+                       or bool(_WS_MSG_HOOKS))
+            if _use_v2:
+                _pump_ws_frames_v2(client_sock, srv, ws_url, use_deflate=_browser_wants_deflate)
+            else:
+                _pump_ws_frames(client_sock, srv, ws_url)
+
+            self.close_connection = True
+
+        except Exception as exc:
+            log(f"WS-direct error: {exc}", "ERROR")
+            self.close_connection = True
+
+    def _handle_tunnel_direct(self, wspath, use_udp=False):
+        """Handle TCP/UDP tunnel directly."""
+        try:
+            host_port = wspath.split("/", 1)[0].split("?", 1)[0]
+            if ":" not in host_port:
+                self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            host, _, port_s = host_port.rpartition(":")
+            port = int(port_s)
+            if not (1 <= port <= 65535):
+                self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+
+            client_sock = self.connection
+            ws_key = self.headers.get("Sec-WebSocket-Key", "")
+            accept = _ws_handshake_accept(ws_key)
+            handshake = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n"
+                "\r\n"
+            )
+            client_sock.sendall(handshake.encode())
+
+            proto = "UDP" if use_udp else "TCP"
+            label = f"{proto} {host}:{port}"
+            log(f"Tunnel open: {label}", "TUNNEL")
+
+            import socket as _sock
+            if use_udp:
+                upstream_sock = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                upstream_sock.settimeout(TUNNEL_TIMEOUT)
+                upstream_sock.connect((host, port))
+            else:
+                upstream_sock = _sock.create_connection((host, port), timeout=TIMEOUT_CONN)
+                upstream_sock.settimeout(TUNNEL_TIMEOUT)
+
+            _pump_tcp_over_ws(client_sock, upstream_sock, label)
+            self.close_connection = True
+        except Exception as exc:
+            log(f"Tunnel error: {exc}", "ERROR")
+            self.close_connection = True
+def _app_ctx_push_request(wreq, environ):
+    """Push a Flask request context for the WS handler."""
+    from flask import current_app
+    ctx = current_app._get_current_object().request_context(environ)
+    ctx.push()
+    return ctx
 
 app = Flask(__name__, static_folder=None)
 
@@ -4324,8 +6125,8 @@ def _normalize_request_origin():
     # Browsers and sites frequently special-case the literal string "localhost"
     # in security checks (CSP frame-ancestors, secure-context requirements,
     # CORS allowlists) without treating "127.0.0.1" as equivalent, even though
-    # both resolve to the same loopback interface. Poki's own CSP is a real,
-    # observed example: it allowlists frame-ancestors http://localhost:8080
+    # both resolve to the same loopback interface. This is a real, observed
+    # pattern: a site's own CSP can allowlist frame-ancestors http://localhost:8080
     # explicitly but NOT 127.0.0.1:8080. A request that looks identical except
     # for arriving via the IP literal gets silently blocked by the browser
     # with zero server-side trace — and because the game's own postMessage
@@ -4347,13 +6148,11 @@ _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ALL_METHODS  = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
-
 def _upstream_url(path: str) -> str:
     origin = f"{urlparse(SITE_URL).scheme}://{MAIN_HOST}"
     base   = f"{origin}/{path.lstrip('/')}"
     qs     = flask_request.query_string.decode("utf-8", "ignore")
     return f"{base}?{qs}" if qs else base
-
 
 def _build_ctx(method: str, target: str, req_body: bytes) -> HookContext:
     parsed = urlparse(target)
@@ -4365,7 +6164,6 @@ def _build_ctx(method: str, target: str, req_body: bytes) -> HookContext:
         req_headers = filter_fwd(dict(flask_request.headers)),
         req_body    = req_body,
     )
-
 
 _SW_PATHS = frozenset({
     "/service-worker.js", "/sw.js", "/serviceworker.js",
@@ -4386,7 +6184,6 @@ _SW_NOOP = (
     b"));\n"
     b"self.addEventListener('fetch', () => {});\n"  # don't intercept — pass through
 )
-
 
 def _do_upstream(method: str, target: str, ctx: HookContext,
                   stream: bool = False) -> requests.Response:
@@ -4472,7 +6269,7 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
 
     fwd.pop("Cookie",  None)
     fwd.pop("cookie",  None)
-    merged_cookies = dict(sess.cookies)
+    merged_cookies = _flatten_cookiejar(sess.cookies, prefer_host=urlparse(target).hostname or "")
     merged_cookies.update(flask_request.cookies)
     if merged_cookies:
         kwargs["cookies"] = merged_cookies
@@ -4545,6 +6342,10 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
             response.status_code,
             dict(response.headers)):
         log(f"CF block on {urlparse(target).netloc} — rotating session and retrying", "WARN")
+        _old_sess = getattr(_proxy_local, "s", None)
+        if _old_sess is not None:
+            try: _old_sess.close()
+            except Exception: pass
         _proxy_local.s = _make_session()
         sess = _proxy_local.s
         sess.headers["User-Agent"] = fwd.get("User-Agent",
@@ -4557,7 +6358,6 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
                 pass
 
     return response
-
 
 def _make_flask_resp(ctx: HookContext, method: str) -> Response:
     """Build Flask Response from HookContext with body validation."""
@@ -4588,9 +6388,9 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
     # isolated apps (SharedArrayBuffer/WASM threads) report missing headers
     # only after the first reload.
     resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-    if COOP_COEP:
-        resp.headers["Cross-Origin-Opener-Policy"]   = "same-origin"
-        resp.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+    # COOP/COEP are passive now (see filter_resp) — whatever ctx.resp_headers
+    # already carries (origin's own choice, or the top-level-HTML heuristic
+    # fallback) is the final answer; no flag to re-check here.
 
     is_html_resp = "text/html" in ctx.resp_ct
     is_hooked    = bool(ctx.resp_headers.get("_hooked"))
@@ -4605,7 +6405,6 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
         resp.headers.pop("Last-Modified", None)
 
     return resp
-
 
 def _serve_cached(lp: str, target: str) -> tuple[bytes, str] | None:
     """"""
@@ -4656,7 +6455,6 @@ def _serve_cached(lp: str, target: str) -> tuple[bytes, str] | None:
         data = _rewrite_json_urls(data)
     return data, ct
 
-
 def _cached_response(lp: str, target: str, method: str, req_path: str) -> Response | None:
     """"""
     result = _serve_cached(lp, target)
@@ -4693,7 +6491,6 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
     _maybe_capture(ctx)
     return _make_flask_resp(ctx, method)
 
-
 # ── /__s2l_ext__/<host>/<path>  —  CDN fallback (MULTIPORT=False) ─────
 
 @app.route("/.__s2l_hp", methods=["GET"])
@@ -4708,7 +6505,6 @@ def _s2l_hp_endpoint() -> Response:
     resp.headers["Cache-Control"]               = "no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
-
 
 @app.route(f"{_EXT_PREFIX}/<path:extpath>", methods=_ALL_METHODS)
 def ext_asset(extpath: str) -> Response:
@@ -4783,8 +6579,8 @@ def ext_asset(extpath: str) -> Response:
         if method in _BODY_METHODS:
             kw["data"] = ctx.req_body
         # Per-client session — see the matching comment in _cdn_serve. This is
-        # the exact path a brand-new per-game host (e.g. Poki's
-        # <uuid>.gdn.poki.com) goes through on its first request, before it
+        # the exact path a brand-new per-game host (e.g. a freshly-seen
+        # <uuid>.gdn.example-cdn.com) goes through on its first request, before it
         # has its own MULTIPORT port, so it's the one most likely to need
         # whatever session/consent state the main page already established.
         r    = _get_client_session().request(method, real_url, **kw)
@@ -4799,7 +6595,7 @@ def ext_asset(extpath: str) -> Response:
         elif r.status_code < 400 and method in _SAFE_METHODS:
             # CACHE_CDN=False: still register host so URL rewriting works next time
             _register_cdn_host(ext_host)
-        out_headers = filter_resp(dict(r.headers))
+        out_headers = filter_resp(_resp_headers_dict(r))
         out_headers["Access-Control-Allow-Origin"]  = "*"
         out_headers["Access-Control-Expose-Headers"] = "*"
         out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
@@ -4841,43 +6637,437 @@ def ext_asset(extpath: str) -> Response:
     except Exception as exc:
         return Response(f"CDN error: {_short_exc(exc)}", status=502)
 
-
 # ── /__s2l_ws_ext__/<host:port>/<path>  —  WebSocket proxy to arbitrary external hosts ──
+# ── /__s2l_tcp__/<host:port>             —  raw TCP tunnel via WebSocket transport ──
+# ── /__s2l_udp__/<host:port>             —  raw UDP tunnel via WebSocket transport ──
 #
 # The S2L JS injector rewrites:
 #     new WebSocket("wss://game-server.com:8443/ws?token=xxx")
 # to:
 #     new WebSocket("ws://localhost:PORT/__s2l_ws_ext__/game-server.com:8443/ws?token=xxx")
 #
-# This route connects upstream first, then completes the WS handshake with the
-# browser and forwards all frames bidirectionally (see _handle_websocket_upgrade).
+# A real WS upgrade to any of these three paths is intercepted and fully
+# handled at the socket layer by _S2LWSGIRequestHandler._handle_ws_direct()
+# / _handle_tunnel_direct() BEFORE Flask ever runs — see that class. These
+# three Flask views only ever get called when the request did NOT carry a
+# WS Upgrade header (e.g. someone opened the URL directly in a browser
+# tab), so their entire job is to explain that.
 
 @app.route("/__s2l_ws_ext__/<path:wspath>", methods=["GET"])
 def ws_ext(wspath: str) -> Response:
-    if flask_request.headers.get("Upgrade", "").lower() != "websocket":
-        return Response(
-            "This path is a WebSocket tunnel — send Upgrade: websocket",
-            status=426,
-            headers={"Upgrade": "websocket"},
-        )
-    slash = wspath.find("/")
-    if slash == -1:
-        ws_host     = wspath
-        ws_path_q   = "/"
-    else:
-        ws_host     = wspath[:slash]
-        ws_path_q   = wspath[slash:]
-    qs = flask_request.query_string.decode("utf-8", "ignore")
-    if qs:
-        ws_path_q += f"?{qs}"
-    # _handle_websocket_upgrade expects an https:// target and maps it to wss://.
-    # We pass https:// so the helper builds the correct wss:// connection to the real host.
-    target_https = f"https://{ws_host}{ws_path_q}"
-    fwd_hdrs     = filter_fwd(dict(flask_request.headers))
-    req_display  = f"/__s2l_ws_ext__/{ws_host}{ws_path_q}"
-    log(f"WS-ext upgrade → {ws_host}{ws_path_q}", "INFO")
-    return _handle_websocket_upgrade(req_display, target_https, fwd_hdrs)
+    return Response(
+        "This path is a WebSocket tunnel — send Upgrade: websocket",
+        status=426,
+        headers={"Upgrade": "websocket"},
+    )
 
+@app.route("/__s2l_tcp__/<path:tcppath>", methods=["GET"])
+def tcp_ext(tcppath: str) -> Response:
+    return Response("This path is a raw TCP tunnel — send Upgrade: websocket",
+                    status=426, headers={"Upgrade": "websocket"})
+
+@app.route("/__s2l_udp__/<path:udppath>", methods=["GET"])
+def udp_ext(udppath: str) -> Response:
+    return Response("This path is a raw UDP tunnel — send Upgrade: websocket",
+                    status=426, headers={"Upgrade": "websocket"})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIREFOX_PROXY — MITM forward proxy for the actual browser
+#
+# Firefox (like every browser) exempts "localhost"/"127.0.0.1" from whatever
+# proxy is configured in its network settings — there's no way to see traffic
+# the browser sends to our OWN reverse-proxy port by pointing Firefox's proxy
+# at us. The workaround: Firefox does NOT exempt the real target domain (e.g.
+# discord.com), so if the browser tab stays on the real domain, that traffic
+# DOES get routed through this proxy like any other site — and for the one
+# domain actively being cloned (MAIN_HOST, or a registered MULTIPORT CDN
+# host) we transparently redirect it to the local site2local server instead
+# of the real internet. That's the "passthru": the browser never notices,
+# it's just talking to discord.com as far as it's concerned. Every OTHER
+# domain visited while this is on gets relayed to the real upstream
+# untouched, purely for inspection/hooking (the Firefox Proxy tab below).
+#
+# This is a real man-in-the-middle: it terminates TLS using a locally
+# generated root CA (one-time Firefox import — instructions are logged at
+# startup) and a fresh leaf certificate per host, signed by that CA. Nothing
+# here calls out anywhere; the CA only ever needs to be trusted by the one
+# browser pointed at this port, on this machine.
+# ──────────────────────────────────────────────────────────────────────────────
+
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    _CRYPTOGRAPHY_OK = True
+except ImportError:
+    _CRYPTOGRAPHY_OK = False
+
+_CA_DIR       = os.path.join("site_data", "_ca")
+_CA_KEY_PATH  = os.path.join(_CA_DIR, "s2l_root_ca.key")
+_CA_CERT_PATH = os.path.join(_CA_DIR, "s2l_root_ca.pem")
+_LEAF_DIR     = os.path.join(_CA_DIR, "leafs")
+
+_ca_lock = threading.Lock()
+_ca_pair = None   # (key, cert) — loaded/generated lazily, only if FIREFOX_PROXY is used
+
+_leaf_cache: dict[str, str] = {}   # host -> path to a combined cert+key PEM
+_leaf_lock  = threading.Lock()
+
+def _ensure_root_ca():
+    """Load the persisted root CA, generating one on first use.
+
+    Cached to disk (not regenerated per run) specifically so the one-time
+    Firefox import stays valid across restarts, regardless of which SITE is
+    currently configured — the CA is shared across every site2local session.
+    """
+    global _ca_pair
+    with _ca_lock:
+        if _ca_pair is not None:
+            return _ca_pair
+        os.makedirs(_CA_DIR, exist_ok=True)
+        if os.path.isfile(_CA_KEY_PATH) and os.path.isfile(_CA_CERT_PATH):
+            try:
+                with open(_CA_KEY_PATH, "rb") as f:
+                    key = serialization.load_pem_private_key(f.read(), password=None)
+                with open(_CA_CERT_PATH, "rb") as f:
+                    cert = x509.load_pem_x509_certificate(f.read())
+                _ca_pair = (key, cert)
+                return _ca_pair
+            except Exception as e:
+                log(f"Existing root CA unreadable ({e}) — generating a new one", "WARN")
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "S2L Local MITM Root CA"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "site2local (local only)"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(subject).issuer_name(issuer)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                .add_extension(x509.KeyUsage(
+                    digital_signature=True, key_cert_sign=True, crl_sign=True,
+                    content_commitment=False, key_encipherment=False, data_encipherment=False,
+                    key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
+                .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+                .sign(key, hashes.SHA256()))
+        with open(_CA_KEY_PATH, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+        with open(_CA_CERT_PATH, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        log(f"Generated new root CA → {_CA_CERT_PATH}", "INFO")
+        _ca_pair = (key, cert)
+        return _ca_pair
+
+def _get_leaf_pem(host: str) -> str:
+    """Return a cert+key PEM path for `host`, generating (and disk-caching)
+    one signed by the root CA the first time this host is seen."""
+    with _leaf_lock:
+        cached = _leaf_cache.get(host)
+        if cached and os.path.isfile(cached):
+            return cached
+        os.makedirs(_LEAF_DIR, exist_ok=True)
+        safe = re.sub(r"[^\w\-.]", "_", host)
+        pem_path = os.path.join(_LEAF_DIR, f"{safe}.pem")
+        if os.path.isfile(pem_path):
+            _leaf_cache[host] = pem_path
+            return pem_path
+
+        ca_key, ca_cert = _ensure_root_ca()
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(subject).issuer_name(ca_cert.subject)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=825))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .sign(ca_key, hashes.SHA256()))
+        with open(pem_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        _leaf_cache[host] = pem_path
+        return pem_path
+
+def _mitm_read_headers(rfile) -> tuple[bytes, list] | None:
+    """Read one HTTP start-line + headers from a buffered socket file object."""
+    start_line = rfile.readline(8192)
+    if not start_line or start_line in (b"\r\n", b"\n"):
+        start_line = rfile.readline(8192)   # tolerate a stray leading blank line
+    if not start_line:
+        return None
+    headers = []
+    while True:
+        line = rfile.readline(8192)
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if b":" not in line:
+            continue
+        k, _, v = line.partition(b":")
+        headers.append((k.decode("latin-1").strip(), v.decode("latin-1", "replace").strip()))
+    return start_line.rstrip(b"\r\n"), headers
+
+def _mitm_read_body(rfile, headers: list, cap: int = 64 * 1024 * 1024) -> bytes:
+    """Read a body per Content-Length or chunked Transfer-Encoding. `cap`
+    bounds how much is buffered for logging/hooking on very large bodies."""
+    hmap = {k.lower(): v for k, v in headers}
+    if "chunked" in hmap.get("transfer-encoding", "").lower():
+        body = b""
+        while True:
+            size_line = rfile.readline(64)
+            if not size_line:
+                break
+            try:
+                size = int(size_line.split(b";")[0].strip(), 16)
+            except ValueError:
+                break
+            if size == 0:
+                while True:
+                    t = rfile.readline(8192)
+                    if t in (b"\r\n", b"\n", b""):
+                        break
+                break
+            chunk = rfile.read(size)
+            if len(body) < cap:
+                body += chunk
+            rfile.read(2)
+        return body
+    cl = hmap.get("content-length")
+    if cl is not None:
+        try:
+            n = int(cl)
+        except ValueError:
+            return b""
+        return rfile.read(n) if n > 0 else b""
+    return b""
+
+def _mitm_upstream_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except NotImplementedError:
+        pass
+    return ctx
+
+def _mitm_process_request(parsed_req, rfile, wfile, dest_host: str, dest_port: int,
+                           dest_tls: bool, host_hdr: str, tag: str) -> bool:
+    """Handle exactly one HTTP request already read off `rfile`: forward it to
+    (dest_host, dest_port), relay the response back over `wfile`, log/hook it.
+    Returns False when the connection should close."""
+    start_line, headers = parsed_req
+    try:
+        method, target, _proto = start_line.decode("latin-1").split(" ", 2)
+    except ValueError:
+        return False
+    p = urlparse(target)
+    path = target if target.startswith("/") else (p.path or "/") + (f"?{p.query}" if p.query else "")
+    hmap  = {k: v for k, v in headers}
+    body  = _mitm_read_body(rfile, headers)
+    body  = _apply_fwd_req_hooks(method, path, hmap, body)
+    up = None
+    try:
+        raw = socket.create_connection((dest_host, dest_port), timeout=15)
+        up  = _mitm_upstream_ssl_context().wrap_socket(raw, server_hostname=dest_host) if dest_tls else raw
+
+        req_lines = [f"{method} {path} HTTP/1.1", f"Host: {host_hdr}"]
+        for k, v in headers:
+            if k.lower() in ("host", "content-length", "proxy-connection", "connection"):
+                continue
+            req_lines.append(f"{k}: {v}")
+        req_lines.append(f"Content-Length: {len(body)}")
+        req_lines.append("Connection: keep-alive")
+        up.sendall(("\r\n".join(req_lines) + "\r\n\r\n").encode("latin-1", "replace") + body)
+
+        up_rfile = up.makefile("rb")
+        resp_parsed = _mitm_read_headers(up_rfile)
+        if resp_parsed is None:
+            return False
+        resp_start, resp_headers = resp_parsed
+        resp_body = _mitm_read_body(up_rfile, resp_headers)
+
+        status_txt = resp_start.decode("latin-1", "replace")
+        try:
+            status_code = int(status_txt.split(" ")[1])
+        except Exception:
+            status_code = 0
+        # Decide ONCE whether this client connection stays open, and use that
+        # same decision both for the header we actually send and for the
+        # return value — previously the header always claimed "keep-alive"
+        # while the return value could independently decide to close right
+        # after, so a client that believed the header would reuse a
+        # connection we'd already torn down, surfacing as a stray connection
+        # reset on its next request.
+        resp_hmap  = {k.lower(): v for k, v in resp_headers}
+        keep_alive = (hmap.get("connection", "").lower() != "close"
+                      and resp_hmap.get("connection", "").lower() != "close")
+        out_lines = [status_txt]
+        for k, v in resp_headers:
+            if k.lower() in ("content-length", "transfer-encoding", "connection"):
+                continue
+            out_lines.append(f"{k}: {v}")
+        out_lines.append(f"Content-Length: {len(resp_body)}")
+        out_lines.append(f"Connection: {'keep-alive' if keep_alive else 'close'}")
+        wfile.write(("\r\n".join(out_lines) + "\r\n\r\n").encode("latin-1", "replace") + resp_body)
+        wfile.flush()
+
+        _gui_fwd_push(tag, method, dest_host if tag == "clone" else urlparse(f"//{host_hdr}").hostname or host_hdr,
+                      path, status_code, hmap, body)
+        log(f"[{tag}] {method} {status_code}  {host_hdr}{path}  {_fmt_size(len(resp_body))}", "CDN")
+        return keep_alive
+    except Exception as e:
+        log(f"MITM {tag} relay error {host_hdr}{path}: {_short_exc(e)}", "WARN")
+        _gui_fwd_push(tag, method, host_hdr, path, "ERR", hmap, body)
+        return False
+    finally:
+        if up is not None:
+            try: up.close()
+            except Exception: pass
+
+def _mitm_handle_connection(client_sock: socket.socket, client_addr) -> None:
+    client_sock.settimeout(30)
+    work_sock = client_sock
+    try:
+        rfile0 = client_sock.makefile("rb")
+        parsed = _mitm_read_headers(rfile0)
+        if parsed is None:
+            return
+        start_line, headers = parsed
+        parts = start_line.decode("latin-1", "replace").split(" ")
+        if len(parts) < 2:
+            return
+        first_method, first_target = parts[0].upper(), parts[1]
+        pending_first = None
+
+        if first_method == "CONNECT":
+            host, _, port_s = first_target.partition(":")
+            port = int(port_s) if port_s.isdigit() else 443
+            client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            if not _CRYPTOGRAPHY_OK:
+                return
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(_get_leaf_pem(host))
+            try:
+                ctx.set_alpn_protocols(["http/1.1"])
+            except NotImplementedError:
+                pass
+            try:
+                work_sock = ctx.wrap_socket(client_sock, server_side=True)
+            except Exception as e:
+                log(f"MITM TLS handshake failed for {host}: {_short_exc(e)}", "WARN")
+                return
+            fixed_route = True   # a CONNECT tunnel belongs to one dest for its whole life
+        else:
+            # Plain-HTTP proxying: absolute-form request line, e.g.
+            # "GET http://example.com/path HTTP/1.1" — no CONNECT involved,
+            # and the request we already read is the first one to relay.
+            p = urlparse(first_target)
+            host, port = p.hostname, (p.port or 80)
+            pending_first = parsed
+            if not host:
+                return
+            fixed_route = False  # a keep-alive plain-HTTP connection can hop hosts per request
+
+        def _route_for(h: str, prt: int, use_tls: bool):
+            is_clone   = (h == MAIN_HOST)
+            clone_port = PORT
+            if not is_clone:
+                with _cdn_port_lock:
+                    cp = _cdn_host_port.get(h, 0)
+                if cp and cp > 0:
+                    is_clone, clone_port = True, cp
+            if is_clone:
+                return "127.0.0.1", clone_port, False, f"localhost:{clone_port}", "clone"
+            return h, prt, use_tls, h, "passthru"
+
+        dest_host, dest_port, dest_tls, host_hdr, tag = _route_for(host, port, first_method == "CONNECT")
+
+        rfile = work_sock.makefile("rb")
+        wfile = work_sock.makefile("wb")
+        while True:
+            if pending_first is not None:
+                parsed_req, pending_first = pending_first, None
+            else:
+                parsed_req = _mitm_read_headers(rfile)
+                if parsed_req is None:
+                    break
+                if not fixed_route:
+                    # Browsers reuse one keep-alive connection to a plain-HTTP
+                    # forward proxy across requests for DIFFERENT destination
+                    # hosts. Re-resolving routing only for the very first
+                    # request (as before) silently sent every later request
+                    # on this connection to that first host too — re-derive
+                    # it per request instead.
+                    try:
+                        _sl, _ = parsed_req
+                        _m, _t, _ = _sl.decode("latin-1").split(" ", 2)
+                        _pp = urlparse(_t)
+                        if _pp.hostname:
+                            host, port = _pp.hostname, (_pp.port or 80)
+                            dest_host, dest_port, dest_tls, host_hdr, tag = _route_for(host, port, False)
+                    except Exception:
+                        pass   # malformed/relative request line — keep previous routing
+            if not _mitm_process_request(parsed_req, rfile, wfile, dest_host, dest_port,
+                                          dest_tls, host_hdr, tag):
+                break
+    except (ConnectionError, OSError, socket.timeout):
+        pass
+    except ssl.SSLError as e:
+        log(f"MITM TLS error: {_short_exc(e)}", "DEBUG")
+    except Exception as e:
+        log(f"MITM connection error: {_short_exc(e)}", "WARN")
+    finally:
+        try: work_sock.close()
+        except Exception: pass
+        if work_sock is not client_sock:
+            try: client_sock.close()
+            except Exception: pass
+
+def _start_firefox_proxy() -> None:
+    if not _CRYPTOGRAPHY_OK:
+        log("FIREFOX_PROXY needs the 'cryptography' package "
+            "(pip install cryptography --break-system-packages) — staying disabled", "ERROR")
+        return
+    _ensure_root_ca()
+    log(f"Root CA ready → {_CA_CERT_PATH}", "INFO")
+    log("One-time step: import that .pem in Firefox → Settings → Privacy & "
+        "Security → Certificates → View Certificates → Authorities → Import "
+        "→ check 'Trust this CA to identify websites'. Then set Firefox's "
+        f"manual proxy (HTTP + HTTPS/SSL) to 127.0.0.1 : {FIREFOX_PROXY_PORT}.", "INFO")
+
+    def _serve() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((HOST, FIREFOX_PROXY_PORT))
+        except OSError as e:
+            log(f"FIREFOX_PROXY bind failed on {FIREFOX_PROXY_PORT}: {e}", "ERROR")
+            return
+        srv.listen(128)
+        log(f"FIREFOX_PROXY listening on {HOST}:{FIREFOX_PROXY_PORT}", "INFO")
+        while True:
+            try:
+                client_sock, addr = srv.accept()
+            except OSError:
+                break
+            threading.Thread(target=_mitm_handle_connection, args=(client_sock, addr),
+                              daemon=True, name=f"mitm-{addr[0]}:{addr[1]}").start()
+
+    threading.Thread(target=_serve, daemon=True, name="firefox-proxy-listener").start()
 
 # ── Main proxy ────────────────────────────────────────────────────────────────
 
@@ -4892,10 +7082,10 @@ def proxy(path: str) -> Response:
     if purpose in ("prefetch", "prerender"):
         _gui_push_raw(method, req_path, 204, "text/plain", b"")
         return Response(status=204)  # No Content
-    if flask_request.headers.get("Upgrade", "").lower() == "websocket":
-        # Real WebSocket proxy — handles Discord DMs, Slack, chat apps, etc.
-        fwd_hdrs = filter_fwd(dict(flask_request.headers))
-        return _handle_websocket_upgrade(req_path, target, fwd_hdrs)
+    # NOTE: no Upgrade:websocket branch here — _S2LWSGIRequestHandler
+    # intercepts every WS upgrade at the socket layer before this view ever
+    # runs (see its docstring). A request reaching this function is
+    # guaranteed to not be a WS upgrade.
 
     # Service worker — no-op SW
     if _is_sw_path(req_path):
@@ -4910,8 +7100,8 @@ def proxy(path: str) -> Response:
         return Response("Blocked", status=403)
 
     # ── Cloudflare Image Resizing paths (/f=auto/, /cdn-cgi/image/, …) ───────
-    # poki.com's CF Image Optimization requires the browser's own cf_clearance.
-    # Our proxy session lacks it → poki.com returns its full SSR 404 page
+    # Some sites' CF Image Optimization requires the browser's own cf_clearance.
+    # Our proxy session lacks it → the origin returns its full SSR 404 page
     # (~190KB HTML). Attempt with client-session cookies first; if still 404/HTML,
     # return an empty 404 immediately — no second fetch, no 190KB to browser, no
     # noisy log line.
@@ -4921,7 +7111,9 @@ def proxy(path: str) -> Response:
             _i_hdrs = filter_fwd(dict(flask_request.headers))
             _i_hdrs["Host"] = MAIN_HOST
             _i_r = _i_sess.get(target, headers=_i_hdrs,
-                               cookies={**dict(_i_sess.cookies), **dict(flask_request.cookies)},
+                               cookies={**_flatten_cookiejar(_i_sess.cookies,
+                                                              prefer_host=urlparse(target).hostname or ""),
+                                        **dict(flask_request.cookies)},
                                timeout=(TIMEOUT_CONN, TIMEOUT_READ),
                                allow_redirects=True, verify=False)
             _i_body = decompress_body(_i_r.content, _i_r.headers.get("Content-Encoding", ""))
@@ -4929,7 +7121,7 @@ def proxy(path: str) -> Response:
             if _i_r.status_code == 200 and "text/html" not in _i_ct:
                 if _i_body and CACHE_CDN:
                     save_queue.put((target, _i_body, _i_ct))
-                _i_out = filter_resp(dict(_i_r.headers))
+                _i_out = filter_resp(_resp_headers_dict(_i_r))
                 _i_out["Cache-Control"] = "public, max-age=86400"
                 log_req(method, 200, MAIN_HOST, req_path, len(_i_body), tag="IMG")
                 return Response(_i_body, status=200, headers=_i_out, content_type=_i_ct)
@@ -4994,20 +7186,48 @@ def proxy(path: str) -> Response:
         short = _short_exc(exc)
         log(f"{method} {urlparse(target).path} — {short}", "WARN")
         stats.inc("conn_errors")
-        # Retry once with a fresh session on connection-level errors
-        try:
-            _proxy_local.s = _make_session()
-            upstream_r = _do_upstream(method, target, ctx, stream=_do_stream)
-            log(f"Retry succeeded {urlparse(target).path}", "INFO")
-        except Exception as exc2:
-            short2 = _short_exc(exc2)
-            log(f"Retry also failed {urlparse(target).path} — {short2}", "ERROR")
+        # Retry once with a fresh session on connection-level errors.
+        # v4: Try curl_cffi first (best CF bypass), then fall back to
+        # cloudscraper (older but sometimes works when cffi's DNS/TLS fails
+        # on specific networks), then plain requests as last resort.
+        _old_sess = getattr(_proxy_local, "s", None)
+        if _old_sess is not None:
+            try: _old_sess.close()
+            except Exception: pass
+        upstream_r = None
+        last_exc = exc
+        # Primary: fresh curl_cffi session
+        for _attempt, _sess_factory in (
+            (1, lambda: _make_session()),
+            (2, _make_cloudscraper_session),
+            (3, _make_requests_session),
+        ):
+            try:
+                _rsess = _sess_factory()
+            except Exception:
+                continue
+            _proxy_local.s = _rsess
+            try:
+                upstream_r = _do_upstream(method, target, ctx, stream=_do_stream)
+                log(f"Retry #{_attempt} succeeded {urlparse(target).path}", "INFO")
+                break
+            except Exception as exc2:
+                last_exc = exc2
+                short2 = _short_exc(exc2)
+                log(f"Retry #{_attempt} failed {urlparse(target).path} — {short2}", "WARN")
+                try: _rsess.close()
+                except Exception: pass
+                continue
+        if upstream_r is None:
+            short2 = _short_exc(last_exc)
+            log(f"All retries failed {urlparse(target).path} — {short2}", "ERROR")
             err_body = (f"Connection error: {short}\n"
                         f"Retry: {short2}\n\n"
                         f"This may be caused by:\n"
                         f"  • The server closed the connection prematurely\n"
                         f"  • A network interruption or timeout\n"
-                        f"  • Cloudflare or WAF blocking the request")
+                        f"  • Cloudflare or WAF blocking the request\n"
+                        f"  • DNS resolution failure (check internet connection)")
             return Response(err_body, status=502, content_type="text/plain; charset=utf-8")
     except Exception as exc:
         log(f"{method} {urlparse(target).path} — {_short_exc(exc)}", "ERROR")
@@ -5036,12 +7256,15 @@ def proxy(path: str) -> Response:
                 hist_body if hist_body else f"(redirect {hist_resp.status_code})".encode()
             )
 
-
     # ── Streaming: hand off immediately for large/binary content ─────────────
     # Check the actual Content-Type now that we have the response headers.
     # If it should be streamed, do it NOW before consuming any body bytes.
     _real_ct = upstream_r.headers.get("Content-Type", "")
     _real_cl = int(upstream_r.headers.get("Content-Length", "0") or 0)
+    # SSE: detect text/event-stream and use the dedicated SSE streamer
+    # which re-buffers to event boundaries and injects keepalives.
+    if SSE_PROXY and _is_sse_response(_real_ct) and method in _SAFE_METHODS:
+        return _stream_sse_resp(upstream_r, method, target)
     if _do_stream and _should_stream(_real_ct, _real_cl) and method in _SAFE_METHODS:
         return _stream_resp(upstream_r, method, target)
 
@@ -5053,7 +7276,7 @@ def proxy(path: str) -> Response:
     # Covers classic 403/503 block pages, plain-text "blocked"/"Access Denied"
     # bodies with no HTML wrapper, AND CF Managed Challenge / Turnstile pages
     # that return HTTP 200 with a JS challenge embedded (the q=78/jschl_vc
-    # family reported against poki.com — a status-only check misses these).
+    # family reported against some CDNs — a status-only check misses these).
     # Either way: rotate to a fresh session with a different browser config
     # and retry once.
     _looks_blocked = (_is_cf_block(body, upstream_r.status_code, dict(upstream_r.headers))
@@ -5061,6 +7284,10 @@ def proxy(path: str) -> Response:
     if _looks_blocked and method in _SAFE_METHODS:
         log(f"Block page detected on {req_path} — rotating session and retrying", "WARN")
         try:
+            _old_sess = getattr(_proxy_local, "s", None)
+            if _old_sess is not None:
+                try: _old_sess.close()
+                except Exception: pass
             _proxy_local.s = _make_session()  # fresh session, next CF config
             # Also forward all real browser hints on retry
             retry_sess = _get_proxy_session()
@@ -5129,18 +7356,33 @@ def proxy(path: str) -> Response:
     _is_json_ct = "application/json" in _ct_now or "application/javascript" in _ct_now
 
     # Case A: Content-Length said non-zero but body came out empty → decompression bust
+    # FIXED: previously excluded only 204/304. But 4xx (404 Not Found, 429 Too
+    # Many Requests) and 5xx responses also legitimately have small bodies that
+    # curl_cffi sometimes returns empty (it doesn't always read the body for
+    # error responses). Re-fetching those caused cascading 429s on Discord's
+    # API — every 404 for an entitlement/eligibility endpoint triggered a
+    # retry that itself got rate-limited, compounding the problem. Now we only
+    # re-fetch decompression failures for 2xx (excluding 204), where an empty
+    # body really does indicate a bug.
     _decomp_failed = (
         len(body) == 0
         and not _cl_explicit_zero
         and _cl_header > 0
-        and upstream_r.status_code not in (204, 304)
+        and 200 <= upstream_r.status_code < 300
+        and upstream_r.status_code != 204
     )
 
     # Case B: JSON API endpoint, empty body, chunked (no Content-Length), status 200
     # Only for GET/HEAD — POST/DELETE intentionally return empty 200.
+    # FIXED: was triggering on 4xx/5xx too because the original check was
+    # `status_code == 200`. But Discord returns 429 with an empty JSON body
+    # when rate-limited, and 404 with an empty body for non-existent resources
+    # — re-fetching those just burns the rate-limit budget faster. Now we
+    # explicitly require 200 (or 206 for partial content) AND Content-Type
+    # starts with application/json.
     _empty_api = (
         method in _SAFE_METHODS
-        and upstream_r.status_code == 200
+        and upstream_r.status_code in (200, 206)
         and len(body) == 0
         and not _cl_explicit_zero
         and _is_json_ct
@@ -5226,14 +7468,16 @@ def proxy(path: str) -> Response:
                     save_queue.put((cdn_url, cdn_body, ct))
                     stats.inc("cdn_fetched")
                     log(f"CDN fallback {cdn_host}{req_path_cdn}  {cdn_r.status_code}", "CDN")
-                    out = filter_resp(dict(cdn_r.headers))
+                    out = filter_resp(_resp_headers_dict(cdn_r))
                     out["Access-Control-Allow-Origin"]  = "*"
                     out["Cross-Origin-Resource-Policy"]  = "cross-origin"
                     return Response(cdn_body, status=cdn_r.status_code, headers=out, content_type=ct)
             except Exception:
                 pass
+    _resp_ct_raw = upstream_r.headers.get("Content-Type", "")
     ctx.resp_status  = upstream_r.status_code
-    ctx.resp_headers = filter_resp(dict(upstream_r.headers))
+    ctx.resp_headers = filter_resp(_resp_headers_dict(upstream_r), body,
+                                    is_top_level_html="text/html" in _resp_ct_raw)
     ctx.resp_body    = body
     ctx.resp_ct      = upstream_r.headers.get("Content-Type", "application/octet-stream")
     platform         = detect_platform(dict(upstream_r.headers))
@@ -5264,10 +7508,10 @@ def proxy(path: str) -> Response:
                 body = refetch_body
                 ctx.resp_body = body
                 ctx.resp_ct   = refetch_r.headers.get("Content-Type", "text/html")
-                ctx.resp_headers = filter_resp(dict(refetch_r.headers))
+                ctx.resp_headers = filter_resp(_resp_headers_dict(refetch_r), body, is_top_level_html=True)
                 log(f"RSC re-fetch succeeded {urlparse(target).path}", "INFO")
             else:
-                log(f"RSC re-fetch also returned RSC — serving as-is", "WARN")
+                log("RSC re-fetch also returned RSC — serving as-is", "WARN")
         except Exception as exc:
             log(f"RSC re-fetch error: {_short_exc(exc)}", "WARN")
     sc_color = (Fore.GREEN if upstream_r.status_code < 300
@@ -5359,6 +7603,42 @@ def proxy(path: str) -> Response:
     if ctx.resp_body and "content-length" not in {k.lower() for k in ctx.resp_headers}:
         ctx.resp_headers["Content-Length"] = str(len(ctx.resp_body))
 
+    # v4: Final blank-page guard. If after ALL recovery the body is still
+    # empty AND it's a top-level HTML document (status 200, text/html, GET),
+    # return a diagnostic page instead of a blank white screen.
+    if (method in _SAFE_METHODS
+            and ctx.resp_status == 200
+            and len(ctx.resp_body) == 0
+            and "text/html" in (ctx.resp_ct or "")
+            and not flask_request.headers.get("Range")):
+        ctx.resp_ct = "text/html; charset=utf-8"
+        ctx.resp_body = (
+            b"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            b"<title>S2L \xe2\x80\x94 Empty Response</title>"
+            b"<style>body{font-family:system-ui,sans-serif;max-width:600px;"
+            b"margin:50px auto;padding:20px;color:#333}"
+            b"h1{color:#e74c3c}code{background:#f4f4f4;padding:2px 6px;"
+            b"border-radius:3px}</style></head><body>"
+            b"<h1>Empty response from upstream</h1>"
+            b"<p>The server returned HTTP 200 but with an empty body. This "
+            b"usually means:</p>"
+            b"<ul>"
+            b"<li>The page is behind a CAPTCHA / bot challenge that S2L couldn't bypass</li>"
+            b"<li>The upstream server detected the proxy and returned an empty page</li>"
+            b"<li>A compression/decompression issue occurred</li>"
+            b"</ul>"
+            b"<p>Try:</p>"
+            b"<ul>"
+            b"<li>Refreshing the page (S2L auto-rotates sessions on failures)</li>"
+            b"<li>Checking the S2L console for CF block warnings</li>"
+            b"<li>Installing <code>curl_cffi</code> for better Cloudflare bypass</li>"
+            b"</ul>"
+            b"<p><small>Path: <code>" + req_path.encode("utf-8", "replace") + b"</code></small></p>"
+            b"</body></html>"
+        )
+        ctx.resp_headers.pop("content-length", None)
+        ctx.resp_headers.pop("Content-Length", None)
+
     _gui_push(ctx)
     _maybe_capture(ctx)
     return _make_flask_resp(ctx, method)
@@ -5386,7 +7666,16 @@ def _banner() -> None:
     if SCAN_PATHS:    flags.append(f"{Style.BRIGHT+Fore.RED}scan-paths{R}")
     if CAPTURE:       flags.append(f"{Style.BRIGHT+Fore.RED}capture{R}")
     if HOOK_GUI:      flags.append(f"{Y}hook-gui{R}")
-    if COOP_COEP:     flags.append(f"{Style.BRIGHT+Fore.CYAN}coop-coep{R}")
+    if FIREFOX_PROXY: flags.append(f"{Style.BRIGHT+Fore.CYAN}firefox-proxy:{FIREFOX_PROXY_PORT}{R}")
+    # v2 features
+    if WS_PING_INTERVAL > 0:  flags.append(f"{G}ws-keepalive:{WS_PING_INTERVAL}s{R}")
+    if WS_DEFLATE:            flags.append(f"{G}ws-deflate{R}")
+    if WS_AUTO_RECONNECT:     flags.append(f"{G}ws-reconnect{R}")
+    if SSE_PROXY:             flags.append(f"{C}sse{R}")
+    if HTTP2_UPSTREAM and _CURL_CFFI_OK:
+                              flags.append(f"{C}h2{R}")
+    if TCP_TUNNEL:            flags.append(f"{M}tcp-tunnel{R}")
+    if UDP_TUNNEL:            flags.append(f"{M}udp-tunnel{R}")
     flag_str   = f"  {DIM}·{R}  ".join(flags) if flags else f"{DIM}none{R}"
 
     hook_str   = (f"{Y}{n_hooks} hook{'s' if n_hooks != 1 else ''}{R}"
@@ -5394,13 +7683,12 @@ def _banner() -> None:
     device_str = (f"{W}{DEVICE}{R}  {DIM}(auto-mirrors browser UA){R}"
                   if DEVICE == "auto" else f"{W}{DEVICE}{R}")
 
-    bypass_eng = (f"{G}curl_cffi/chrome136{R}" if _CURL_CFFI_OK
+    bypass_eng = (f"{G}curl_cffi{R}  {DIM}(TLS profile auto-matched to device){R}" if _CURL_CFFI_OK
                   else f"{Y}cloudscraper{R}  {DIM}(tip: pip install curl-cffi for better CF bypass){R}")
-
 
     print(f"""
 {C}  ╔══════════════════════════════════════════════════════╗{R}
-{C}  ║{W}           S I T E  2  L O C A L                    {C}║{R}
+{C}  ║{W}           S I T E  2  L O C A L    {G}v3{R}              {C}║{R}
 {C}  ╠══════════════════════════════════════════════════════╣{R}
 {C}  ║{R}  {DIM}Target:  {R}  {G}{MAIN_HOST}{R}  {DIM}({ip}){R}
 {C}  ║{R}  {DIM}Proxy:   {R}  {W}http://{HOST}:{PORT}{R}
@@ -5453,6 +7741,14 @@ if __name__ == "__main__":
         CACHE_CDN = False
     if not PROXY_CDN and MULTIPORT:
         log("MULTIPORT=True has no effect without PROXY_CDN=True", "WARN")
+    if FIREFOX_PROXY and not _CRYPTOGRAPHY_OK:
+        log("FIREFOX_PROXY=True needs the 'cryptography' package "
+            "(pip install cryptography --break-system-packages) — disabling", "ERROR")
+        FIREFOX_PROXY = False
+    if FIREFOX_PROXY and not HOOK_GUI:
+        log("FIREFOX_PROXY works without HOOK_GUI too (passthru/passthrough "
+            "still runs), but the Firefox Proxy request log/hook tab needs "
+            "HOOK_GUI=True to be visible.", "WARN")
     def _sigint_handler(sig, frame):
         print(f"\n{Fore.YELLOW}{Style.BRIGHT}Script finished by user command{Style.RESET_ALL}")
         sys.exit(0)
@@ -5481,7 +7777,6 @@ if __name__ == "__main__":
         threading.Thread(target=_capture_worker, daemon=True, name="capture-worker").start()
 
     _banner()
-    _load_mimes()
 
     # Purge any bot/CAPTCHA pages that slipped into cache in previous runs
     def _purge_bot_cache() -> None:
@@ -5507,6 +7802,9 @@ if __name__ == "__main__":
 
     if SCAN_PATHS:
         threading.Thread(target=_run_path_scanner, daemon=True, name="path-scanner").start()
+
+    if FIREFOX_PROXY:
+        _start_firefox_proxy()
 
     if CRAWL:
         def _bg_crawl() -> None:
