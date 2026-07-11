@@ -1,11 +1,49 @@
 #!/usr/bin/env python3
 import os, sys, re, json, time, socket, queue, zlib, gc
 import hashlib, mimetypes, logging, threading, warnings
-mimetypes.add_type("application/javascript", ".mjs")
-mimetypes.add_type("application/manifest+json", ".webmanifest")
-mimetypes.add_type("application/wasm", ".wasm")
-mimetypes.add_type("image/avif", ".avif")
-mimetypes.add_type("image/webp", ".webp")
+# Supplement the system mime.types with modern types that some distros ship
+# without. The stdlib `mimetypes` module reads /etc/mime.types (or equivalent)
+# at import time — these add_type() calls fill gaps, they don't replace a
+# static table. This is fully dynamic: any types the OS already knows about
+# are kept, and anything added here is merged on top.
+for _ext, _mt in (
+    (".mjs",       "application/javascript"),
+    (".cjs",       "application/javascript"),
+    (".jsx",       "application/javascript"),
+    (".tsx",       "application/javascript"),
+    (".vue",       "application/javascript"),
+    (".svelte",    "application/javascript"),
+    (".webmanifest", "application/manifest+json"),
+    (".wasm",      "application/wasm"),
+    (".avif",      "image/avif"),
+    (".webp",      "image/webp"),
+    (".heic",      "image/heic"),
+    (".heif",      "image/heif"),
+    (".apng",      "image/apng"),
+    (".opus",      "audio/ogg"),
+    (".oga",       "audio/ogg"),
+    (".ogv",       "video/ogg"),
+    (".m4a",       "audio/mp4"),
+    (".m4v",       "video/mp4"),
+    (".webm",      "video/webm"),
+    (".woff2",     "font/woff2"),
+    (".woff",      "font/woff"),
+    (".ttf",       "font/ttf"),
+    (".otf",       "font/otf"),
+    (".map",       "application/json"),
+    (".json5",     "application/json"),
+    (".csv",       "text/csv"),
+    (".md",        "text/markdown"),
+    (".svg",       "image/svg+xml"),
+    (".ics",       "text/calendar"),
+    (".epub",      "application/epub+zip"),
+    (".m3u8",      "application/vnd.apple.mpegurl"),
+    (".ts",        "video/mp2t"),
+):
+    try:
+        mimetypes.add_type(_mt, _ext)
+    except Exception:
+        pass
 import shutil, subprocess, tempfile, datetime
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable
@@ -199,7 +237,10 @@ MULTIPORT = True                # each CDN host gets a dedicated port (False = /
 HOOK_GUI = False                # Tkinter traffic inspector + live hook editor
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
-SCAN_PATHS = False              # probe /.git/.env/admin/etc at startup → JSON report
+SCAN_PATHS = False              # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
+                                #   "all"        — every wordlist under wordlists/ (recursive)
+                                #   "all-in-dir" — every wordlist in wordlists/ top-level only
+                                #   "dir/file"   — one specific wordlist (relative to wordlists/)
 CAPTURE = False                  # record every request+response as JSON
 CAPTURE_CDN = False              # include CDN responses in captures
 CAPTURE_BODIES = False            # include request bodies in captures
@@ -211,7 +252,6 @@ CAPTURE_SKIP_STATIC = True       # skip images/fonts/JS/CSS from captures
 # / WASM threads / Worker) but wasn't sent any — no flag to remember to flip.
 FIREFOX_PROXY = False             # MITM forward proxy for the actual browser (root CA + CONNECT tunnel)
 FIREFOX_PROXY_PORT = 8443         # port to point Firefox's manual proxy config at
-EXTRA_PATHS: list = []           # extra paths to probe in SCAN_PATHS mode
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -315,7 +355,7 @@ def _raw_path_after(marker: str) -> str | None:
     PEP 3333, so an intentionally-encoded slash (%2F) inside a single opaque path
     segment is irreversibly indistinguishable from a real path separator.
 
-    Firebase Storage is the textbook case: an object key that legitimately
+    Object-key storage services are the textbook case: an object key that legitimately
     contains a slash (e.g. "listings/foo.jpg") is transmitted as ONE percent-
     encoded segment ("listings%2Ffoo.jpg") specifically so it is NOT split into
     two path segments. Once PATH_INFO decodes that %2F, we've already lost the
@@ -337,6 +377,24 @@ def _raw_path_after(marker: str) -> str | None:
         return None
     return raw_path[idx + len(marker):]
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+def _is_ip_literal(host: str) -> bool:
+    """Return True if `host` is a literal IP address (v4 or v6), not a DNS name.
+
+    Used to decide whether to send SNI in TLS handshakes: RFC 6066 says SNI
+    is for DNS names only, and many servers/WAFs reject connections that
+    send an IP literal as the SNI hostname.
+    """
+    if not host:
+        return False
+    h = host.strip("[]")
+    # IPv6 contains ':', IPv4 contains '.', DNS names contain only [a-zA-Z0-9._-]
+    if ":" in h:
+        return True  # IPv6 literal
+    if h.replace(".", "").isdigit() and h.count(".") == 3:
+        return True  # IPv4 literal
+    # Pure numeric (rare, but e.g. "1234" as a hostname) — treat as IP
+    return h.isdigit()
 
 # RSC wire format signatures (Next.js streaming protocol)
 _WIRE_FORMAT_SIGNATURES: tuple = (
@@ -475,7 +533,7 @@ def _run_hooks(hooks: list, ctx: HookContext) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  YOUR HOOKS GO HERE
 #
-#  `pattern` matches against ctx.path ONLY (e.g. "/gameinfo/@sdk"), never the
+#  `pattern` matches against ctx.path ONLY (e.g. "/api/user/me"), never the
 #  host — so a hook fires the same way whether that path is served by
 #  MAIN_HOST, a /__s2l_ext__/ external asset, or a MULTIPORT CDN host's own
 #  dedicated port. Check ctx.url if a hook needs to know which host it was.
@@ -497,8 +555,8 @@ def _run_hooks(hooks: list, ctx: HookContext) -> int:
 
 # Works the same for a CDN-hosted endpoint, e.g. a first-party API on a
 # completely different host than the page itself:
-# @on_response(pattern=r"/gameinfo/@sdk")
-# def _patch_sdk_info(ctx: HookContext) -> None:
+# @on_response(pattern=r"/api/config")
+# def _patch_config(ctx: HookContext) -> None:
 #     try:
 #         d = ctx.json(); d["debug"] = False; ctx.set_json(d)
 #     except Exception: pass
@@ -542,6 +600,9 @@ def _apply_gui_req_hooks(ctx: HookContext) -> None:
             continue
         mf = h["method"].strip().upper()
         if mf not in ("", "*") and ctx.method.upper() != mf:
+            continue
+        # Origin filter — match by domain (target site vs specific CDN)
+        if not _origin_matches(h.get("origin_url", ""), ctx):
             continue
         try:
             if not re.search(h["pattern"], ctx.path, re.IGNORECASE):
@@ -630,13 +691,23 @@ def _gui_push(ctx: HookContext) -> None:
 
     body = ctx.resp_body if ctx.resp_body is not None else b""
 
-    # Show a readable placeholder in the Body Editor for truly empty responses
-    # (e.g. API polling endpoints that 200 with no payload).
-    # This is what was causing the "0B / blank body editor" confusion in the GUI.
+    # Show a readable placeholder in the Body Editor for truly empty responses.
+    # Distinguish between legitimately-empty statuses (204/304/3xx) and
+    # suspicious empties (200 with no body) so the user can tell at a glance
+    # whether the emptiness is expected or a bug.
     display_body = body
     if len(body) == 0:
+        sc = ctx.resp_status
         ct = (ctx.resp_ct or "").lower()
-        if "json" in ct:
+        if sc == 204:
+            display_body = "(204 No Content - response has no body by definition)".encode()
+        elif sc == 304:
+            display_body = "(304 Not Modified - served from browser cache, no body)".encode()
+        elif sc == 206:
+            display_body = "(206 Partial Content - empty body, range request may have produced no bytes)".encode()
+        elif sc in (301, 302, 303, 307, 308):
+            display_body = "(redirect - no body, follow Location header)".encode()
+        elif "json" in ct:
             display_body = b"(empty JSON response -- upstream returned 200 with no body)"
         elif "html" in ct:
             display_body = b"(empty HTML response -- upstream returned 200 with no body)"
@@ -644,15 +715,24 @@ def _gui_push(ctx: HookContext) -> None:
             display_body = b"(empty response)"
 
     try:
+        # Extract origin host from ctx.url so the hook editor can auto-populate
+        # the "Origin URL" field and hooks can match by domain.
+        _origin = ""
+        try:
+            _origin = urlparse(ctx.url).netloc or ""
+        except Exception:
+            pass
         _gui_log_queue.put_nowait({
-            "ts":     time.strftime("%H:%M:%S"),
-            "method": ctx.method,
-            "path":   ctx.path,
-            "query":  ctx.query,
-            "status": ctx.resp_status,
-            "ct":     ctx.resp_ct.split(";")[0].strip() if ctx.resp_ct else "",
-            "size":   len(body),           # real size (0 = correct)
-            "body":   display_body,        # what the editor shows
+            "ts":       time.strftime("%H:%M:%S"),
+            "method":   ctx.method,
+            "path":     ctx.path,
+            "query":    ctx.query,
+            "status":   ctx.resp_status,
+            "ct":       ctx.resp_ct.split(";")[0].strip() if ctx.resp_ct else "",
+            "web_type": "",                # main proxy requests have no CDN tag
+            "size":     len(body),         # real size (0 = correct)
+            "body":     display_body,      # what the editor shows
+            "origin":   _origin,
         })
     except queue.Full:
         # Throttle: only log the first drop in a 5-second window, otherwise
@@ -663,7 +743,7 @@ def _gui_push(ctx: HookContext) -> None:
             _gui_drop_last_log[0] = now
 
 def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
-                  display_tag: str = "") -> None:
+                  display_tag: str = "", origin: str = "") -> None:
     """Lightweight push for CDN mini-server / ext_asset routes.
 
     display_tag is shown as a prefix in the Content-Type column (e.g. "[cdn:8081]")
@@ -672,6 +752,10 @@ def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
     showed e.g. "[cdn:8081] /generate_204" and users trying to write a hook pattern
     from it would include "[cdn:8081]" — causing their patterns to never match because
     _apply_gui_hooks (and _run_hooks) test against ctx.path which is always the bare path.
+
+    origin is the upstream host this request was served from (e.g. "cdn.example.com").
+    It's stored in the traffic log entry so the hook editor can auto-populate the
+    "Origin URL" field, and so hooks can match by domain (not just path).
     """
     if not HOOK_GUI:
         return
@@ -684,24 +768,75 @@ def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
         except Exception:
             body = b""
 
-    display_body = body if body else b"(empty response)"
+    # Build a meaningful display body for the GUI editor.
+    # - 206 Partial Content: legit empty body is rare; if empty, it's usually
+    #   a range that produced no bytes or a stream issue — note it.
+    # - 204 No Content / 304 Not Modified: legitimately empty.
+    # - 200 with empty body on a non-API content type: suspicious, note it.
+    if body:
+        display_body = body
+    elif status == 204:
+        display_body = "(204 No Content - response has no body by definition)".encode()
+    elif status == 304:
+        display_body = "(304 Not Modified - served from browser cache, no body)".encode()
+    elif status == 206:
+        display_body = "(206 Partial Content - empty body, range request may have produced no bytes)".encode()
+    elif status in (301, 302, 303, 307, 308):
+        display_body = "(redirect - no body, follow Location header)".encode()
+    else:
+        display_body = b"(empty response)"
     ct_clean = ct.split(";")[0].strip() if ct else ""
-    if display_tag:
-        ct_clean = f"{display_tag} {ct_clean}"
+    # Store the display_tag ([cdn], [ext], [stream], [cdn:8081], etc) as a
+    # separate "web_type" field so the GUI can show it in its own column
+    # instead of cramming it into the Content-Type column.
+    web_type = display_tag or ""
 
     try:
         _gui_log_queue.put_nowait({
-            "ts":     time.strftime("%H:%M:%S"),
-            "method": method,
-            "path":   path,
-            "query":  "",
-            "status": status,
-            "ct":     ct_clean,
-            "size":   len(body),
-            "body":   display_body,
+            "ts":       time.strftime("%H:%M:%S"),
+            "method":   method,
+            "path":     path,
+            "query":    "",
+            "status":   status,
+            "ct":       ct_clean,
+            "web_type": web_type,
+            "size":     len(body),
+            "body":     display_body,
+            "origin":   origin,
         })
     except queue.Full:
         pass
+
+def _origin_matches(hook_origin: str, ctx: HookContext) -> bool:
+    """Check if a hook's origin filter matches the request's actual origin.
+
+    hook_origin semantics:
+      - "" / "*" / "any"  → matches ANY origin (the target site AND all CDNs)
+      - "target" / "main" → matches only MAIN_HOST (the target site)
+      - a hostname        → matches if the request's netloc ends with it
+                            (e.g. "cdn.example.com" matches that exact host;
+                             "example.com" also matches "cdn.example.com")
+    This lets users write hooks that target a specific CDN without affecting
+    the main site, or vice-versa.
+    """
+    ho = (hook_origin or "").strip().lower()
+    if ho in ("", "*", "any"):
+        return True
+    try:
+        netloc = urlparse(ctx.url).netloc.lower()
+    except Exception:
+        netloc = ""
+    if not netloc:
+        return False
+    # Strip port
+    host = netloc.split(":", 1)[0]
+    # Strip www.
+    if host.startswith("www."):
+        host = host[4:]
+    if ho in ("target", "main"):
+        return host == MAIN_HOST.lower() or host == ("www." + MAIN_HOST).lower()
+    # Hostname suffix match: "example.com" matches "cdn.example.com"
+    return host == ho or host.endswith("." + ho)
 
 def _apply_gui_hooks(ctx: HookContext) -> None:
     """Apply the first matching enabled GUI hook. Thread-safe."""
@@ -721,6 +856,9 @@ def _apply_gui_hooks(ctx: HookContext) -> None:
         _rs = h.get("status", 0)
         hook_status = 0 if _rs in (0,"*","any","") else int(_rs)
         if hook_status != 0 and hook_status != ctx.resp_status:
+            continue
+        # Origin filter — match by domain (target site vs specific CDN)
+        if not _origin_matches(h.get("origin_url", ""), ctx):
             continue
         # Path + query pattern (match against full path?query so hooks can target specific params)
         try:
@@ -863,6 +1001,7 @@ def _launch_hook_gui() -> None:
         _GRN = "#69ff69"
         _YLW = "#ffcc00"
         _RED = "#ff5555"
+        _CYN = "#00d0d0"   # cyan accent for origin column
         _ENT = "#1a1a1a"   # entry/input background
 
         root.configure(bg=_BG)
@@ -964,18 +1103,22 @@ def _launch_hook_gui() -> None:
 
         top_area = tk.Frame(v_pane, bg=_BG)
         bot_area = tk.Frame(v_pane, bg=_PNL)
-        v_pane.add(top_area, minsize=320)
-        v_pane.add(bot_area, minsize=160)
+        # Give the top area (traffic log + body editor) the lion's share of
+        # vertical space. Active hooks only needs ~120px for 3-4 rows.
+        v_pane.add(top_area, minsize=360, height=600)
+        v_pane.add(bot_area, minsize=100, height=120)
 
         # Horizontal split inside top_area: left (traffic log) | right (body editor)
+        # Give the traffic log MORE width than the body editor — the path column
+        # was too narrow to read. 55/45 split instead of the old ~50/50.
         h_pane = tk.PanedWindow(top_area, orient=tk.HORIZONTAL, bg=_BG, sashwidth=5,
                                 sashrelief="flat")
         h_pane.pack(fill=tk.BOTH, expand=True)
 
         left  = tk.Frame(h_pane, bg=_PNL)
         right = tk.Frame(h_pane, bg=_PNL)
-        h_pane.add(left,  minsize=460)
-        h_pane.add(right, minsize=340)
+        h_pane.add(left,  minsize=520, width=560)
+        h_pane.add(right, minsize=300, width=420)
 
         # ── LEFT: traffic log ─────────────────────────────────────────────────
         _lbl(left, "Traffic Log", fg=_ACC, font=("Consolas", 11, "bold"),
@@ -984,15 +1127,17 @@ def _launch_hook_gui() -> None:
         tree_frame = tk.Frame(left, bg=_PNL)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=4)
 
-        cols = ("ts", "method", "path", "status", "ct", "size")
+        cols = ("ts", "method", "origin", "path", "status", "web_type", "ct", "size")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
         for c, w, label in (
-            ("ts",     70,  "Time"),
-            ("method", 60,  "Method"),
-            ("path",   0,   "Path"),   # 0 = stretch
-            ("status", 54,  "Status"),
-            ("ct",     130, "Content-Type"),
-            ("size",   68,  "Size"),
+            ("ts",       58,  "Time"),
+            ("method",   50,  "Method"),
+            ("origin",   110, "Origin"),
+            ("path",     0,   "Path"),      # 0 = stretch (gets the remaining space)
+            ("status",   44,  "Status"),
+            ("web_type", 72,  "Web Type"),  # [cdn], [ext], [stream], [cdn:8081]
+            ("ct",       100, "File Type"), # MIME type only
+            ("size",     56,  "Size"),
         ):
             tree.heading(c, text=label)
             tree.column(c, width=w, anchor="w", stretch=(c == "path"))
@@ -1173,6 +1318,7 @@ def _launch_hook_gui() -> None:
 
         row1 = tk.Frame(save_frame, bg=_PNL); row1.pack(fill=tk.X, pady=2)
         row2 = tk.Frame(save_frame, bg=_PNL); row2.pack(fill=tk.X, pady=2)
+        row3 = tk.Frame(save_frame, bg=_PNL); row3.pack(fill=tk.X, pady=2)
 
         _lbl(row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
         name_entry = _entry(row1, width=14)
@@ -1194,10 +1340,21 @@ def _launch_hook_gui() -> None:
                                    width=6, state="readonly", font=("Consolas", 10))
         status_menu.pack(side=tk.LEFT, padx=(2, 0))
 
-        _lbl(row2, "Pattern (regex):", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        _lbl(row2, "Pattern url:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
         pat_entry = _entry(row2, width=34)
         pat_entry.insert(0, r".*")
         pat_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+
+        # Origin URL — which domain/host this hook targets.
+        #   * / empty / "any"  → any origin (target site + all CDNs)
+        #   "target"           → only the main target site (MAIN_HOST)
+        #   a hostname         → that specific host (suffix match: "example.com"
+        #                        also matches "cdn.example.com")
+        _lbl(row3, "Origin url:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        origin_entry = _entry(row3, width=20)
+        origin_entry.insert(0, "*")
+        origin_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+        _lbl(row3, "  (target / * / host)", fg=_DIM, bg=_PNL).pack(side=tk.LEFT)
 
         save_status = _lbl(right, text="", fg=_DIM, bg=_PNL)
         save_status.pack(anchor="w", padx=8, pady=(0, 2))
@@ -1212,7 +1369,11 @@ def _launch_hook_gui() -> None:
                 return
 
             path_qs = data["path"] + (f"?{data['query']}" if data.get("query") else "")
-            info_var.set(f"{data['method']}  {path_qs}  [{data['status']}]  {data['ct']}")
+            _info_origin = data.get("origin", "")
+            _info_prefix = f"[{_info_origin}]  " if _info_origin else ""
+            _info_wt = data.get("web_type", "")
+            _info_wt_s = f"  {_info_wt}" if _info_wt else ""
+            info_var.set(f"{_info_prefix}{data['method']}  {path_qs}  [{data['status']}]{_info_wt_s}  {data['ct']}")
 
             raw_body = data["body"]
             body_box.config(state="normal")
@@ -1236,6 +1397,14 @@ def _launch_hook_gui() -> None:
             # re.escape() was here before and produced ugly \/ and \. escapes.
             pat_entry.delete(0, "end")
             pat_entry.insert(0, data["path"])
+            # Origin: auto-populate from the traffic log entry's origin field.
+            # If it's the main target site, use "target"; otherwise use the CDN host.
+            _data_origin = data.get("origin", "")
+            origin_entry.delete(0, "end")
+            if _data_origin:
+                origin_entry.insert(0, _data_origin)
+            else:
+                origin_entry.insert(0, "*")
             # Auto-suggest name from path (only if name field is empty).
             # Use the deepest meaningful segment, skipping hashes/UUIDs.
             if not name_entry.get().strip():
@@ -1348,12 +1517,13 @@ def _launch_hook_gui() -> None:
                 imported = 0
                 for item in items:
                     hook = {
-                        "name":       item.get("name", "imported"),
-                        "method":     item.get("method", "*"),
-                        "status":     int(item.get("status", 200)),
-                        "pattern":    item.get("pattern", ".*"),
-                        "body_bytes": item.get("body", "").encode("utf-8"),
-                        "enabled":    item.get("enabled", True),
+                        "name":        item.get("name", "imported"),
+                        "method":      item.get("method", "*"),
+                        "status":      int(item.get("status", 200)),
+                        "pattern":     item.get("pattern", ".*"),
+                        "origin_url":  item.get("origin_url", item.get("origin", "*")),
+                        "body_bytes":  item.get("body", "").encode("utf-8"),
+                        "enabled":     item.get("enabled", True),
                     }
                     with _gui_hooks_lock:
                         names = [h["name"] for h in _gui_hooks]
@@ -1394,8 +1564,8 @@ def _launch_hook_gui() -> None:
         hooks_frame.bind("<Configure>", _on_hf_configure)
         hooks_canvas.bind("<Configure>", _on_canvas_configure)
 
-        _HOOK_COLS   = ("Name", "Method", "Status", "Pattern", "On", "", "")
-        _HOOK_WIDTHS = (18, 8, 7, 32, 4, 5, 5)
+        _HOOK_COLS   = ("Name", "Method", "Status", "Origin", "Pattern", "On", "", "")
+        _HOOK_WIDTHS = (16, 7, 6, 18, 28, 4, 4, 4)
 
         def _render_hook_rows():
             for w in hooks_frame.winfo_children():
@@ -1408,21 +1578,27 @@ def _launch_hook_gui() -> None:
                 hooks_copy = list(_gui_hooks)
             if not hooks_copy:
                 _lbl(hooks_frame, "No hooks saved yet.", fg=_DIM, bg=_PNL).grid(
-                    row=1, column=0, columnspan=7, sticky="w", padx=4, pady=4)
+                    row=1, column=0, columnspan=8, sticky="w", padx=4, pady=4)
                 return
             for row_idx, h in enumerate(hooks_copy, start=1):
                 row_fg = _FG if h["enabled"] else _DIM
                 _lbl(hooks_frame, h["name"], bg=_PNL, fg=row_fg,
-                     width=18, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
+                     width=16, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
                 _lbl(hooks_frame, h["method"], bg=_PNL,
                      fg=_YLW if h["enabled"] else _DIM,
-                     width=8, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
+                     width=7, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
                 _lbl(hooks_frame, str(h["status"]), bg=_PNL,
                      fg=_GRN if h["enabled"] else _DIM,
-                     width=7, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
+                     width=6, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
+                _origin_disp = h.get("origin_url", "*") or "*"
+                if len(_origin_disp) > 18:
+                    _origin_disp = _origin_disp[:17] + "…"
+                _lbl(hooks_frame, _origin_disp, bg=_PNL,
+                     fg=_CYN if h["enabled"] else _DIM,
+                     width=18, anchor="w").grid(row=row_idx, column=3, sticky="w", padx=3)
                 _lbl(hooks_frame,
-                     h["pattern"][:40] + ("…" if len(h["pattern"]) > 40 else ""),
-                     bg=_PNL, fg=_DIM, width=32, anchor="w").grid(row=row_idx, column=3, sticky="w", padx=3)
+                     h["pattern"][:28] + ("…" if len(h["pattern"]) > 28 else ""),
+                     bg=_PNL, fg=_DIM, width=28, anchor="w").grid(row=row_idx, column=4, sticky="w", padx=3)
 
                 # Enabled toggle
                 bv = tk.BooleanVar(value=h["enabled"])
@@ -1436,7 +1612,7 @@ def _launch_hook_gui() -> None:
                 tk.Checkbutton(hooks_frame, variable=bv, command=_make_toggle(h, bv),
                                bg=_PNL, fg=_FG, selectcolor=_BG,
                                activebackground=_PNL,
-                               width=2).grid(row=row_idx, column=4, padx=3)
+                               width=2).grid(row=row_idx, column=5, padx=3)
 
                 # Edit — load hook back into the editor
                 def _make_edit(hook_ref):
@@ -1448,6 +1624,8 @@ def _launch_hook_gui() -> None:
                         status_var.set(sc if sc in _STATUS_OPTS else "200")
                         pat_entry.delete(0, "end")
                         pat_entry.insert(0, hook_ref["pattern"])
+                        origin_entry.delete(0, "end")
+                        origin_entry.insert(0, hook_ref.get("origin_url", "*") or "*")
                         body_box.delete("1.0", "end")
                         try:
                             txt = hook_ref["body_bytes"].decode("utf-8", errors="replace")
@@ -1463,7 +1641,7 @@ def _launch_hook_gui() -> None:
                     return _edit
                 _btn(hooks_frame, "Ed", _make_edit(h),
                      font=("Consolas", 8), bg="#051a05",
-                     fg=_GRN).grid(row=row_idx, column=5, padx=3)
+                     fg=_GRN).grid(row=row_idx, column=6, padx=3)
 
                 # Delete
                 def _make_del(hook_name):
@@ -1479,7 +1657,7 @@ def _launch_hook_gui() -> None:
                     return _del
                 _btn(hooks_frame, "X", _make_del(h["name"]),
                      bg="#1a0505", fg=_RED,
-                     font=("Consolas", 8)).grid(row=row_idx, column=6, padx=3)
+                     font=("Consolas", 8)).grid(row=row_idx, column=7, padx=3)
 
         _render_hook_rows()
 
@@ -1489,8 +1667,11 @@ def _launch_hook_gui() -> None:
         def _load_hooks_from_disk() -> None:
             """Load previously saved hooks from site_data/MyHooks/{host}/ at startup."""
             for hook in _hook_load_all({"name": "?", "method": "*", "status": 200,
-                                         "pattern": ".*", "enabled": True}):
+                                         "pattern": ".*", "origin_url": "*",
+                                         "enabled": True}):
                 hook["status"] = int(hook.get("status", 200) or 0)
+                if "origin_url" not in hook:
+                    hook["origin_url"] = "*"
                 with _gui_hooks_lock:
                     if hook["name"] not in [h["name"] for h in _gui_hooks]:
                         _gui_hooks.append(hook)
@@ -1529,13 +1710,15 @@ def _launch_hook_gui() -> None:
             except re.error as e:
                 messagebox.showerror("S2L", f"Invalid pattern: {e}")
                 return
+            origin_str = origin_entry.get().strip() or "*"
             hook = {
-                "name":       name,
-                "method":     method_var.get(),
-                "status":     status,
-                "pattern":    pat_str,
-                "body_bytes": body_txt.encode("utf-8"),
-                "enabled":    True,
+                "name":        name,
+                "method":      method_var.get(),
+                "status":      status,
+                "pattern":     pat_str,
+                "origin_url":  origin_str,
+                "body_bytes":  body_txt.encode("utf-8"),
+                "enabled":     True,
             }
             with _gui_hooks_lock:
                 _gui_hooks.append(hook)
@@ -1597,6 +1780,7 @@ def _launch_hook_gui() -> None:
 
         rh_row1 = tk.Frame(rh_top, bg=_PNL); rh_row1.pack(fill=tk.X, padx=8, pady=2)
         rh_row2 = tk.Frame(rh_top, bg=_PNL); rh_row2.pack(fill=tk.X, padx=8, pady=2)
+        rh_row3 = tk.Frame(rh_top, bg=_PNL); rh_row3.pack(fill=tk.X, padx=8, pady=2)
 
         _lbl(rh_row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
         rh_name_entry = _entry(rh_row1, width=14)
@@ -1609,10 +1793,16 @@ def _launch_hook_gui() -> None:
                                       width=7, state="readonly", font=("Consolas", 10))
         rh_method_menu.pack(side=tk.LEFT, padx=(2, 0))
 
-        _lbl(rh_row2, "Pattern (regex):", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        _lbl(rh_row2, "Pattern url:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
         rh_pat_entry = _entry(rh_row2, width=34)
         rh_pat_entry.insert(0, r".*")
         rh_pat_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+
+        _lbl(rh_row3, "Origin url:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        rh_origin_entry = _entry(rh_row3, width=20)
+        rh_origin_entry.insert(0, "*")
+        rh_origin_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+        _lbl(rh_row3, "  (target / * / host)", fg=_DIM, bg=_PNL).pack(side=tk.LEFT)
 
         _lbl(rh_top, "Request Body  (replaces what the real origin server receives):",
              fg=_ACC, bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
@@ -1647,8 +1837,8 @@ def _launch_hook_gui() -> None:
         rh_rows_frame.bind("<Configure>", _on_rh_configure)
         rh_canvas.bind("<Configure>", _on_rh_canvas_configure)
 
-        _RH_COLS   = ("Name", "Method", "Pattern", "On", "", "")
-        _RH_WIDTHS = (18, 8, 40, 4, 5, 5)
+        _RH_COLS   = ("Name", "Method", "Origin", "Pattern", "On", "", "")
+        _RH_WIDTHS = (16, 7, 18, 32, 4, 4, 4)
 
         def _render_req_hook_rows():
             for w in rh_rows_frame.winfo_children():
@@ -1661,18 +1851,24 @@ def _launch_hook_gui() -> None:
                 hooks_copy = list(_gui_req_hooks)
             if not hooks_copy:
                 _lbl(rh_rows_frame, "No request hooks saved yet.", fg=_DIM, bg=_PNL).grid(
-                    row=1, column=0, columnspan=6, sticky="w", padx=4, pady=4)
+                    row=1, column=0, columnspan=7, sticky="w", padx=4, pady=4)
                 return
             for row_idx, h in enumerate(hooks_copy, start=1):
                 row_fg = _FG if h["enabled"] else _DIM
                 _lbl(rh_rows_frame, h["name"], bg=_PNL, fg=row_fg,
-                     width=18, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
+                     width=16, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
                 _lbl(rh_rows_frame, h["method"], bg=_PNL,
                      fg=_YLW if h["enabled"] else _DIM,
-                     width=8, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
+                     width=7, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
+                _rh_origin_disp = h.get("origin_url", "*") or "*"
+                if len(_rh_origin_disp) > 18:
+                    _rh_origin_disp = _rh_origin_disp[:17] + "…"
+                _lbl(rh_rows_frame, _rh_origin_disp, bg=_PNL,
+                     fg=_CYN if h["enabled"] else _DIM,
+                     width=18, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
                 _lbl(rh_rows_frame,
-                     h["pattern"][:40] + ("…" if len(h["pattern"]) > 40 else ""),
-                     bg=_PNL, fg=_DIM, width=40, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
+                     h["pattern"][:32] + ("…" if len(h["pattern"]) > 32 else ""),
+                     bg=_PNL, fg=_DIM, width=32, anchor="w").grid(row=row_idx, column=3, sticky="w", padx=3)
 
                 bv = tk.BooleanVar(value=h["enabled"])
                 def _make_rh_toggle(hook_ref, var):
@@ -1685,7 +1881,7 @@ def _launch_hook_gui() -> None:
                 tk.Checkbutton(rh_rows_frame, variable=bv, command=_make_rh_toggle(h, bv),
                                bg=_PNL, fg=_FG, selectcolor=_BG,
                                activebackground=_PNL,
-                               width=2).grid(row=row_idx, column=3, padx=3)
+                               width=2).grid(row=row_idx, column=4, padx=3)
 
                 def _make_rh_edit(hook_ref):
                     def _edit():
@@ -1694,6 +1890,8 @@ def _launch_hook_gui() -> None:
                         rh_method_var.set(hook_ref["method"] if hook_ref["method"] in _RH_METHOD_OPTS else "*")
                         rh_pat_entry.delete(0, "end")
                         rh_pat_entry.insert(0, hook_ref["pattern"])
+                        rh_origin_entry.delete(0, "end")
+                        rh_origin_entry.insert(0, hook_ref.get("origin_url", "*") or "*")
                         rh_body_box.delete("1.0", "end")
                         try:
                             txt = hook_ref["body_bytes"].decode("utf-8", errors="replace")
@@ -1709,7 +1907,7 @@ def _launch_hook_gui() -> None:
                     return _edit
                 _btn(rh_rows_frame, "Ed", _make_rh_edit(h),
                      font=("Consolas", 8), bg="#051a05",
-                     fg=_GRN).grid(row=row_idx, column=4, padx=3)
+                     fg=_GRN).grid(row=row_idx, column=5, padx=3)
 
                 def _make_rh_del(hook_name):
                     def _del():
@@ -1724,7 +1922,7 @@ def _launch_hook_gui() -> None:
                     return _del
                 _btn(rh_rows_frame, "X", _make_rh_del(h["name"]),
                      bg="#1a0505", fg=_RED,
-                     font=("Consolas", 8)).grid(row=row_idx, column=5, padx=3)
+                     font=("Consolas", 8)).grid(row=row_idx, column=6, padx=3)
 
         _render_req_hook_rows()
 
@@ -1736,7 +1934,10 @@ def _launch_hook_gui() -> None:
         def _load_req_hooks_from_disk() -> None:
             """Load previously saved request hooks from site_data/MyReqHooks/{host}/."""
             for hook in _req_hook_load_all({"name": "?", "method": "*",
-                                             "pattern": ".*", "enabled": True}):
+                                             "pattern": ".*", "origin_url": "*",
+                                             "enabled": True}):
+                if "origin_url" not in hook:
+                    hook["origin_url"] = "*"
                 with _gui_req_hooks_lock:
                     if hook["name"] not in [h["name"] for h in _gui_req_hooks]:
                         _gui_req_hooks.append(hook)
@@ -1770,12 +1971,14 @@ def _launch_hook_gui() -> None:
             except re.error as e:
                 messagebox.showerror("S2L", f"Invalid pattern: {e}")
                 return
+            origin_str = rh_origin_entry.get().strip() or "*"
             hook = {
-                "name":       name,
-                "method":     rh_method_var.get(),
-                "pattern":    pat_str,
-                "body_bytes": body_txt.encode("utf-8"),
-                "enabled":    True,
+                "name":        name,
+                "method":      rh_method_var.get(),
+                "pattern":     pat_str,
+                "origin_url":  origin_str,
+                "body_bytes":  body_txt.encode("utf-8"),
+                "enabled":     True,
             }
             with _gui_req_hooks_lock:
                 _gui_req_hooks.append(hook)
@@ -2028,9 +2231,11 @@ def _launch_hook_gui() -> None:
                     else:
                         sz_s = "—"    # genuinely empty response; not a read error
                     _tag = ("hooked" if entry.get("hooked") else "err" if status>=400 else "api" if any(x in entry.get("ct","") for x in ("json","xml","event-stream")) else method if method in ("GET","POST","PUT","PATCH","DELETE") else "")
+                    _origin_val = entry.get("origin", "") or ""
+                    _web_type_val = entry.get("web_type", "") or ""
                     iid  = tree.insert("", "end", values=(
-                        entry["ts"], method, entry["path"],
-                        status, entry["ct"], sz_s,
+                        entry["ts"], method, _origin_val, entry["path"],
+                        status, _web_type_val, entry["ct"], sz_s,
                     ), tags=(_tag,))
                     _row_data[iid] = entry
                     children = tree.get_children()
@@ -2437,7 +2642,7 @@ def _is_bot_page(body: bytes, status: int = 200, path: str = "") -> bool:
     """Return True if the body is a bot-detection / CAPTCHA page.
 
     Only fires on HTML responses — JSON API 403s are never bot pages.
-    Path-exempt prefixes (YouTube internal API, /api/, etc.) are skipped.
+    Path-exempt prefixes (internal API routes, /api/, etc.) are skipped.
     """
     # API endpoints return legitimate 4xx — never block them
     if path and any(path.startswith(p) for p in _BOT_EXEMPT_PREFIXES):
@@ -2619,8 +2824,7 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
                 # servers send brotli streams with trailing junk that confuses
                 # the one-shot API), fall back to the streaming decompressor
                 # which is more tolerant. We saw "Empty body (decompression
-                # failure)" warnings on Discord API endpoints (apex/experiments,
-                # users/@me/survey, etc.) where curl_cffi returned a brotli
+                # failure)" warnings on certain API endpoints where curl_cffi returned a brotli
                 # body it couldn't auto-decompress; our one-shot _brotli.decompress
                 # also failed silently and we returned the raw compressed bytes
                 # as if they were the decoded body — which downstream code
@@ -2676,6 +2880,18 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
     return data
 
 def guess_mime(path: str) -> str:
+    """Guess a MIME type from a path extension.
+
+    Uses the stdlib mimetypes module (dynamic — reads /etc/mime.types at
+    import, supplemented by the add_type() calls at the top of this file).
+    Falls back to application/octet-stream when the extension is unknown or
+    absent, which is the safest default for binary-safe proxying.
+    """
+    if not path:
+        return "application/octet-stream"
+    # Strip query string / fragment if present (can happen when guess_mime
+    # is called on a URL path instead of a local file path).
+    path = path.split("?", 1)[0].split("#", 1)[0]
     mt, _ = mimetypes.guess_type(path)
     return mt or "application/octet-stream"
 
@@ -2935,7 +3151,7 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
         out["Access-Control-Expose-Headers"] = "*"
     # Cross-Origin-Resource-Policy: cross-origin — required so that resources served
     # through S2L (images, scripts, fonts from CDN) can be consumed by cross-origin HTML
-    # pages also going through S2L (game iframes, etc.). Without this, when COEP is
+    # pages also going through S2L (cross-origin iframes, etc.). Without this, when COEP is
     # active any resource without CORP is blocked by the browser.
     out["Cross-Origin-Resource-Policy"] = "cross-origin"
     # COOP/COEP are now PASSIVE: whatever the origin itself decided (kept above,
@@ -3049,14 +3265,14 @@ def rewrite_abs_urls(html: bytes) -> bytes:
     """Rewrite absolute MAIN_HOST URLs inside HTML *attribute values* → proxy-relative.
 
     Only targets attribute-value contexts (href=, src=, action=, data-href=, etc.)
-    so that inline JSON/JS (ytInitialData, __NEXT_DATA__, etc.) is NOT modified.
-    Touching bare JSON strings breaks YouTube/Next.js because their JS uses the
-    full URLs for API calls and video manifests.
+    so that inline JSON/JS (hydration payloads like __NEXT_DATA__, etc.) is NOT modified.
+    Touching bare JSON strings breaks SPA frameworks because their JS uses the
+    full URLs for API calls and dynamic manifests.
 
-    Before: href="https://www.youtube.com/watch?v=abc"
+    Before: href="https://example.com/watch?v=abc"
     After:  href="/watch?v=abc"
 
-    JSON (untouched): "url":"https://www.youtube.com/watch?v=abc"
+    JSON (untouched): "url":"https://example.com/watch?v=abc"
     """
     if not html or not MAIN_HOST:
         return html
@@ -3126,8 +3342,8 @@ def _fmt_size(n: int) -> str:
 def _fmt_host(host: str) -> str:
     """Normalize a hostname for display: strip www. prefix and port.
     Returns 'host' (no scheme, no port) for consistent log lines.
-    Examples: 'www.deltarune.com:443' → 'deltarune.com'
-              'cdn.discordapp.com' → 'cdn.discordapp.com'
+    Examples: 'www.example.com:443' → 'example.com'
+              'cdn.example.com' → 'cdn.example.com'
     """
     if not host:
         return ""
@@ -3147,7 +3363,9 @@ def log_req(method: str, status: int, host: str, path: str, size: int, tag: str 
     prefix = f"[{tag}] " if tag else ""
     _h = _fmt_host(host)
     log(f"{prefix}{method:6} {status} {_h}{path} {_fmt_size(size)}", "→")
-    _gui_push_raw(method, path, status, "", b"", display_tag=f"[{tag}]" if tag else "")
+    _gui_push_raw(method, path, status, "", b"",
+                  display_tag=f"[{tag.upper()}]" if tag else "",
+                  origin=_fmt_host(host))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTML reveal  (SHOW_HIDDEN)
@@ -3207,7 +3425,7 @@ def _build_s2l_injector() -> bytes:
         # over any outer variable; everything it needs is passed as an argument.
         #
         # CRITICAL: this same script is also injected into every CDN-multiport
-        # sub-iframe (e.g. a game host gets its own port, :8087). Inside THAT
+        # sub-iframe (e.g. a CDN host gets its own port, :8087). Inside THAT
         # document, location.port is :8087, NOT the main proxy's port — but
         # /__s2l_ext__/ and /__s2l_ws_ext__/ only exist on the main app. A bare
         # relative path for the main-host case would also resolve against
@@ -3219,7 +3437,7 @@ def _build_s2l_injector() -> bytes:
           'var PX="http://"+proxyHost+":"+proxyPort;'
           'function rw(u){'
           # Handle protocol-relative URLs (//cdn.host/path) by prepending https:
-          # BEFORE the guard check. Without this, URLs like //cdn.discord.com/x.js
+          # BEFORE the guard check. Without this, URLs like //cdn.example.com/x.js
           # are returned unchanged (the u[0]=="/" guard catches them) and bypass
           # the proxy entirely, loading from the real CDN where CORS/auth fails.
           'if(typeof u==="string"&&u.length>2&&u[0]==="/"&&u[1]==="/")u="https:"+u;'
@@ -3322,7 +3540,7 @@ def _build_s2l_injector() -> bytes:
         '}catch(e){}'
         # ── location.href / .assign() / .replace() / window.open() patch ───────
         # A frame can navigate itself WITHOUT ever touching fetch/XHR/src — e.g.
-        # an embedded app/game SDK's "are we on the right domain?" check falling
+        # an embedded app SDK's "are we on the right domain?" check falling
         # back to `top.location.href = "https://real-cdn-host/"`, or any script
         # doing `location.replace(realCdnUrl)`. None of the patches above catch
         # a raw navigation, so the browser tries to connect to the REAL host
@@ -3356,7 +3574,7 @@ def _build_s2l_injector() -> bytes:
           '}'
         '}catch(e){}'
         # ── Window.prototype.postMessage patch ─────────────────────────────────
-        # Embedded app/game SDKs commonly do:
+        # Embedded app SDKs commonly do:
         #   window.parent.postMessage(msg, 'https://real-parent-origin')
         #   iframe.contentWindow.postMessage(msg, 'https://real-cdn-origin')
         # The browser silently drops these, because the actual receiving window
@@ -3399,14 +3617,14 @@ def _build_s2l_injector() -> bytes:
         # ignores the message. Fix: patch the origin getter so each
         # localhost:PORT reports the REAL host it stands in for — main port →
         # MAIN_HOST, a CDN port → that CDN host's real domain (e.g.
-        # localhost:8091 → the actual gdn.example.com it was registered for).
+        # localhost:8091 → the actual cdn.example.com it was registered for).
         #
         # CRITICAL: this must NOT collapse every localhost origin to the same
-        # single host. An app/game wrapper that does a postMessage handshake
+        # single host. An app iframe that does a postMessage handshake
         # with an embedded iframe verifies event.origin matches that embed's
         # OWN expected CDN origin before trusting it. If every message —
         # including ones from the embed's own CDN-port iframe — reported back
-        # as the wrapper's main origin instead of the embed's real GDN host,
+        # as the wrapper's main origin instead of the embed's real CDN host,
         # that origin check would fail, and some wrappers' fallback/recovery
         # path responds to that failure by re-pointing the embed's iframe
         # itself at event.origin — i.e. straight at the real remote host —
@@ -3571,7 +3789,7 @@ def _build_s2l_injector() -> bytes:
           '};'
         '}catch(e){}'
         # ── CSS backgroundImage + cssText setter patch ────────────────────────
-        # Catches: element.style.backgroundImage = "url(https://cdn.game.com/bg.png)"
+        # Catches: element.style.backgroundImage = "url(https://cdn.example.com/bg.png)"
         'try{'
           'var _cssRw=function(v){return typeof v==="string"?v.replace(/url\\((["\']?)(https?:\\/\\/[^)"\'\\s<>]+)\\1\\)/gi,function(m,q,u){var r=rw(u);return r!==u?"url("+q+r+q+")":m;}):v;};'
           'var _bgD=Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype,"backgroundImage");'
@@ -3627,7 +3845,7 @@ def _build_s2l_injector() -> bytes:
         '}catch(e){}'
         # ── iframe.srcdoc patch ─────────────────────────────────────────────────
         # srcdoc embeds a full HTML document as a literal STRING — typically
-        # built at runtime from API-response data (e.g. a sandboxed game-embed
+        # built at runtime from API-response data (e.g. a sandboxed app
         # wrapper). It never passes through our server-side HTML rewriting
         # (it's not a separate HTTP response) and isn't caught by any
         # attribute/property patch above (srcdoc isn't itself a URL). Rewrite
@@ -3651,7 +3869,7 @@ def _build_s2l_injector() -> bytes:
         '}catch(e){}'
         # ── Service worker + cache handling ─────────────────────────────────
         # IMPORTANT: Do NOT blanket-unregister all SWs or nuke all caches on
-        # every page load. SPAs (Discord, Twitter, YouTube, etc.) rely on their
+        # every page load. SPAs and real-time apps rely on their
         # SW for caching JS bundles and app-shell. Wiping them on every proxy
         # navigation forces a full re-fetch of every chunk — on flaky networks
         # this hangs the SPA init indefinitely (blank page). The injector's
@@ -3674,7 +3892,7 @@ def _build_s2l_injector() -> bytes:
           '}'
         '}catch(e){}'
         # ── Live HP refresh — picks up CDN hosts registered after page load ───
-        # Polls PX+/.__s2l_hp every 2s so game CDN hosts registered AFTER the
+        # Polls PX+/.__s2l_hp every 2s so CDN hosts registered AFTER the
         # initial page serve are picked up without a reload. PX is absolute
         # (http://127.0.0.1:8080) so polling works from any sub-iframe port.
         '(function(){'
@@ -3767,8 +3985,8 @@ def local_path(u: str) -> str:
     if path.endswith("/") or not os.path.splitext(path)[1]:
         path = path.rstrip("/") + "/index.html"
     parts = [_safe_seg(x) for x in path.split("/") if x]
-    # Include a query-string hash so URLs with different params (e.g. YouTube search,
-    # paginated APIs) are cached as separate files — prevents stale search results.
+    # Include a query-string hash so URLs with different params (e.g. search
+    # queries, paginated APIs) are cached as separate files — prevents stale search results.
     if p.query:
         qs_hash = hashlib.sha1(p.query.encode()).hexdigest()[:10]
         last = parts[-1] if parts else "index.html"
@@ -3821,59 +4039,141 @@ MAIN_HOST = urlparse(SITE_URL).netloc
 SITE_NAME = MAIN_HOST.replace("www.", "").replace(".", "_")
 SRC_FOLDER  = os.path.join("site_src",  SITE_NAME)
 DATA_FOLDER = os.path.join("site_data", SITE_NAME)
+WORDLISTS_DIR = "wordlists"   # wordlist files for SCAN_PATHS (one path per line)
 os.makedirs(SRC_FOLDER,  exist_ok=True)
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hidden path scanner  (SCAN_PATHS)
+#
+# Three modes, all driven by wordlist FILES under wordlists/:
+#   "all"        — every wordlist file found under wordlists/ (recursive).
+#                  Each file runs to completion before the next starts.
+#   "all-in-dir" — every wordlist file in wordlists/ top-level only (non-recursive).
+#   "dir/file"   — one specific wordlist, path relative to wordlists/.
+#                  e.g. "common/admin.txt" → wordlists/common/admin.txt
+#                       "admin.txt"        → wordlists/admin.txt
+#
+# Wordlist format: one path per line.  Blank lines and lines starting with '#'
+# are ignored.  Leading '/' is stripped automatically.
 # ──────────────────────────────────────────────────────────────────────────────
 
-_DEFAULT_HIDDEN_PATHS = [
-    "admin", "administrator", "login", "panel", "dashboard", "console",
-    "wp-admin", "wp-login.php", "phpmyadmin",
-    ".git", ".git/HEAD", ".git/config",
-    ".env", ".env.local", ".env.production",
-    "config", "config.php", "config.json",
-    "backup", "backups", "db", "database",
-    "private", "secret", "secrets",
-    "api", "api/v1", "api/v2", "graphql",
-    "swagger", "swagger-ui", "swagger.json", "openapi.json",
-    "robots.txt", "sitemap.xml",
-    "server-status", "server-info",
-    "phpinfo.php", "info.php", "test.php",
-    "debug", "trace", "health", "status", "metrics",
-]
+def _load_wordlist(path: str) -> list[str]:
+    """Read one wordlist file → list of path strings (de-duplicated, order kept)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                p = line.lstrip("/")
+                if p and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+    except OSError as e:
+        log(f"wordlist read error {path}: {_short_exc(e)}", "WARN")
+    return out
+
+def _resolve_wordlists() -> list[tuple[str, list[str]]]:
+    """Resolve SCAN_PATHS mode → ordered list of (display_name, paths).
+
+    Returns [] when SCAN_PATHS is falsy or no wordlists are found.
+    """
+    if not SCAN_PATHS or not isinstance(SCAN_PATHS, str):
+        return []
+    mode = SCAN_PATHS.strip()
+    if not mode:
+        return []
+
+    files: list[str] = []   # absolute/relative file paths
+
+    if mode == "all":
+        # Recursive walk of WORDLISTS_DIR
+        if os.path.isdir(WORDLISTS_DIR):
+            for root, _dirs, fns in sorted(os.walk(WORDLISTS_DIR)):
+                for fn in sorted(fns):
+                    fp = os.path.join(root, fn)
+                    if os.path.isfile(fp):
+                        files.append(fp)
+    elif mode == "all-in-dir":
+        # Top-level only
+        if os.path.isdir(WORDLISTS_DIR):
+            for fn in sorted(os.listdir(WORDLISTS_DIR)):
+                fp = os.path.join(WORDLISTS_DIR, fn)
+                if os.path.isfile(fp):
+                    files.append(fp)
+    else:
+        # Specific file: relative to WORDLISTS_DIR
+        fp = os.path.join(WORDLISTS_DIR, mode)
+        if os.path.isfile(fp):
+            files.append(fp)
+        else:
+            # Also allow an absolute / cwd-relative path as a convenience
+            if os.path.isfile(mode):
+                files.append(mode)
+            else:
+                log(f"SCAN_PATHS wordlist not found: {mode} (looked in {WORDLISTS_DIR}/)", "ERROR")
+
+    result: list[tuple[str, list[str]]] = []
+    for fp in files:
+        paths = _load_wordlist(fp)
+        if paths:
+            disp = os.path.relpath(fp, WORDLISTS_DIR) if fp.startswith(WORDLISTS_DIR) else fp
+            result.append((disp, paths))
+    return result
+
+def _scan_paths_summary() -> tuple[int, int]:
+    """Return (n_wordlists, n_total_paths) for the banner."""
+    wls = _resolve_wordlists()
+    return (len(wls), sum(len(p) for _, p in wls))
 
 def _run_path_scanner() -> None:
-    paths  = _DEFAULT_HIDDEN_PATHS + list(EXTRA_PATHS)
+    wordlists = _resolve_wordlists()
+    if not wordlists:
+        log(f"SCAN_PATHS={SCAN_PATHS!r} but no wordlists found in {WORDLISTS_DIR}/ — "
+            f"drop .txt files there (one path per line).", "WARN")
+        return
     sess   = _make_session()
-    found  = []
+    found: list = []
     origin = f"{urlparse(SITE_URL).scheme}://{MAIN_HOST}"
-    log(f"Path scanner — probing {len(paths)} paths on {MAIN_HOST}", "SCAN")
-    for p in paths:
-        url = f"{origin}/{p.lstrip('/')}"
-        try:
-            r = sess.head(url, timeout=(TIMEOUT_CONN, TIMEOUT_READ), allow_redirects=False, verify=False)
-            if r.status_code == 405:
-                r = sess.get(url, timeout=(TIMEOUT_CONN, min(TIMEOUT_READ,6)), allow_redirects=False, verify=False)
-            if r.status_code not in (404, 410):
-                found.append({"path": p, "url": url, "status": r.status_code,
-                              "content_type": r.headers.get("Content-Type", "")})
-                sc = r.status_code
-                c  = Fore.GREEN if sc == 200 else Fore.YELLOW if sc in (301, 302, 403) else Fore.CYAN
-                log(f"{c}{sc}{Style.RESET_ALL}  {url}", "SCAN")
-        except _CONN_ERRORS:
-            pass
-        except Exception as e:
-            log(f"scan error {url}: {_short_exc(e)}", "WARN")
+    total_paths = sum(len(p) for _, p in wordlists)
+    log(f"Path scanner — {len(wordlists)} wordlist(s), {total_paths} paths on {MAIN_HOST}", "SCAN")
+    for wl_name, paths in wordlists:
+        log(f"  wordlist: {wl_name} ({len(paths)} paths)", "SCAN")
+        for p in paths:
+            url = f"{origin}/{p}"
+            try:
+                r = sess.head(url, timeout=(TIMEOUT_CONN, TIMEOUT_READ),
+                              allow_redirects=False, verify=False)
+                if r.status_code == 405:
+                    r = sess.get(url, timeout=(TIMEOUT_CONN, min(TIMEOUT_READ, 6)),
+                                 allow_redirects=False, verify=False)
+                if r.status_code not in (404, 410):
+                    found.append({"path": p, "url": url, "status": r.status_code,
+                                  "wordlist": wl_name,
+                                  "content_type": r.headers.get("Content-Type", "")})
+                    sc = r.status_code
+                    c  = (Fore.GREEN if sc == 200
+                          else Fore.YELLOW if sc in (301, 302, 403)
+                          else Fore.CYAN)
+                    log(f"  {c}{sc}{Style.RESET_ALL}  {url}", "SCAN")
+            except _CONN_ERRORS:
+                pass
+            except Exception as e:
+                log(f"scan error {url}: {_short_exc(e)}", "WARN")
     out = os.path.join(DATA_FOLDER, "hidden_paths.json")
     try:
         with open(out, "w", encoding="utf-8") as f:
             json.dump({"scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                       "target": MAIN_HOST, "results": found}, f, indent=2)
+                       "target": MAIN_HOST,
+                       "mode": SCAN_PATHS,
+                       "wordlists": [wl for wl, _ in wordlists],
+                       "results": found}, f, indent=2)
     except Exception as e:
         log(f"scan save failed: {e}", "ERROR")
-    log(f"Scan done — {len(found)}/{len(paths)} found → {out}", "SCAN")
+    log(f"Scan done — {len(found)}/{total_paths} found → {out}", "SCAN")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Domain policy
@@ -4086,11 +4386,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 _has_range_c or _should_stream(guess_mime("/" + p)))
             kw["stream"] = _do_stream_c
             r    = _get_client_session().request(method, cdn_url, **kw)
+            # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
+            # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
+            # large binary files (.tar bundles, .wasm, video, etc), producing
+            # "0.0B" bodies even though the server returned 200 with real content.
             if _do_stream_c:
-                _real_ct_c = r.headers.get("Content-Type", "")
-                _real_cl_c = int(r.headers.get("Content-Length", "0") or 0)
-                if _should_stream(_real_ct_c, _real_cl_c):
-                    return _stream_resp(r, method, cdn_url)
+                return _stream_resp(r, method, cdn_url)
             body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
             ct   = r.headers.get("Content-Type", "application/octet-stream")
             # Only save on real 200 responses with content — 304 has an empty body and
@@ -4105,7 +4406,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if method in _SAFE_METHODS:
                 out_headers["Cache-Control"] = "public, max-age=86400"
             # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
-            # through the proxy (critical for game iframes served from CDN hosts).
+            # through the proxy (critical for cross-origin iframes served from CDN hosts).
             _ct_base_c = ct.split(";")[0].strip().lower()
             if r.status_code < 400 and PROXY_CDN:
                 if "text/html" in _ct_base_c:
@@ -4133,7 +4434,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
 
             log(f"CDN {method} {ctx.resp_status} {_fmt_host(cdn_host)}/{p} {_fmt_size(len(ctx.resp_body))} :{port}", "CDN")
             _gui_push_raw(method, f"/{p}", ctx.resp_status, ctx.resp_ct, ctx.resp_body,
-                          display_tag=f"[cdn:{port}]")
+                          display_tag=f"[CDN:{port}]", origin=_fmt_host(cdn_host))
             return Response(ctx.resp_body, status=ctx.resp_status, headers=ctx.resp_headers, content_type=ctx.resp_ct)
         except Exception as exc:
             log(f"CDN error {cdn_host}/{p}: {_short_exc(exc)}", "WARN")
@@ -4232,7 +4533,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
     can quietly drift apart.
 
     Absolute https://MAIN_HOST/... baked into server-rendered content (e.g. an
-    <iframe src="https://some-cdn/..."> deep inside a nested game iframe) must
+    <iframe src="https://some-cdn/..."> deep inside a nested iframe) must
     be rewritten so the browser re-enters our proxy instead of connecting to
     the real internet host directly (→ "connection refused"). A bare relative
     path only works when the CURRENT document is itself served from the main
@@ -4245,7 +4546,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
     if MAIN_HOST.startswith("www."):
         _mh.add(MAIN_HOST[4:])
     # Strip the port from the captured host before matching against MAIN_HOST.
-    # The regexes feeding this function capture host:port (e.g. "discord.com:443"),
+    # The regexes feeding this function capture host:port (e.g. "example.com:443"),
     # which would fail the `host in _mh` check and incorrectly route MAIN_HOST
     # assets through /__s2l_ext__/ — losing session cookies and auth.
     host_no_port = host.split(":", 1)[0]
@@ -4264,13 +4565,13 @@ def _proxy_target(host: str, tail: str) -> str | None:
     # main-port page that happens to resolve correctly by coincidence, but the
     # SAME rewritten HTML/JSON is also served verbatim on every CDN sub-port
     # (MULTIPORT) and via /__s2l_ext__/ itself — there the browser resolves
-    # the relative path against THAT origin instead, e.g. a game index.html
+    # the relative path against THAT origin instead, e.g. an index.html
     # served from :8084 turned "/__s2l_ext__/other-cdn.com/x" into
     # "http://localhost:8084/__s2l_ext__/other-cdn.com/x", which 400'd because
     # port 8084's Flask instance only knows how to proxy its own single CDN
     # host, not arbitrary third parties. That 400 was exactly what broke
-    # loading the next item from the real CDN ({"error":"Invalid Game"}-style body) — the
-    # failed request was the game's own manifest/config fetch.
+    # loading the next item from the real CDN (error-style body) — the
+    # failed request was the app's own manifest/config fetch.
     return f"http://localhost:{PORT}{_EXT_PREFIX}/{host}{tail}"
 
 def _rewrite_json_urls(data: bytes) -> bytes:
@@ -4445,7 +4746,9 @@ def _rewrite_ext_urls(html_bytes: bytes, base_url: str) -> bytes:
 visited:        set = set()
 _VISITED_MAX = 100000  # cap to prevent unbounded memory growth
 saved_paths:    set = set()
+_SAVED_PATHS_MAX = 50000  # cap to prevent unbounded memory growth
 content_hashes: set = set()
+_CONTENT_HASHES_MAX = 50000  # cap to prevent unbounded memory growth
 
 visited_lock = threading.Lock()
 save_lock    = threading.Lock()
@@ -4473,6 +4776,14 @@ def _mark_host_dead(netloc: str) -> None:
     """Mark a host as dead for DEAD_HOST_TTL seconds."""
     with _dead_hosts_lock:
         _dead_hosts[netloc] = time.time() + DEAD_HOST_TTL
+        # Prune expired entries periodically to prevent unbounded growth.
+        # Only prune when the dict gets large (>500 entries) to avoid
+        # scanning on every call.
+        if len(_dead_hosts) > 500:
+            now = time.time()
+            expired = [k for k, v in _dead_hosts.items() if now > v]
+            for k in expired:
+                _dead_hosts.pop(k, None)
 
 def _is_host_dead(netloc: str) -> bool:
     """Check if a host is currently marked dead (with TTL expiry)."""
@@ -4490,20 +4801,46 @@ _crawl_done     = threading.Event()   # set when initial crawl finishes
 _cdn_thread_sem = threading.Semaphore(32)  # cap concurrent CDN fetch threads
 
 # Regex for extracting URLs from arbitrary response bodies (DUMP_ALL mode).
-# Three cases, each with its own guard against a real false-positive class:
-#  1. Explicit https?:// — unambiguous, no extra guard needed.
-#  2. Protocol-relative //host/path — only counted right after a quote/paren,
-#     since that's how these are actually written (src="//cdn...",
-#     url(//fonts...)); without that guard, a bare "// like this" JS/CSS
-#     comment matches just as easily and gets "discovered" as a dead domain.
-#  3. Bare root-relative /path — only counted when NOT a continuation of a
-#     longer token (e.g. "foo/bar/baz" inside a string shouldn't yield a
-#     spurious "/bar/baz" match cut out of the middle of it).
+# Three alternatives, each with guards tuned to minimise false positives:
+#
+#  1. Explicit https?:// — the unambiguous case. The host char class stops at
+#     the first character that can't legally appear in a hostname, then the
+#     path/query portion is allowed the full RFC 3986 sub-delims + pchar set.
+#
+#  2. Protocol-relative //host/path — only matched right after a context
+#     character that genuinely precedes a URL in real code: quotes, parens,
+#     `=`, or `:`. This is how these are actually written (src="//cdn...",
+#     url(//fonts...), fetch("//api...")). Without that guard, a bare
+#     "// comment" in JS/CSS matches just as easily.
+#
+#  3. Bare root-relative /path — only matched when NOT a continuation of a
+#     longer token (so "foo/bar/baz" inside a string doesn't yield a spurious
+#     "/bar/baz"). Requires at least 2 chars to avoid matching "/" alone.
+#
+# Trailing punctuation (.,;:!?)]}>'"`\) that the greedy path class hoovers up
+# is trimmed post-match by _clean_url_match() — doing it in-regex would require
+# variable-length lookbehinds which Python's re doesn't support.
+_URL_HOST_CHARS  = rb"[a-zA-Z0-9\-._:]+"          # host + port
+_URL_PATH_CHARS  = rb"[a-zA-Z0-9\-._~:/?#@!$&'*+,;=%()"  # path + query
+_URL_TRAILING    = frozenset(b".,;:!?)\"'<>]}\\`")
+
 URL_REGEX = re.compile(
-    rb"https?:\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'*+,;=%]+"
-    rb"|(?<=[\"'(])\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&'*+,;=%]+"
-    rb"|(?<![a-zA-Z0-9_\/])\/(?!\/)[a-zA-Z0-9_\-\/.]{2,}"
+    rb"https?://" + _URL_HOST_CHARS + _URL_PATH_CHARS + rb"]*"
+    rb"|(?<=[\"'(=:])//" + _URL_HOST_CHARS + _URL_PATH_CHARS + rb"]*"
+    rb"|(?<![a-zA-Z0-9_/])/(?!/)[a-zA-Z0-9_\-/.]{2,}"
 )
+
+def _clean_url_match(m: bytes) -> bytes:
+    """Strip trailing punctuation that the greedy path class captures.
+
+    These characters are valid inside URLs (e.g. a comma in a query string)
+    but almost never appear at the very end of a real URL — they're sentence
+    punctuation, JS operators, or closing delimiters that the regex hoovers
+    up because they're in the path character class.
+    """
+    while m and m[-1] in _URL_TRAILING:
+        m = m[:-1]
+    return m
 
 # HTML tags that represent external sub-resources worth fetching
 _ASSET_TAGS = frozenset({"script", "img", "link", "source", "video", "audio"})
@@ -4543,6 +4880,14 @@ def _fetch_external_asset(u: str) -> None:
                 _register_cdn_host(netloc)
                 stats.inc("cdn_fetched")
                 log(f"{_fmt_host(netloc)}{urlparse(u).path}  [{_fmt_size(len(body))}]", "CDN")
+                # Push to GUI traffic log so background CDN fetches appear in
+                # the Hook Inspector — they're real requests the user needs to
+                # see, not just terminal noise.
+                _parsed_u = urlparse(u)
+                _gui_push_raw("GET", _parsed_u.path or "/", r.status_code,
+                              r.headers.get("Content-Type", "application/octet-stream"),
+                              body, display_tag="[CDN-BG]",
+                              origin=_fmt_host(netloc))
                 if CAPTURE and CAPTURE_CDN:
                     parsed_u = urlparse(u)
                     ctx_cdn  = HookContext(
@@ -4579,6 +4924,10 @@ def _save_worker() -> None:
                 if h in content_hashes:
                     save_queue.task_done(); continue
                 content_hashes.add(h)
+                # Cap memory — clear if too large (prevents OOM on long runs)
+                if len(content_hashes) > _CONTENT_HASHES_MAX:
+                    content_hashes.clear()
+                    content_hashes.add(h)
             # NOTE: we track saved_paths by the ORIGINAL path here. If the
             # write later remaps p to p/index.html (directory collision),
             # _save_worker updates saved_paths with the final write path
@@ -4591,6 +4940,10 @@ def _save_worker() -> None:
                     save_queue.task_done(); continue
                 # Tentatively mark as in-progress; removed on write failure.
                 saved_paths.add(original_p)
+                # Cap memory — clear if too large (prevents OOM on long runs)
+                if len(saved_paths) > _SAVED_PATHS_MAX:
+                    saved_paths.clear()
+                    saved_paths.add(original_p)
             # Record the real upstream Content-Type when it disagrees with what
             # the on-disk path/extension implies (e.g. an extensionless CSS/JS
             # URL that local_path() collapsed to .../index.html) — see resolve_mime().
@@ -4712,7 +5065,9 @@ def _maybe_capture(ctx: HookContext) -> None:
 
 def enqueue(u: str) -> None:
     # Only feed the crawler during the initial crawl phase.
-    # After crawl finishes, the proxy serves fresh from upstream — no need to re-crawl.
+    # After crawl finishes, the proxy serves fresh from upstream — no need
+    # to re-crawl. In procedural mode (CRAWL=False), _crawl_done is never
+    # set and no workers are running, so this is always a no-op.
     if not _crawl_done.is_set():
         url_queue.put(normalize_url(u))
 
@@ -4764,6 +5119,11 @@ def _crawl(u: str) -> None:
             else Fore.YELLOW if r.status_code < 400
             else Fore.RED)
     log(f"GET {sc_c}{r.status_code}{Style.RESET_ALL}  {host_disp}{path_short}  {_fmt_size(len(data))}", "CRAWL")
+    # Push crawl fetches to the GUI traffic log so they appear in the Hook
+    # Inspector alongside proxied requests — the user needs to see what the
+    # crawler is fetching, not just the terminal.
+    _gui_push_raw("GET", path_short, r.status_code, ct, data,
+                  display_tag="[CRAWL]", origin=host_disp)
 
     if r.status_code >= 400:
         stats.inc("http_errors")
@@ -4801,10 +5161,13 @@ def _crawl(u: str) -> None:
     if DUMP_ALL:
         for m in URL_REGEX.findall(data[:SCAN_LIMIT]):
             try:
-                found = m.decode("utf-8", "ignore")
-                p = urlparse(found)
-                if found.startswith(("data:", "javascript:")):
+                cleaned = _clean_url_match(m)
+                if not cleaned:
                     continue
+                found = cleaned.decode("utf-8", "ignore")
+                if found.startswith(("data:", "javascript:", "blob:", "mailto:", "tel:")):
+                    continue
+                p = urlparse(found)
                 if p.hostname in _LOCAL_HOSTS:
                     continue
                 enqueue(urljoin(u, found))
@@ -4824,17 +5187,85 @@ def _crawl_worker() -> None:
         _crawl(u)
         url_queue.task_done()
 
+# Persistent background discovery workers — stay alive AFTER the initial crawl
+# so URLs discovered by the proxy handler (link extraction from served pages)
+# continue to be crawled. Without this, the first browser navigation to a page
+# that wasn't in the initial crawl would serve the page live but never pre-cache
+# its sub-resources, forcing the user to reload to get a fully-cached page.
+_DISCOVERY_WORKERS = max(2, min(8, WORKERS // 4))
+_discovery_started  = threading.Event()
+
+def _discovery_worker() -> None:
+    """Long-lived crawl worker — processes the url_queue forever.
+
+    Started after the initial crawl finishes. The initial crawl's WORKERS
+    threads all exit (via None sentinels); these workers take over and keep
+    draining the queue so enqueue() calls from the proxy handler are honored.
+    """
+    while True:
+        u = url_queue.get()
+        if u is None:
+            url_queue.task_done()
+            return
+        try:
+            _crawl(u)
+        except Exception as e:
+            log(f"discovery crawl error {u}: {_short_exc(e)}", "WARN")
+        finally:
+            url_queue.task_done()
+
+def _start_discovery_workers() -> None:
+    if _discovery_started.is_set():
+        return
+    _discovery_started.set()
+    for i in range(_DISCOVERY_WORKERS):
+        threading.Thread(target=_discovery_worker, daemon=True,
+                         name=f"discovery-{i}").start()
+
+def _extract_links_async(html_body: bytes, base_url: str) -> None:
+    """Extract links from an HTML body (served by the proxy) and enqueue any
+    same-domain URLs for background crawling. Runs in its own thread so the
+    proxy response is never delayed by link parsing.
+
+    This is the key fix for the "reload more than once" bug: without it, the
+    first navigation to a page serves it live but never discovers its
+    sub-resources, so the browser has to fetch each one on demand (and some
+    JS may fail if a dependency isn't ready). With it, the discovery workers
+    pre-cache linked pages and assets in the background.
+    """
+    try:
+        soup = BeautifulSoup(html_body.decode("utf-8", "ignore"), "lxml")
+        for tag in soup.find_all(["a", "script", "img", "link", "iframe", "source"]):
+            v = tag.get("href") or tag.get("src")
+            if not v:
+                continue
+            abs_url = normalize_url(urljoin(base_url, v))
+            parsed  = urlparse(abs_url)
+            if parsed.hostname in _LOCAL_HOSTS:
+                continue
+            if is_allowed_domain(parsed.netloc):
+                enqueue(abs_url)
+            elif PROXY_CDN and is_external_domain(parsed.netloc) and tag.name in _ASSET_TAGS:
+                threading.Thread(target=_fetch_external_asset, args=(abs_url,),
+                                 daemon=True).start()
+    except Exception:
+        pass
+
 def crawl_parallel() -> None:
     workers = [threading.Thread(target=_crawl_worker, daemon=True, name=f"crawl-{i}")
                for i in range(WORKERS)]
     for w in workers:
         w.start()
     url_queue.join()
-    # Enqueue sentinels so all workers exit cleanly (one per worker).
+    # Enqueue sentinels so all INITIAL workers exit cleanly (one per worker).
+    # The persistent discovery workers are started AFTER, so they never see
+    # these sentinels.
     for _ in range(WORKERS):
         url_queue.put(None)
     save_queue.join()
-    _crawl_done.set()   # signals enqueue() to stop feeding the queue
+    _crawl_done.set()   # signals initial crawl is complete
+    # Start persistent discovery workers so newly-discovered URLs keep flowing.
+    _start_discovery_workers()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streaming helper  (large binary responses — video, WASM, big downloads)
@@ -4845,8 +5276,9 @@ def crawl_parallel() -> None:
 # Images are NOT here — they're usually small (<1MB) and buffering them is safe.
 # Only true large binary formats that would OOM the process belong here.
 _STREAM_CTS = frozenset({
-    "video/mp4", "video/webm", "video/ogg", "video/mpeg",
-    "audio/mpeg", "audio/ogg", "audio/webm",
+    "video/mp4", "video/webm", "video/ogg", "video/mpeg", "video/mp2t",
+    "audio/mpeg", "audio/ogg", "audio/webm", "audio/mp4", "audio/aac",
+    "audio/x-m4a", "audio/x-wav", "audio/wav",
     "application/octet-stream",
     "application/zip", "application/x-tar", "application/gzip",
     "application/wasm",
@@ -4963,6 +5395,13 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
         raw_chunks: list[bytes] = []
         total = 0
         completed = False
+        # Capture the first few KB of the DECOMPRESSED body for the GUI traffic
+        # log. Without this, streamed responses (audio/video 206, large files)
+        # show "(empty response)" in the Hook Inspector body editor because the
+        # body is never buffered — it goes straight to the browser. We grab a
+        # bounded prefix so the user can at least see what kind of content it is.
+        _gui_preview = bytearray()
+        _GUI_PREVIEW_MAX = 4096
         try:
             for chunk in upstream_r.iter_content(chunk_size=65536):
                 if chunk:
@@ -4971,32 +5410,66 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                     if total < _STREAM_CACHE_MAX_BYTES:
                         raw_chunks.append(chunk)
                     total += len(chunk)
-                    yield _decompress_chunk(chunk)
+                    _dec = _decompress_chunk(chunk)
+                    if len(_gui_preview) < _GUI_PREVIEW_MAX:
+                        _gui_preview.extend(_dec[:_GUI_PREVIEW_MAX - len(_gui_preview)])
+                    yield _dec
             completed = True
         except Exception as e:
             log(f"Stream error {urlparse(target).path}: {_short_exc(e)}", "WARN")
         finally:
             # Only cache if the stream completed normally AND we stayed within
-            # the memory bound. Partial/cancelled streams would poison the cache
-            # with truncated files that look valid to future cache hits.
-            if (method == "GET" and sc < 400 and completed
+            # the memory bound AND it's a full response (200, or 206 that
+            # covers the ENTIRE file — detected via Content-Range starting at 0).
+            # A 206 for "Range: bytes=1000-2000" is a partial slice and must
+            # NOT be cached (would overwrite the full file with a slice).
+            # But a 206 for "Range: bytes=0-" returns the whole file with
+            # status 206 — that IS cacheable.
+            _cr_header = ""
+            try:
+                _cr_header = upstream_r.headers.get("Content-Range", "") or ""
+            except Exception:
+                pass
+            _is_full_content = (sc == 200) or (
+                sc == 206 and _cr_header and _cr_header.startswith("bytes 0-"))
+            if (method == "GET" and _is_full_content and completed
                     and raw_chunks and total <= _STREAM_CACHE_MAX_BYTES):
                 full  = b"".join(raw_chunks)
                 plain = decompress_body(full, enc)
                 if not _is_wire_payload(plain) and not _is_bot_page(plain, sc):
                     save_queue.put((target, plain, ct))
                     stats.inc("saved")
-            elif total > _STREAM_CACHE_MAX_BYTES:
-                log(f"STREAM {method} {sc} {_fmt_host(urlparse(target).netloc)}{urlparse(target).path}"
-                    f" [{_fmt_size(total)}] — too large, not cached", "→")
+            # Single consolidated stream log line. Include "not cached" note
+            # when the stream was too large or didn't complete — previously
+            # this was a second separate log line, creating duplicate entries.
+            _not_cached_note = ""
+            if total > _STREAM_CACHE_MAX_BYTES:
+                _not_cached_note = " — too large, not cached"
+            elif not completed:
+                _not_cached_note = " — incomplete, not cached"
             log(f"STREAM {method} {sc} {_fmt_host(urlparse(target).netloc)}{urlparse(target).path}"
-                f" [{_fmt_size(total)}]", "→")
+                f" [{_fmt_size(total)}]{_not_cached_note}", "→")
+            # Push to the GUI traffic log. For 206/204 and other non-2xx the
+            # preview may be empty — that's fine, _gui_push_raw handles it.
+            # For large streams we show the preview prefix with a note.
+            _preview_bytes = bytes(_gui_preview)
+            if HOOK_GUI:
+                _path = urlparse(target).path or "/"
+                if total > _GUI_PREVIEW_MAX and _preview_bytes:
+                    _gui_body = (_preview_bytes
+                                 + f"\n... (streamed {_fmt_size(total)} total, showing first {_fmt_size(len(_preview_bytes))})"
+                                   .encode("utf-8", "replace"))
+                else:
+                    _gui_body = _preview_bytes
+                _gui_push_raw(method, _path, sc, ct, _gui_body,
+                              display_tag=f"[STREAM]",
+                              origin=_fmt_host(urlparse(target).netloc))
 
     return Response(stream_with_context(_gen()), status=sc,
                     headers=out_h, content_type=ct)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# WebSocket proxy  (Discord, Slack, real-time messaging apps)
+# WebSocket proxy  (real-time messaging apps, gateways with subprotocols)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5027,7 +5500,7 @@ _WS_PMDE_WINDOW_BITS = 15
 _WS_PMDE_MEM_LEVEL   = 8
 
 # Try to import zstandard for the (rare) servers that send zstd-encoded WS
-# messages — not part of any RFC, but seen in the wild on some game backends.
+# messages — not part of any RFC, but seen in the wild on some backends.
 try:
     import zstandard as _zstd
     _ZSTD_OK = True
@@ -5178,8 +5651,8 @@ def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
     that meant: T=0 tunnel opens (last_pong=T0), T=20 first ping sent +
     immediately checked → 20 < 30, OK; T=40 second ping sent + checked →
     40 > 30 → tunnel declared dead at T=40, regardless of whether the
-    upstream ever ponged. The 40-second death we saw on Discord's gateway
-    matches this exactly.
+    upstream ever ponged. The 40-second death we saw on a real-time
+    gateway matches this exactly.
 
     The fix: track the timestamp of the LAST PING SENT separately from
     last_pong. After sending a ping, wait WS_PONG_TIMEOUT for a pong. If
@@ -5315,10 +5788,10 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False)
         the upstream (Sec-WebSocket-Extensions is stripped from the outbound
         handshake), so upstream frames are NEVER permessage-deflate compressed.
         Trying to inflate them either errored out (raw deflate vs. zlib-wrapped
-        Discord payloads → "incorrect header check") or silently returned the
+        application payloads → "incorrect header check") or silently returned the
         raw bytes via the exception handler, then re-compressed the result and
         shipped it to the browser WITHOUT setting RSV1 — so the browser
-        couldn't tell it was compressed and applied its own (Discord
+        couldn't tell it was compressed and applied its own (application-level
         zlib-stream) decompressor to mangled bytes.
 
         The correct flow: upstream frames are always plain (rsv1=False in
@@ -5442,7 +5915,7 @@ def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
     3-tuple discarded RSV1, forcing the pump to guess whether a frame was
     compressed based solely on the negotiated use_deflate flag — which broke
     for any frame the peer chose not to compress, and made it impossible to
-    distinguish permessage-deflate from Discord's unrelated zlib-stream scheme.
+    distinguish permessage-deflate from an application's unrelated zlib-stream scheme.
 
     Returns None on EOF, timeout, or protocol error.
     """
@@ -5473,9 +5946,9 @@ def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
                 return None
         # Cap payload size to prevent a malicious or buggy peer from
         # exhausting memory with a multi-GB frame. 8 MiB is well above any
-        # legitimate WS message (Discord gateway payloads are < 100 KB;
-        # even Slack's max is 1 MB). Anything bigger is almost certainly an
-        # attack or a desync.
+        # legitimate WS message (typical gateway payloads are < 100 KB;
+        # even the largest real-time APIs cap at ~1 MB). Anything bigger is
+        # almost certainly an attack or a desync.
         if pay_len > WS_MAX_MSG_BYTES:
             log(f"WS frame too large ({pay_len} bytes > {WS_MAX_MSG_BYTES}) — dropping",
                 "WARN")
@@ -5494,8 +5967,8 @@ def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
         if masked:
             # Fast C-level unmask instead of per-byte Python loop — the
             # original `bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))`
-            # path was the #1 CPU hot spot on busy WS tunnels (Discord
-            # gateway can push hundreds of small frames per second).
+            # path was the #1 CPU hot spot on busy WS tunnels (active
+            # gateways can push hundreds of small frames per second).
             mk = mask_key
             payload = _ws_unmask(payload, mk)
         return fin, rsv1, opcode, payload
@@ -5517,7 +5990,7 @@ def _ws_make_frame(opcode: int, payload: bytes, mask: bool = False,
     lacks RSV1. The previous version had no way to set RSV1, so every
     "compressed" frame it emitted was indistinguishable from a plain frame —
     the receiver either parsed raw deflate bytes as JSON (garbage) or, on
-    Discord's gateway, applied its own zlib-stream decompressor to the
+    an application using its own zlib-stream, applied its decompressor to the
     mangled payload and crashed with "zlib error, -3, incorrect header check".
     """
     l = len(payload)
@@ -5542,7 +6015,7 @@ class _RawSocketUpstreamWS:
     """Upstream WS connection over a bare Python `ssl` socket.
 
     This was the only implementation before, and it's why WS endpoints
-    behind an anti-bot WAF (Discord's gateway, similar Cloudflare-fronted
+    behind an anti-bot WAF (CF-protected gateways, similar Cloudflare-fronted
     realtime APIs) failed the handshake every single time: those edges
     fingerprint the *opening TLS ClientHello* (JA3/JA4), and Python's `ssl`
     module produces one that's trivially distinguishable from a real
@@ -5555,13 +6028,25 @@ class _RawSocketUpstreamWS:
     def __init__(self, ws_url: str, extra_headers: dict):
         parsed  = urlparse(ws_url)
         use_ssl = ws_url.startswith("wss://")
-        host    = parsed.hostname
+        host    = parsed.hostname    # strips [] from IPv6 literals
         port    = parsed.port or (443 if use_ssl else 80)
         path_qs = parsed.path or "/"
         if parsed.query:
             path_qs += "?" + parsed.query
+        # For the Host header, reconstruct the netloc with brackets for IPv6.
+        # parsed.hostname strips brackets, but HTTP Host: must include them.
+        if ":" in (host or "") and not host.startswith("["):
+            host_hdr = f"[{host}]"
+        else:
+            host_hdr = host or ""
+        if port and not ((use_ssl and port == 443) or (not use_ssl and port == 80)):
+            host_hdr = f"{host_hdr}:{port}"
+        # SNI: don't send an IP literal as server_hostname — many servers/WAFs
+        # reject SNI that looks like an IP (RFC 6066 says SNI is for DNS names).
+        # Pass None for IP literals so OpenSSL sends an empty SNI extension.
+        sni_hostname = host if host and not _is_ip_literal(host) else None
 
-        raw = socket.create_connection((host, port), timeout=10)
+        raw = socket.create_connection((host, port), timeout=15)
         srv = raw
         try:
             if use_ssl:
@@ -5584,14 +6069,16 @@ class _RawSocketUpstreamWS:
                     except ssl.SSLError:
                         pass
                 except Exception:
-                    # Every other outbound request in this file uses verify=False —
-                    # this fallback context was the one place that still enforced real
-                    # certificate validation, silently rejecting upstreams the rest of
-                    # the proxy treats as fine.
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode    = ssl.CERT_NONE
-                srv = ctx.wrap_socket(raw, server_hostname=host)
+                # Set a longer timeout for the TLS handshake — IPv6 connections
+                # to remote servers can take longer than the default, and a timeout
+                # here produces "The handshake operation timed out" which the
+                # user saw in the log.
+                raw.settimeout(30)
+                srv = ctx.wrap_socket(raw, server_hostname=sni_hostname)
+                raw.settimeout(15)   # back to normal for WS handshake
 
             # RFC 6455 §4.1: Sec-WebSocket-Key is 16 random bytes, base64-encoded
             # DIRECTLY — no hashing. SHA1 only enters the picture on the SERVER
@@ -5605,7 +6092,7 @@ class _RawSocketUpstreamWS:
             key = base64.b64encode(os.urandom(16)).decode()
             hdrs = [
                 f"GET {path_qs} HTTP/1.1",
-                f"Host: {host}",
+                f"Host: {host_hdr}",
                 "Upgrade: websocket",
                 "Connection: Upgrade",
                 f"Sec-WebSocket-Key: {key}",
@@ -5673,8 +6160,8 @@ def _get_session_for_ws():
     """Get a session for the WS connection.
 
     FIX v3: Try to reuse the client session (which has cf_clearance cookies and
-    the same TLS fingerprint as the main page). This is critical for Discord,
-    Slack, and other CF-protected WS endpoints — a fresh session gets 403'd.
+    the same TLS fingerprint as the main page). This is critical for
+    CF-protected WS endpoints — a fresh session gets 403'd.
 
     Returns (session, should_close):
       - should_close=False: shared session, do NOT close after use
@@ -5715,13 +6202,22 @@ class _CffiUpstreamWS:
     """
 
     def __init__(self, ws_url: str, extra_headers: dict):
+        # curl_cffi has a known bug with IPv6 address literals in ws_connect:
+        # "TLS connect error: error:00000000:invalid library" — the internal
+        # OpenSSL layer chokes on IPv6 SNI. Skip curl_cffi entirely for IPv6
+        # literals and let _ws_connect_upstream fall through to the raw-socket
+        # path, which now handles IPv6 SNI correctly (None for IP literals).
+        _parsed_ws = urlparse(ws_url)
+        _ws_host = _parsed_ws.hostname or ""
+        if _is_ip_literal(_ws_host):
+            raise RuntimeError(f"curl_cffi skipped for IP literal {_ws_host} (known IPv6 TLS bug)")
         hdrs = {k: v for k, v in extra_headers.items()
                 if k.lower() not in ("host", "upgrade", "connection",
                                       "sec-websocket-key", "sec-websocket-version",
                                       "sec-websocket-extensions", "accept-encoding")}
         # FIX v3: Reuse the CLIENT session (which has cf_clearance cookies +
         # the same TLS fingerprint as the main page) instead of creating a
-        # fresh one. This is what fixes Discord/Slack/CF-protected WS endpoints
+        # fresh one. This is what fixes CF-protected WS endpoints
         # — a fresh session has no cookies and gets 403'd by Cloudflare.
         sess, should_close = _get_session_for_ws()
         if not hasattr(sess, "ws_connect"):
@@ -5749,7 +6245,7 @@ class _CffiUpstreamWS:
         # FIXED: curl_cffi's WebSocket object is NOT thread-safe. Concurrent
         # send() (from keepalive thread) and recv() (from relay thread) corrupt
         # internal buffers, producing garbled data that desyncs the browser's
-        # application-level decompressor (Discord zlib-stream: "invalid stored
+        # application-level decompressor (e.g. zlib-stream: "invalid stored
         # block lengths"). This lock serializes ALL access to self._ws.
         # Note: recv() is a blocking call — while it holds the lock, send()
         # will block until recv() returns. This means keepalive pings only fire
@@ -5846,7 +6342,11 @@ def _ws_connect_upstream(ws_url: str, extra_headers: dict):
         try:
             return _CffiUpstreamWS(ws_url, extra_headers)
         except Exception as e:
-            log(f"curl_cffi WS connect failed ({_short_exc(e)}), falling back to raw socket", "DEBUG")
+            # _CffiUpstreamWS already logs the curl_cffi failure at WARN.
+            # Only log here if it was the IPv6-skip (which raises before the
+            # WARN log) so the user sees why we fell back to raw socket.
+            if "IPv6" in str(e) or "IP literal" in str(e):
+                log(f"WS: {e} — using raw socket fallback", "INFO")
     return _RawSocketUpstreamWS(ws_url, extra_headers)
 
 def _pump_ws_frames(client_sock, srv, ws_url: str) -> None:
@@ -5934,7 +6434,7 @@ def _pump_ws_frames(client_sock, srv, ws_url: str) -> None:
     t1.start(); t2.start()
     stop.wait()
     # Close BOTH sides. Only closing `srv` here leaked the browser-side socket
-    # on every WS teardown — harmless for a single game, but `.io` titles open
+    # on every WS teardown — harmless for a single connection, but `.io` titles open
     # many short-lived WS connections per session and this exhausted file
     # descriptors over time, surfacing as unrelated-looking "connection refused"
     # errors later in the same run.
@@ -6088,11 +6588,11 @@ def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
 # Route:  /__s2l_tcp__/<host:port>          (TCP)
 # Route:  /__s2l_udp__/<host:port>          (UDP)
 #
-# The browser opens:  new WebSocket("ws://localhost:PORT/__s2l_tcp__/game.com:43594")
+# The browser opens:  new WebSocket("ws://localhost:PORT/__s2l_tcp__/server.example.com:43594")
 # Each WS message (binary or text) is forwarded as a raw TCP segment.
 # Each TCP segment received is framed back as a WS binary message.
 #
-# This is enough for most browser games / custom-protocol apps that need
+# This is enough for most browser apps / custom-protocol apps that need
 # a persistent socket. It does NOT support UDP multicast or broadcast.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -6360,8 +6860,7 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             try:
                 srv = _ws_connect_upstream(ws_url, extra_fwd)
             except Exception as exc:
-                log(f"WS upstream FAILED: {exc}", "WARN")
-                log(f"  Origin sent: {extra_fwd.get('Origin', '?')}", "WARN")
+                log(f"WS upstream FAILED: {ws_url} — {_short_exc(exc)}", "WARN")
                 try:
                     err_msg = str(exc)[:200].encode("utf-8", "replace")
                     client_sock.sendall(
@@ -6385,8 +6884,8 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             # we deflate/inflate on our end — corrupting every frame. There is
             # exactly one handshake response; a second one isn't valid HTTP.
             #
-            # FIXED: zlib-stream guard. Some endpoints (notably Discord's
-            # gateway, via ?compress=zlib-stream) layer their OWN zlib
+            # FIXED: zlib-stream guard. Some endpoints (notably real-time
+            # gateways via ?compress=zlib-stream) layer their OWN zlib
             # compression at the application level — it is NOT permessage-
             # deflate (RFC 7692), the frames do NOT set RSV1, and the bytes
             # are zlib-wrapped (2-byte 0x78 0x9C header) rather than raw
@@ -6627,8 +7126,8 @@ def _is_sw_path(path: str) -> bool:
         _sw_re = re.compile(r"(?:^|/)(?:service[-_]?worker|sw|serviceworker)\.js(?:[?#]|$)", re.IGNORECASE)
         _is_sw_path._re = _sw_re
     return bool(_sw_re.search(path))
-# Minimal no-op service worker. Does NOT delete caches — SPAs (Discord, Twitter,
-# YouTube) rely on their SW caches for app-shell/bundle loading. Wiping them on
+# Minimal no-op service worker. Does NOT delete caches — SPAs and real-time
+# apps rely on their SW caches for app-shell/bundle loading. Wiping them on
 # every activate forces a full re-fetch of every chunk, which on flaky networks
 # hangs the SPA init indefinitely (blank page). The no-op SW just claims clients
 # and passes fetch events through without interception, so the SPA's own fetch
@@ -6766,7 +7265,7 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
 
     # ── HTTP/2 empty body bug workaround ─────────────────────────────────────
     # curl_cffi occasionally returns empty content on first request for HTTP/2
-    # multiplexed responses (chunked API endpoints like Discord /api/v9/*).
+    # multiplexed responses (chunked API endpoints using HTTP/2).
     # Status 200/201 with 0 bytes and no explicit Content-Length: 0 → retry once.
     #
     # CRITICAL: reuse the SAME session (with cookies + Authorization) — do NOT
@@ -7028,7 +7527,7 @@ def ext_asset(extpath: str) -> Response:
     qs       = flask_request.query_string.decode("utf-8", "ignore")
 
     # Recover a still-percent-encoded object path when possible — see
-    # _raw_path_after() for why this matters (Firebase Storage %2F keys, etc.)
+    # _raw_path_after() for why this matters (object-key %2F paths, etc.)
     _raw_rest = _raw_path_after(_EXT_PREFIX + "/")
     if _raw_rest is not None:
         _raw_slash = _raw_rest.find("/")
@@ -7055,7 +7554,8 @@ def ext_asset(extpath: str) -> Response:
         result = _serve_cached(lp, real_url)
         if result is not None:
             data, ct = result
-            _gui_push_raw("GET", f"[cdn] {ext_host}{ext_path}", 200, ct, data)
+            _gui_push_raw("GET", ext_path, 200, ct, data,
+                          display_tag=f"[CDN]", origin=ext_host)
             resp = Response(data, content_type=ct)
             resp.headers["Cache-Control"] = "public, max-age=86400"
             resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -7090,26 +7590,27 @@ def ext_asset(extpath: str) -> Response:
         if method in _BODY_METHODS:
             kw["data"] = ctx.req_body
         # Per-client session — see the matching comment in _cdn_serve. This is
-        # the exact path a brand-new per-game host (e.g. a freshly-seen
-        # <uuid>.gdn.example-cdn.com) goes through on its first request, before it
+        # the exact path a brand-new per-host CDN (e.g. a freshly-seen
+        # <uuid>.cdn.example.com) goes through on its first request, before it
         # has its own MULTIPORT port, so it's the one most likely to need
         # whatever session/consent state the main page already established.
         # Decide whether to stream based on Range header and path extension.
-        # Without this, video/audio from external CDNs (e.g. YouTube's
-        # googlevideo.com) is fully buffered in memory with a 12s read
+        # Without this, video/audio from external CDNs (e.g. video
+        # streaming CDNs) is fully buffered in memory with a 12s read
         # timeout, causing playback to stall after ~30-40s.
         _has_range = bool(flask_request.headers.get("Range", ""))
         _do_stream_ext = method in _SAFE_METHODS and (
             _has_range or _should_stream(guess_mime(ext_path)))
         kw["stream"] = _do_stream_ext
         r    = _get_client_session().request(method, real_url, **kw)
-        # If streaming, check the real Content-Type/Length and hand off to
-        # _stream_resp before consuming any body bytes.
+        # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
+        # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
+        # large binary files (.tar bundles, .wasm, video, etc), producing
+        # "0.0B" bodies even though the server returned 200 with real content.
+        # The stream-mode r.content read is unreliable — _stream_resp reads
+        # chunk-by-chunk and is always correct.
         if _do_stream_ext:
-            _real_ct_e = r.headers.get("Content-Type", "")
-            _real_cl_e = int(r.headers.get("Content-Length", "0") or 0)
-            if _should_stream(_real_ct_e, _real_cl_e):
-                return _stream_resp(r, method, real_url)
+            return _stream_resp(r, method, real_url)
         body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
         ct   = r.headers.get("Content-Type", "application/octet-stream")
         # Only save real 200 responses with content — 304 has empty body and saving
@@ -7128,7 +7629,7 @@ def ext_asset(extpath: str) -> Response:
         if method in _SAFE_METHODS:
             out_headers["Cache-Control"] = "public, max-age=86400"
         # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
-        # through the proxy (critical for game iframes served via /__s2l_ext__/).
+        # through the proxy (critical for cross-origin iframes served via /__s2l_ext__/).
         _ct_base_e = ct.split(";")[0].strip().lower()
         if r.status_code < 400 and PROXY_CDN:
             if "text/html" in _ct_base_e:
@@ -7154,7 +7655,7 @@ def ext_asset(extpath: str) -> Response:
 
         log(f"ext {method} {ctx.resp_status} {_fmt_host(ext_host)}{ext_path} {_fmt_size(len(ctx.resp_body))}", "CDN")
         _gui_push_raw(method, ext_path, ctx.resp_status, ctx.resp_ct, ctx.resp_body,
-                      display_tag="[ext]")
+                      display_tag="[EXT]", origin=_fmt_host(ext_host))
         if CAPTURE and CAPTURE_CDN:
             _maybe_capture(ctx)
         return Response(ctx.resp_body, status=ctx.resp_status, headers=ctx.resp_headers, content_type=ctx.resp_ct)
@@ -7168,9 +7669,9 @@ def ext_asset(extpath: str) -> Response:
 # ── /__s2l_udp__/<host:port>             —  raw UDP tunnel via WebSocket transport ──
 #
 # The S2L JS injector rewrites:
-#     new WebSocket("wss://game-server.com:8443/ws?token=xxx")
+#     new WebSocket("wss://ws.example.com:8443/ws?token=xxx")
 # to:
-#     new WebSocket("ws://localhost:PORT/__s2l_ws_ext__/game-server.com:8443/ws?token=xxx")
+#     new WebSocket("ws://localhost:PORT/__s2l_ws_ext__/ws.example.com:8443/ws?token=xxx")
 #
 # A real WS upgrade to any of these three paths is intercepted and fully
 # handled at the socket layer by _S2LWSGIRequestHandler._handle_ws_direct()
@@ -7203,15 +7704,15 @@ def udp_ext(udppath: str) -> Response:
 # Firefox (like every browser) exempts "localhost"/"127.0.0.1" from whatever
 # proxy is configured in its network settings — there's no way to see traffic
 # the browser sends to our OWN reverse-proxy port by pointing Firefox's proxy
-# at us. The workaround: Firefox does NOT exempt the real target domain (e.g.
-# discord.com), so if the browser tab stays on the real domain, that traffic
-# DOES get routed through this proxy like any other site — and for the one
-# domain actively being cloned (MAIN_HOST, or a registered MULTIPORT CDN
-# host) we transparently redirect it to the local site2local server instead
-# of the real internet. That's the "passthru": the browser never notices,
-# it's just talking to discord.com as far as it's concerned. Every OTHER
-# domain visited while this is on gets relayed to the real upstream
-# untouched, purely for inspection/hooking (the Firefox Proxy tab below).
+# at us. The workaround: Firefox does NOT exempt the real target domain, so
+# if the browser tab stays on the real domain, that traffic DOES get routed
+# through this proxy like any other site — and for the one domain actively
+# being cloned (MAIN_HOST, or a registered MULTIPORT CDN host) we
+# transparently redirect it to the local site2local server instead of the
+# real internet. That's the "passthru": the browser never notices, it's just
+# talking to the real domain as far as it's concerned. Every OTHER domain
+# visited while this is on gets relayed to the real upstream untouched,
+# purely for inspection/hooking (the Firefox Proxy tab below).
 #
 # This is a real man-in-the-middle: it terminates TLS using a locally
 # generated root CA (one-time Firefox import — instructions are logged at
@@ -7622,7 +8123,8 @@ def proxy(path: str) -> Response:
     if (not OFFLINE
             and purpose in ("prefetch", "prerender")
             and _sec_dest in ("document", "", "frame", "iframe")):
-        _gui_push_raw(method, req_path, 204, "text/plain", b"")
+        _gui_push_raw(method, req_path, 204, "text/plain", b"",
+                      origin=MAIN_HOST)
         return Response(status=204)  # No Content
     # NOTE: no Upgrade:websocket branch here — _S2LWSGIRequestHandler
     # intercepts every WS upgrade at the socket layer before this view ever
@@ -7631,18 +8133,21 @@ def proxy(path: str) -> Response:
 
     # Service worker — no-op SW
     if _is_sw_path(req_path):
-        _gui_push_raw(method, req_path, 200, "application/javascript", _SW_NOOP)
+        _gui_push_raw(method, req_path, 200, "application/javascript", _SW_NOOP,
+                      origin=MAIN_HOST)
         resp = Response(_SW_NOOP, content_type="application/javascript; charset=utf-8")
         resp.headers["Service-Worker-Allowed"] = "/"
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
     if any(x in target for x in BLOCK_PATHS):
-        _gui_push_raw(method, req_path, 403, "text/plain", b"Blocked")
+        _gui_push_raw(method, req_path, 403, "text/plain", b"Blocked",
+                      origin=MAIN_HOST)
         return Response("Blocked", status=403)
 
     if method == "OPTIONS":
-        _gui_push_raw("OPTIONS", req_path, 204, "text/plain", b"")
+        _gui_push_raw("OPTIONS", req_path, 204, "text/plain", b"",
+                      origin=MAIN_HOST)
         r = Response(status=204)
         _req_origin = flask_request.headers.get("Origin", "")
         r.headers.update({
@@ -7689,14 +8194,15 @@ def proxy(path: str) -> Response:
                         _rng_resp.headers["Access-Control-Allow-Origin"] = "*"
                         _rng_resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                         log(f"{method:6} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
-                        _gui_push_raw(method, req_path, 206, ct_off, _slice)
+                        _gui_push_raw(method, req_path, 206, ct_off, _slice,
+                                      origin=MAIN_HOST)
                         return _rng_resp
                 r = _cached_response(lp, target, method, req_path)
                 if r is not None:
                     return r
             # Fallback: try alternate CDN hosts that may have this path cached.
             # In OFFLINE mode the main-host 404 fallback below never runs, so
-            # without this a web-game asset cached on a CDN host but requested
+            # without this an asset cached on a CDN host but requested
             # against the main host returns 404.
             if PROXY_CDN:
                 req_path_cdn = urlparse(target).path
@@ -7718,7 +8224,8 @@ def proxy(path: str) -> Response:
             # the client gets a deterministic status instead of misleading 404.
             return Response("Offline — method not supported, GET cached",
                             status=405, headers={"Allow": "GET, HEAD"})
-        _gui_push_raw(method, req_path, 404, "text/plain", b"Offline")
+        _gui_push_raw(method, req_path, 404, "text/plain", b"Offline",
+                      origin=MAIN_HOST)
         return Response("Offline — not cached", status=404)
 
     if method in _SAFE_METHODS:
@@ -7726,7 +8233,7 @@ def proxy(path: str) -> Response:
         # IMPORTANT: Range requests MUST always hit upstream.
         # Serving a full file from disk cache in response to "Range: bytes=X-Y"
         # causes the browser to receive a 200 instead of 206 Partial Content —
-        # video players (YouTube, HTML5 <video>) interpret this as a truncated
+        # video players (HTML5 <video>) interpret this as a truncated
         # stream and loop / stall indefinitely.
         _has_range = bool(flask_request.headers.get("Range", ""))
         if os.path.isfile(lp) and not _has_range:
@@ -7740,14 +8247,21 @@ def proxy(path: str) -> Response:
     if _REQ_HOOKS:
         stats.inc("hooks_run", _run_hooks(_REQ_HOOKS, ctx))
 
-    # Request with stream=True for ALL safe methods so the body isn't
-    # pre-consumed inside _do_upstream — the actual stream-to-browser decision
-    # happens later based on the REAL Content-Type/Length. This is necessary
-    # because URLs without extensions (YouTube /videoplayback, many CDN video
-    # endpoints) would otherwise buffer the entire video in memory with a 12s
-    # read timeout, causing playback to stall after ~30-40s.
+    # Decide whether to use stream=True for the upstream request.
+    # stream=True is needed for: Range requests (audio/video 206), and URLs
+    # whose extension suggests streamable content (video/audio/wasm/large bin).
+    # For everything else (HTML/CSS/JS/JSON/fonts/images), stream=False is
+    # more reliable — curl_cffi's HTTP/2 stream mode can return empty bytes
+    # for small static files, causing the "Stream-mode empty body" warnings
+    # and forcing an expensive re-fetch.
     _has_range = bool(flask_request.headers.get("Range", ""))
-    _do_stream = method in _SAFE_METHODS
+    _req_ext = os.path.splitext(urlparse(target).path)[1].lower()
+    _looks_streamable = _req_ext in (
+        ".mp4", ".webm", ".ogg", ".ogv", ".mpeg", ".mp2t", ".m3u8",
+        ".mp3", ".m4a", ".aac", ".wav", ".opus",
+        ".wasm", ".zip", ".tar", ".gz", ".tgz", ".bz2",
+    )
+    _do_stream = method in _SAFE_METHODS and (_has_range or _looks_streamable)
 
     try:
         upstream_r = _do_upstream(method, target, ctx, stream=_do_stream)
@@ -7817,12 +8331,15 @@ def proxy(path: str) -> Response:
 
             hist_path = urlparse(hist_url).path or "/"
             hist_ct = hist_resp.headers.get("Content-Type", "application/octet-stream")
+            _hist_origin = _fmt_host(urlparse(hist_url).netloc)
             _gui_push_raw(
                 method,
                 hist_path,
                 hist_resp.status_code,
                 hist_ct,
-                hist_body if hist_body else f"(redirect {hist_resp.status_code})".encode()
+                hist_body if hist_body else f"(redirect {hist_resp.status_code})".encode(),
+                display_tag="[REDIR]",
+                origin=_hist_origin,
             )
 
     # ── Streaming: hand off immediately for large/binary content ─────────────
@@ -7834,7 +8351,18 @@ def proxy(path: str) -> Response:
     # which re-buffers to event boundaries and injects keepalives.
     if SSE_PROXY and _is_sse_response(_real_ct) and method in _SAFE_METHODS:
         return _stream_sse_resp(upstream_r, method, target)
-    if _do_stream and _should_stream(_real_ct, _real_cl) and method in _SAFE_METHODS:
+    # Streaming hand-off: if we fetched with stream=True AND the response is
+    # streamable content (audio/video/large binary) OR a 206 Partial Content
+    # (Range request), hand off to _stream_resp. CRITICAL: when stream=True
+    # was used, we must NOT fall through to upstream_r.content for 206/range
+    # responses — curl_cffi's HTTP/2 stream mode can return empty bytes for
+    # partial content chunks, producing "0.0B" bodies that break audio/video
+    # playback. _stream_resp reads the stream chunk-by-chunk and is reliable.
+    _has_content_range = bool(upstream_r.headers.get("Content-Range", ""))
+    if (_do_stream and method in _SAFE_METHODS
+            and (_should_stream(_real_ct, _real_cl)
+                 or upstream_r.status_code == 206
+                 or _has_content_range)):
         return _stream_resp(upstream_r, method, target)
 
     # Decompress upstream body before we do anything with it.
@@ -7949,7 +8477,7 @@ def proxy(path: str) -> Response:
     #      curl_cffi usually auto-decompresses, but some encodings (zstd, malformed
     #      brotli) slip through. Fix: re-fetch with Accept-Encoding: identity.
     #
-    #   B) Discord / Slack API endpoints using chunked Transfer-Encoding.
+    #   B) API endpoints using chunked Transfer-Encoding.
     #      No Content-Length header, yet body should be JSON. curl_cffi occasionally
     #      returns empty content for HTTP/2 multiplexed responses on the first try.
     #      Fix: retry via _do_upstream with a fresh session & stripped Accept-Encoding.
@@ -7972,8 +8500,8 @@ def proxy(path: str) -> Response:
     # FIXED: previously excluded only 204/304. But 4xx (404 Not Found, 429 Too
     # Many Requests) and 5xx responses also legitimately have small bodies that
     # curl_cffi sometimes returns empty (it doesn't always read the body for
-    # error responses). Re-fetching those caused cascading 429s on Discord's
-    # API — every 404 for an entitlement/eligibility endpoint triggered a
+    # error responses). Re-fetching those caused cascading 429s on
+    # rate-limited APIs — every 404 for an endpoint triggered a
     # retry that itself got rate-limited, compounding the problem. Now we only
     # re-fetch decompression failures for 2xx (excluding 204), where an empty
     # body really does indicate a bug.
@@ -7988,7 +8516,7 @@ def proxy(path: str) -> Response:
     # Case B: JSON API endpoint, empty body, chunked (no Content-Length), status 200
     # Only for GET/HEAD — POST/DELETE intentionally return empty 200.
     # FIXED: was triggering on 4xx/5xx too because the original check was
-    # `status_code == 200`. But Discord returns 429 with an empty JSON body
+    # `status_code == 200`. But rate-limited APIs return 429 with an empty JSON body
     # when rate-limited, and 404 with an empty body for non-existent resources
     # — re-fetching those just burns the rate-limit budget faster. Now we
     # explicitly require 200 (or 206 for partial content) AND Content-Type
@@ -8031,7 +8559,7 @@ def proxy(path: str) -> Response:
             retry_fwd      = dict(ctx.req_headers)
             # Force no compression on retry — defeats decompression failures
             retry_fwd["Accept-Encoding"] = "identity"
-            # Preserve Authorization header explicitly (Discord Bearer tokens)
+            # Preserve Authorization header explicitly (Bearer tokens)
             orig_auth = flask_request.headers.get("Authorization", "")
             if orig_auth and "authorization" not in {k.lower() for k in retry_fwd}:
                 retry_fwd["Authorization"] = orig_auth
@@ -8190,7 +8718,26 @@ def proxy(path: str) -> Response:
     )
     if _should_save:
         save_queue.put((target, ctx.resp_body, ctx.resp_ct))
+        # Mark this URL as visited so the crawler doesn't fetch it again.
+        # The proxy already fetched it — re-fetching is wasteful and creates
+        # duplicate log entries. enqueue() still runs for link extraction
+        # but _crawl() will skip it immediately via the visited set.
+        _norm_target = normalize_url(target)
+        with visited_lock:
+            visited.add(_norm_target)
         enqueue(target)
+        # Extract links from served HTML so the discovery workers pre-cache
+        # sub-pages and assets — this is what makes the FIRST page load work
+        # fully without needing a reload to trigger crawling.
+        # Only in bulk mode (CRAWL=True) — in procedural mode (CRAWL=False)
+        # there are no discovery workers to process the enqueued links.
+        if CRAWL and is_html(ctx.resp_body, ctx.resp_ct) and not OFFLINE:
+            threading.Thread(
+                target=_extract_links_async,
+                args=(ctx.resp_body, target),
+                daemon=True,
+                name="link-extract",
+            ).start()
 
     # HTML + CSS + JSON post-processing
     _is_html = is_html(ctx.resp_body, ctx.resp_ct)
@@ -8309,11 +8856,10 @@ def _banner() -> None:
     elif PROXY_CDN:               flags.append(f"{Y}cdn:live{R}")
     if MULTIPORT:     flags.append(f"{M}multiport{R}")
     if SHOW_HIDDEN:   flags.append(f"{G}show-hidden{R}")
-    if SCAN_PATHS:    flags.append(f"{Style.BRIGHT+Fore.RED}scan-paths{R}")
+    if SCAN_PATHS:    flags.append(f"{Style.BRIGHT+Fore.RED}scan:{SCAN_PATHS}{R}")
     if CAPTURE:       flags.append(f"{Style.BRIGHT+Fore.RED}capture{R}")
     if HOOK_GUI:      flags.append(f"{Y}hook-gui{R}")
     if FIREFOX_PROXY: flags.append(f"{Style.BRIGHT+Fore.CYAN}firefox-proxy:{FIREFOX_PROXY_PORT}{R}")
-    # v2 features
     if WS_PING_INTERVAL > 0:  flags.append(f"{G}ws-keepalive:{WS_PING_INTERVAL}s{R}")
     if WS_DEFLATE:            flags.append(f"{G}ws-deflate{R}")
     if WS_AUTO_RECONNECT:     flags.append(f"{G}ws-reconnect{R}")
@@ -8322,57 +8868,89 @@ def _banner() -> None:
     if _CURL_CFFI_OK:         flags.append(f"{C}h2{R}")
     if TCP_TUNNEL:            flags.append(f"{M}tcp-tunnel{R}")
     if UDP_TUNNEL:            flags.append(f"{M}udp-tunnel{R}")
-    flag_str   = f"  {DIM}·{R}  ".join(flags) if flags else f"{DIM}none{R}"
+    flag_str   = f" {DIM}·{R} ".join(flags) if flags else f"{DIM}none{R}"
 
     hook_str   = (f"{Y}{n_hooks} hook{'s' if n_hooks != 1 else ''}{R}"
                   if n_hooks else f"{DIM}none{R}")
-    device_str = (f"{W}{DEVICE}{R}  {DIM}(auto-mirrors browser UA){R}"
+    device_str = (f"{W}{DEVICE}{R} {DIM}(auto-mirrors browser UA){R}"
                   if DEVICE == "auto" else f"{W}{DEVICE}{R}")
 
-    bypass_eng = (f"{G}curl_cffi{R}  {DIM}(TLS profile auto-matched to device){R}" if _CURL_CFFI_OK
-                  else f"{Y}cloudscraper{R}  {DIM}(tip: pip install curl-cffi for better CF bypass){R}")
+    bypass_eng = (f"{G}curl_cffi{R} {DIM}(TLS profile auto-matched to device){R}" if _CURL_CFFI_OK
+                  else f"{Y}cloudscraper{R} {DIM}(pip install curl-cffi for better CF bypass){R}")
 
-    print(f"""
-{C}  ╔══════════════════════════════════════════════════════╗{R}
-{C}  ║{W}           S I T E  2  L O C A L    {G}V8.0{R}  {C}║{R}
-{C}  ╠══════════════════════════════════════════════════════╣{R}
-{C}  ║{R}  {DIM}Target:  {R}  {G}{MAIN_HOST}{R}  {DIM}({ip}){R}
-{C}  ║{R}  {DIM}Proxy:   {R}  {W}http://{HOST}:{PORT}{R}
-{C}  ║{R}  {DIM}Device:  {R}  {device_str}
-{C}  ║{R}  {DIM}Bypass:  {R}  {bypass_eng}
-{C}  ║{R}  {DIM}Workers: {R}  {W}{WORKERS}{R}
-{C}  ║{R}  {DIM}Timeout: {R}  {W}connect={TIMEOUT_CONN}s  read={TIMEOUT_READ}s{R}
-{C}  ║{R}  {DIM}Retries: {R}  {W}{RETRIES}× backoff={BACKOFF}s{R}
-{C}  ║{R}  {DIM}Hooks:   {R}  {hook_str}
-{C}  ║{R}  {DIM}Flags:   {R}  {flag_str}
-{C}  ╚══════════════════════════════════════════════════════╝{R}
-""")
+    # Pretty box banner with dynamic right border. Body lines contain ANSI
+    # color codes (zero visual width) so we must measure VISIBLE width by
+    # stripping ANSI before padding. Each body line is padded to _BOX_W and
+    # closed with a right ║ so the box is always perfectly rectangular.
+    # The box auto-expands if any line is wider than the default _BOX_W.
+    _title = "S I T E  2  L O C A L"
+    _ver   = "V8.0"
+    _title_core = f"  {_title}    {_ver}  "
+
+    # Build body lines first so we can measure their visible widths.
+    _l_target  = f"  {DIM}Target:  {R}  {G}{MAIN_HOST}{R} {DIM}({ip}){R}"
+    _l_proxy   = f"  {DIM}Proxy:   {R}  {W}http://{HOST}:{PORT}{R}"
+    _l_device  = f"  {DIM}Device:  {R}  {device_str}"
+    _l_bypass  = f"  {DIM}Bypass:  {R}  {bypass_eng}"
+    _l_workers = f"  {DIM}Workers: {R}  {W}{WORKERS}{R}"
+    _l_timeout = f"  {DIM}Timeout: {R}  {W}connect={TIMEOUT_CONN}s  read={TIMEOUT_READ}s{R}"
+    _l_retries = f"  {DIM}Retries: {R}  {W}{RETRIES}× backoff={BACKOFF}s{R}"
+    _l_hooks   = f"  {DIM}Hooks:   {R}  {hook_str}"
+    _l_flags   = f"  {DIM}Flags:   {R}  {flag_str}"
+    _body_lines = [_l_target, _l_proxy, _l_device, _l_bypass, _l_workers,
+                   _l_timeout, _l_retries, _l_hooks, _l_flags]
+
+    # Box width: max of default (54), title core, and all body visible widths
+    # plus 1 col of right padding so content never touches the right border.
+    _BOX_W = max(54, len(_title_core),
+                 max(len(_ANSI_ESC.sub("", ln)) for ln in _body_lines) + 1)
+
+    def _pad_r(content: str) -> str:
+        """Pad a content string (with ANSI codes) to _BOX_W visible cols."""
+        vw = len(_ANSI_ESC.sub("", content))
+        if vw >= _BOX_W:
+            return content
+        return content + " " * (_BOX_W - vw)
+
+    # Center the title within _BOX_W.
+    _pad_left = (_BOX_W - len(_title_core)) // 2
+    _pad_right = _BOX_W - len(_title_core) - _pad_left
+    _title_line = " " * _pad_left + _title_core + " " * _pad_right
+
+    def _row(content: str) -> str:
+        return f"{C}  ║{R}{_pad_r(content)}{C}║{R}"
+
+    print(
+        f"\n"
+        f"{C}  ╔{'═' * _BOX_W}╗{R}\n"
+        f"{C}  ║{W}{_title_line}{R}{C}║{R}\n"
+        f"{C}  ╠{'═' * _BOX_W}╣{R}\n"
+        + "\n".join(_row(ln) for ln in _body_lines) + "\n"
+        f"{C}  ╚{'═' * _BOX_W}╝{R}"
+    )
 
     if PROXY_CDN and MULTIPORT:
-        print(f"  {M}▶ MULTIPORT{R}  {Style.DIM}CDN hosts get a dedicated port starting at {PORT+1}{Style.RESET_ALL}\n")
+        print(f"  {M}▶ MULTIPORT{R} {DIM}CDN hosts get a dedicated port starting at {PORT+1}{R}")
     elif PROXY_CDN:
-        print(f"  {M}▶ CDN{R}  {Style.DIM}assets via {_EXT_PREFIX}/ (single port){Style.RESET_ALL}\n")
+        print(f"  {M}▶ CDN{R} {DIM}assets via {_EXT_PREFIX}/ (single port){R}")
     if CAPTURE:
         skip   = "static skipped" if CAPTURE_SKIP_STATIC else "all captured"
         body   = "req body on" if CAPTURE_BODIES else "req body off"
         others = " · CDN included" if CAPTURE_CDN else ""
-        print(f"  {Style.BRIGHT+Fore.RED}▶ CAPTURE{Style.RESET_ALL}  {Style.DIM}({skip} · {body}{others}){Style.RESET_ALL}")
-        print(f"  {Style.DIM}→  {DATA_FOLDER}/captures/{Style.RESET_ALL}\n")
+        print(f"  {Style.BRIGHT+Fore.RED}▶ CAPTURE{R} {DIM}({skip} · {body}{others}) → {DATA_FOLDER}/captures/{R}")
     if SHOW_HIDDEN:
-        print(f"  {G}▶ SHOW_HIDDEN{Style.RESET_ALL}  {Style.DIM}hidden elements revealed in every HTML page{Style.RESET_ALL}\n")
+        print(f"  {G}▶ SHOW_HIDDEN{R} {DIM}hidden elements revealed in every HTML page{R}")
     if SCAN_PATHS:
-        total = len(_DEFAULT_HIDDEN_PATHS) + len(EXTRA_PATHS)
-        print(f"  {Style.BRIGHT+Fore.RED}▶ SCAN_PATHS{Style.RESET_ALL}"
-              f"  {Style.DIM}probing {total} paths → {DATA_FOLDER}/hidden_paths.json{Style.RESET_ALL}\n")
+        n_wl, n_paths = _scan_paths_summary()
+        print(f"  {Style.BRIGHT+Fore.RED}▶ SCAN_PATHS{R} {DIM}mode={SCAN_PATHS} · {n_wl} wordlist(s) · {n_paths} paths → {DATA_FOLDER}/hidden_paths.json{R}")
     if HOOK_GUI:
-        print(f"  {Y}▶ HOOK_GUI{Style.RESET_ALL}  {Style.DIM}Tkinter traffic inspector + live hook editor{Style.RESET_ALL}\n")
+        print(f"  {Y}▶ HOOK_GUI{R} {DIM}Tkinter traffic inspector + live hook editor{R}")
     if n_hooks:
-        print(f"  {Y}▶ HOOKS{Style.RESET_ALL}")
+        print(f"  {Y}▶ HOOKS{R}")
         for pat, mset, fn in _REQ_HOOKS:
-            print(f"  {Style.DIM}  req  [{','.join(sorted(mset))}] {pat.pattern} → {fn.__name__}{Style.RESET_ALL}")
+            print(f"  {DIM}  req  [{','.join(sorted(mset))}] {pat.pattern} → {fn.__name__}{R}")
         for pat, mset, fn in _RESP_HOOKS:
-            print(f"  {Style.DIM}  resp [{','.join(sorted(mset))}] {pat.pattern} → {fn.__name__}{Style.RESET_ALL}")
-        print()
+            print(f"  {DIM}  resp [{','.join(sorted(mset))}] {pat.pattern} → {fn.__name__}{R}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -8396,11 +8974,15 @@ if __name__ == "__main__":
             "still runs), but the Firefox Proxy request log/hook tab needs "
             "HOOK_GUI=True to be visible.", "WARN")
     def _sigint_handler(sig, frame):
-        print(f"\n{Fore.YELLOW}{Style.BRIGHT}Shutting down...{Style.RESET_ALL}")
+        # Clear the ^C that the terminal echoes on Ctrl+C — write \r + spaces
+        # to overwrite it, then move cursor to start of line.
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+        print(f"{Fore.YELLOW}{Style.BRIGHT}Shutting down...{Style.RESET_ALL}")
         if GRACEFUL_SHUTDOWN:
             # Drain in-flight requests: wait for save_queue and capture_queue
             # to flush so no cached data is lost. Daemon threads (Flask, CDN
-            # servers) will be killed by sys.exit after the drain.
+            # servers) will be killed by os._exit after the drain.
             try:
                 log("Draining save_queue...", "INFO")
                 save_queue.join()
@@ -8413,7 +8995,12 @@ if __name__ == "__main__":
                 pass
             log("Drain complete.", "INFO")
         print(f"{Fore.YELLOW}{Style.BRIGHT}Script finished by user command{Style.RESET_ALL}")
-        sys.exit(0)
+        # Use os._exit instead of sys.exit to avoid the "[1]+ Killed" shell
+        # message that sys.exit produces when called from a signal handler.
+        # os._exit kills all daemon threads immediately without running
+        # atexit handlers (which is what we want — Flask/CDN servers are
+        # daemon threads).
+        os._exit(0)
 
     signal.signal(signal.SIGINT,  _sigint_handler)
     signal.signal(signal.SIGTERM, _sigint_handler)
@@ -8516,6 +9103,14 @@ if __name__ == "__main__":
         log("Crawler started in background.")
     elif CRAWL and OFFLINE:
         log("CRAWL ignored in OFFLINE mode — no upstream available", "WARN")
+
+    # Discovery workers: only start in bulk mode (CRAWL=True). In procedural
+    # mode (CRAWL=False), there is NO background crawling — the proxy serves
+    # pages on-demand from upstream, caching them as they're requested. This
+    # is the original "proxy-on-demand only" behavior.
+    if CRAWL and not OFFLINE and not _discovery_started.is_set():
+        _start_discovery_workers()
+        log(f"Discovery workers started ({_DISCOVERY_WORKERS} threads).", "INFO")
 
     log(f"Listening on http://{HOST}:{PORT}")
 
