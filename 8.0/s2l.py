@@ -1,7 +1,42 @@
 #!/usr/bin/env python3
+# ── Silence multiprocessing.resource_tracker "leaked semaphore" warning ──
+# Some indirect dependency (cffi/curl_cffi/cloudscraper/etc.) creates a named
+# POSIX semaphore through the multiprocessing module without releasing it
+# before our hard os._exit(0) shutdown in the SIGINT handler. The OS reaps
+# the semaphore anyway; the warning is purely cosmetic.
+#
+# The warning is emitted by the resource_tracker *subprocess*, not this
+# process, so an in-process warnings.filterwarnings() cannot suppress it.
+# PYTHONWARNINGS is read by EVERY Python interpreter at startup, including
+# the resource_tracker child, which inherits this env var via fork+exec.
+# Setting it here, BEFORE any imports that might trigger multiprocessing,
+# propagates the filter to all child processes.
+import os as _os
+_s2l_existing_warnings = _os.environ.get("PYTHONWARNINGS", "")
+_s2l_sem_filter = "ignore::UserWarning:multiprocessing.resource_tracker"
+if _s2l_sem_filter not in _s2l_existing_warnings:
+    _os.environ["PYTHONWARNINGS"] = (
+        (_s2l_existing_warnings + "," if _s2l_existing_warnings else "")
+        + _s2l_sem_filter
+    )
 import os, sys, re, json, time, socket, queue, zlib, gc
 import hashlib, mimetypes, logging, threading, warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# Defensive belt-and-suspenders: if multiprocessing.resource_tracker is ever
+# imported into THIS process (e.g. via a library), patch its warnings.warn so
+# any future in-process emission of the "leaked semaphore" warning is muted.
+try:
+    import multiprocessing.resource_tracker as _s2l_rt
+    if not getattr(_s2l_rt, "_s2l_warn_patched", False):
+        _s2l_rt_orig_warn = _s2l_rt.warnings.warn
+        def _s2l_silent_warn(message, *a, **k):
+            if "leaked semaphore" in str(message):
+                return
+            return _s2l_rt_orig_warn(message, *a, **k)
+        _s2l_rt.warnings.warn = _s2l_silent_warn
+        _s2l_rt._s2l_warn_patched = True
+except Exception:
+    pass
 # Supplement the system mime.types with modern types that some distros ship
 # without. The stdlib `mimetypes` module reads /etc/mime.types (or equivalent)
 # at import time — these add_type() calls fill gaps, they don't replace a
@@ -265,14 +300,14 @@ DUMP_ALL = False               # extract + crawl every URL found in any response
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = Falsee                # Tkinter traffic inspector + live hook editor
+HOOK_GUI = False                # Tkinter traffic inspector + live hook editor
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
                                 #   "all"        — every wordlist under wordlists/ (recursive)
                                 #   "all-in-dir" — every wordlist in wordlists/ top-level only
                                 #   "dir/file"   — one specific wordlist (relative to wordlists/)
-SCANS_PER_SECOND = 15           # SCAN_PATHS rate limit + progress refresh cadence.
+SCANS_PER_SECOND = 1000           # SCAN_PATHS rate limit + progress refresh cadence.
                                 #   Three effects, one knob:
                                 #     1. REAL RATE LIMIT — caps total probes/sec to
                                 #        MAIN_HOST across ALL worker threads. The
@@ -4657,7 +4692,7 @@ def _prompt_scan_status_filter() -> None:
     print()
     print(f"{Fore.CYAN}{Style.BRIGHT}══ SCAN_PATHS — status filter ══{Style.RESET_ALL}")
     print()
-    print(f"{Fore.YELLOW}Before scanning paths, do you want to filter any status? "
+    print(f"{Fore.YELLOW}Filter HTTP status codes before scanning? "
           f"{Fore.WHITE}(this can prevent log pollution, you can also ignore this by "
           f"just pressing enter with no stuff typed.){Style.RESET_ALL}")
     print()
@@ -4678,7 +4713,7 @@ def _prompt_scan_status_filter() -> None:
     # Print as wrapped lines of ~12 chips each
     line_buf: list[str] = []
     line_len = 0
-    print(f"{Fore.WHITE}We have this list of status: {Style.RESET_ALL}")
+    print(f"{Fore.WHITE}Available HTTP status codes: {Style.RESET_ALL}")
     for chip in status_chips:
         chip_len = len(_ANSI_ESC.sub("", chip))
         if line_len + chip_len + 2 > 80 and line_buf:
@@ -4695,8 +4730,8 @@ def _prompt_scan_status_filter() -> None:
     # ── Main filter prompt ──────────────────────────────────────────────
     while True:
         try:
-            raw = input(f"{Fore.WHITE}Type the status code you want to prevent logging from "
-                        f"{Fore.YELLOW}(if multiple filtering do this for example: 404, 400...){Fore.WHITE}\n"
+            raw = input(f"{Fore.WHITE}Enter status codes to hide "
+                        f"{Fore.YELLOW}(e.g. 404,400){Fore.WHITE}\n"
                         f"{Fore.CYAN}> {Style.RESET_ALL}").strip()
         except (EOFError, KeyboardInterrupt):
             # User pressed Ctrl+D / Ctrl+C — treat as "no filter"
@@ -4740,18 +4775,18 @@ def _prompt_scan_status_filter() -> None:
         # Normal case — set the block list and exit the prompt.
         _SCAN_BLOCK_STATUSES = set(valid)
         _SCAN_ONLY_STATUS = None
-        print(f"{Fore.GREEN}OK, prevented {len(valid)} status code(s) from appearing on your log: "
+        print(f"{Fore.GREEN}OK, hiding {len(valid)} status code(s) from the log: "
               f"{', '.join(str(s) for s in sorted(valid))}{Style.RESET_ALL}")
         # ── Optional: "show only ONE" mode ─────────────────────────────
         try:
-            yn = input(f"{Fore.YELLOW}Optional: do you want to block all the status code from "
-                       f"appearing and only let one for logging? {Fore.WHITE}(y/N) {Fore.CYAN}> {Style.RESET_ALL}").strip().lower()
+            yn = input(f"{Fore.YELLOW}Show only one status code? "
+                       f"{Fore.WHITE}(y/N) {Fore.CYAN}> {Style.RESET_ALL}").strip().lower()
         except (EOFError, KeyboardInterrupt):
             yn = ""
         if yn in ("y", "yes"):
             while True:
                 try:
-                    only_raw = input(f"{Fore.WHITE}I want to see only: {Style.RESET_ALL}").strip()
+                    only_raw = input(f"{Fore.WHITE}Show only: {Style.RESET_ALL}").strip()
                 except (EOFError, KeyboardInterrupt):
                     print(f"{Fore.YELLOW}No 'only' filter — using block list only.{Style.RESET_ALL}")
                     break
@@ -4770,8 +4805,7 @@ def _prompt_scan_status_filter() -> None:
                 # this is a no-op — but it keeps the JSON output and the log
                 # messages honest about what's actually being filtered.
                 _SCAN_BLOCK_STATUSES.discard(only)
-                print(f"{Fore.GREEN}OK, prevented all status code from appearing on your log, "
-                      f"you only have {only} for you logging{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}OK, showing only HTTP {only} responses.{Style.RESET_ALL}")
                 break
         return
 
@@ -4788,9 +4822,9 @@ def _run_path_scanner() -> None:
     on-disk record).
 
     Mode-specific opening lines (per the user's spec):
-      SCAN_PATHS = "<dir>/<file>"   → "Gettings all paths on the wordlist..."
-      SCAN_PATHS = "all"            → "Gettings the path of the first wordlist..."
-      SCAN_PATHS = "all-in-dir"     → "Gettings the path of the first wordlist..."
+      SCAN_PATHS = "<dir>/<file>"   → "Loading wordlist..."
+      SCAN_PATHS = "all"            → "Loading first wordlist..."
+      SCAN_PATHS = "all-in-dir"     → "Loading first wordlist..."
     Then for each wordlist:
       "Scanning paths of <dir>/<file>... [X/X]"
     """
@@ -4878,12 +4912,12 @@ def _run_path_scanner() -> None:
     mode = (SCAN_PATHS or "").strip()
     if mode in ("all", "all-in-dir"):
         # Multi-wordlist mode — announce we're picking up the first one.
-        log(f"Gettings the path of the first wordlist...", "SCAN")
+        log(f"Loading first wordlist...", "SCAN")
     elif mode and mode not in ("all", "all-in-dir"):
         # Single-wordlist mode — announce we're loading that specific file.
-        log(f"Gettings all paths on the wordlist...", "SCAN")
+        log(f"Loading wordlist...", "SCAN")
 
-    log(f"Path scanner — {len(wordlists)} wordlist(s), {total_paths} paths on {MAIN_HOST}", "SCAN")
+    log(f"Path scanner — {len(wordlists)} wordlists, {total_paths} paths for {MAIN_HOST}", "SCAN")
 
     # Snapshot the filter settings so a mid-scan prompt update can't change
     # behavior out from under us. Read once, use for the whole scan.
@@ -10246,7 +10280,7 @@ def _banner() -> None:
     # closed with a right ║ so the box is always perfectly rectangular.
     # The box auto-expands if any line is wider than the default _BOX_W.
     _title = "S I T E  2  L O C A L"
-    _ver   = "V8.0"
+    _ver   = "V 8 . 0"
     _title_core = f"  {_title}    {_ver}  "
 
     # Build body lines first so we can measure their visible widths.
