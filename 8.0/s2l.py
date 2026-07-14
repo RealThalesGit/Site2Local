@@ -307,7 +307,7 @@ SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-di
                                 #   "all"        — every wordlist under wordlists/ (recursive)
                                 #   "all-in-dir" — every wordlist in wordlists/ top-level only
                                 #   "dir/file"   — one specific wordlist (relative to wordlists/)
-SCANS_PER_SECOND = 1000           # SCAN_PATHS rate limit + progress refresh cadence.
+SCANS_PER_SECOND = 10           # SCAN_PATHS rate limit + progress refresh cadence.
                                 #   Three effects, one knob:
                                 #     1. REAL RATE LIMIT — caps total probes/sec to
                                 #        MAIN_HOST across ALL worker threads. The
