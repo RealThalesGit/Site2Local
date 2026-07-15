@@ -356,7 +356,7 @@ PROXY_CDN = True # proxy external CDN/third-party assets
 CACHE_CDN = True # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True # each CDN host gets a dedicated port (False = /__s2l_ext__/)
 HOOK_GUI = False # Tkinter traffic inspector + live hook editor
-RAINBOW_LOGS = False # Native rainbow output for ALL terminal output
+RAINBOW_LOGS = False # Native rainbow output for ALL terminal output and also its not using lolcat bin anymore
 # (banner, logs, scan paths, viewer, shutdown).
 # Pure-Python sine-wave gradient (256-color ANSI),
 # no external binary needed. Continuous gradient
