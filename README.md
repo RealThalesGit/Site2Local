@@ -13,6 +13,10 @@ Yes, you can edit free like a bird, editing the website you are only affects you
 ## Is this project based of another project?
 Nope, site2local is independent and constantly being updated, i don't push the updates so much here, i only release when the tool gets stable enough.
 
+## Known bugs
+If you cache too many websites on your pc, crawl may start failing to get some files, it is recommended to always clean your browser cache.
+If some page fail to start (eg, game content isn't downloading) refresh the page.
+
 ## Optional Things
 Don't forget to share, fork it and contribute to it!
 
