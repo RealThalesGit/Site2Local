@@ -1,4 +1,5 @@
 # Site2Local
+> **Screw telemetry, screw detectors, be free, have full control.**
 A **Vibe-coded** python project which makes a existent website running on localhost known as 127.0.0.1!
 
 ## What i can change on it?
