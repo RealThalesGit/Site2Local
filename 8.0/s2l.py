@@ -257,8 +257,8 @@ DUMP_ALL = False               # extract + crawl every URL found in any response
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = True                # Tkinter traffic inspector + live hook editor
-RAINBOW_LOGS = True            # lolcat-style terminal output
+HOOK_GUI = False                # Tkinter traffic inspector + live hook editor
+RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
                                 #   "all"        — every wordlist under wordlists/ (recursive)
@@ -279,9 +279,9 @@ SCANS_PER_SECOND = 10           # SCAN_PATHS rate limit + progress refresh caden
                                 #   Set to 0 (or a negative) to disable the rate
                                 #   limit — the scanner then runs as fast as 8
                                 #   worker threads allow (no cap).
-CAPTURE = True                  # record every request+response as JSON
-CAPTURE_CDN = True              # include CDN responses in captures
-CAPTURE_BODIES = True            # include request bodies in captures
+CAPTURE = False                  # record every request+response as JSON
+CAPTURE_CDN = False              # include CDN responses in captures
+CAPTURE_BODIES = False            # include request bodies in captures
 CAPTURE_SKIP_STATIC = True       # skip images/fonts/JS/CSS from captures
 FIREFOX_PROXY = False             # MITM forward proxy for the actual browser (root CA + CONNECT tunnel)
 FIREFOX_PROXY_PORT = 8443         # port to point Firefox's manual proxy config at
