@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Site2Local — Dependencies
+# ═══════════════════════════════════════════════════════════════════════════════
+# Install everything (recommended):
+#   pip install -r requirements.txt
+#
+# Install only the core (minimum to run the proxy):
+#   pip install requests urllib3 beautifulsoup4 flask colorama
+#
+# Then add optional features as needed:
+#   pip install PyQt6                        # for HOOK_GUI (traffic inspector)
+#   pip install Brotli                       # for brotli Content-Encoding
+#   pip install zstandard                    # for zstd   Content-Encoding
+#   pip install curl-cffi                    # Cloudflare bypass (Chrome TLS)
+#   pip install ai-cloudscraper              # Cloudflare bypass (fallback)
+#   pip install tqdm                         # SCAN_PATHS progress bar
+#   pip install cryptography                 # FIREFOX_PROXY MITM proxy
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Core (required for the proxy to run at all) ──────────────────────────────
+requests>=2.28.0
+urllib3>=2.0.0
+beautifulsoup4>=4.11.0
+flask>=3.0.0
+colorama>=0.4.6
+
+# ── GUI (HOOK_GUI=True — the PyQt6 traffic inspector + hook editor) ──────────
+PyQt6>=6.2.0
+
+# ── Optional: Content-Encoding decoders ──────────────────────────────────────
+# Brotli (br)    — many modern sites send brotli-compressed responses
+Brotli>=1.0.9
+# Zstandard (zstd) — increasingly common for API responses (RFC 8878)
+zstandard>=0.18.0
+
+# ── Optional: Cloudflare bypass tiers (tried in order until one works) ────────
+# curl-cffi uses real Chrome TLS fingerprints — most effective vs Cloudflare
+curl-cffi>=0.5.0
+# ai-cloudscraper is the maintained fork (original cloudscraper is unmaintained
+# since 2023). Falls back to the original cloudscraper if ai-cloudscraper
+# isn't installed.
+ai-cloudscraper>=1.0.0
+
+# ── Optional: SCAN_PATHS progress bar ────────────────────────────────────────
+tqdm>=4.64.0
+
+# ── Optional: FIREFOX_PROXY (MITM forward proxy for the real browser) ────────
+# Generates a root CA + intercepts HTTPS traffic. Requires the cryptography
+# package for X.509 cert generation.
+cryptography>=41.0.0
