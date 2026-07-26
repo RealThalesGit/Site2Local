@@ -2520,40 +2520,48 @@ def _launch_hook_gui() -> None:
 
         # ── WS log queue poller ───────────────────────────────────────────
         def _ws_poll():
-            if not ws_paused_cb.isChecked():
-                count = 0
-                while count < 60:
-                    try:
-                        entry = _gui_ws_log_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    sz = entry["size"]
-                    if sz >= 1024 * 1024:
-                        sz_s = f"{sz / 1024 / 1024:.1f}MB"
-                    elif sz >= 1024:
-                        sz_s = f"{sz // 1024}KB"
-                    elif sz > 0:
-                        sz_s = f"{sz}B"
-                    else:
-                        sz_s = "—"
-                    _dir = entry["direction"]
-                    dir_disp = "[->] IN" if _dir == "in" else ("[<-] OUT" if _dir == "out" else _dir)
-                    _op_upper = (entry.get("op_name") or "").upper()
-                    color = QColor(_GRN) if _dir == "in" else QColor(_CYN)
-                    item = QTreeWidgetItem([entry["ts"], dir_disp, _op_upper,
-                                             entry["origin"], entry["path"], sz_s])
-                    for c in range(item.columnCount()):
-                        item.setForeground(c, color)
-                    _ws_row_counter[0] += 1
-                    iid = str(_ws_row_counter[0])
-                    item.setData(0, Qt.ItemDataRole.UserRole, iid)
-                    ws_tree.addTopLevelItem(item)
-                    _ws_row_data[iid] = entry
-                    if ws_tree.topLevelItemCount() > _WS_MAX_ROWS:
-                        ws_tree.takeTopLevelItem(0)
-                    if ws_auto_scroll_cb.isChecked():
-                        ws_tree.scrollToItem(item)
-                    count += 1
+            # Wrapped in try/except so a slot exception is logged, not
+            # swallowed — same protection as the main _poll() loop.
+            try:
+                if not ws_paused_cb.isChecked():
+                    count = 0
+                    while count < 60:
+                        try:
+                            entry = _gui_ws_log_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        sz = entry["size"]
+                        if sz >= 1024 * 1024:
+                            sz_s = f"{sz / 1024 / 1024:.1f}MB"
+                        elif sz >= 1024:
+                            sz_s = f"{sz // 1024}KB"
+                        elif sz > 0:
+                            sz_s = f"{sz}B"
+                        else:
+                            sz_s = "—"
+                        _dir = entry["direction"]
+                        dir_disp = "[->] IN" if _dir == "in" else ("[<-] OUT" if _dir == "out" else _dir)
+                        _op_upper = (entry.get("op_name") or "").upper()
+                        color = QColor(_GRN) if _dir == "in" else QColor(_CYN)
+                        item = QTreeWidgetItem([entry["ts"], dir_disp, _op_upper,
+                                                 entry["origin"], entry["path"], sz_s])
+                        for c in range(item.columnCount()):
+                            item.setForeground(c, color)
+                        _ws_row_counter[0] += 1
+                        iid = str(_ws_row_counter[0])
+                        item.setData(0, Qt.ItemDataRole.UserRole, iid)
+                        ws_tree.addTopLevelItem(item)
+                        _ws_row_data[iid] = entry
+                        if ws_tree.topLevelItemCount() > _WS_MAX_ROWS:
+                            ws_tree.takeTopLevelItem(0)
+                        if ws_auto_scroll_cb.isChecked():
+                            ws_tree.scrollToItem(item)
+                        count += 1
+            except Exception as _e:
+                import traceback as _tb
+                log(f"_ws_poll() raised {_e.__class__.__name__}: {_e}\n"
+                    + "".join(_tb.format_exception(type(_e), _e, _e.__traceback__)),
+                    "ERROR")
         ws_poll_timer = QTimer(ws_bot)
         ws_poll_timer.timeout.connect(_ws_poll)
         ws_poll_timer.start(150)
@@ -2770,30 +2778,39 @@ def _launch_hook_gui() -> None:
             QTimer.singleShot(100, lambda: (_load_fwd_hooks_from_disk(), _render_fwd_hook_rows()))
 
             def _fwd_poll():
-                count = 0
-                while count < 60:
-                    try:
-                        entry = _gui_fwd_log_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    sz = entry["size"]
-                    sz_s = f"{sz/1024:.1f}KB" if sz >= 1024 else (f"{sz}B" if sz else "—")
-                    is_err = isinstance(entry["status"], int) and entry["status"] >= 400
-                    color = QColor(_RED) if is_err else (
-                        QColor(_YLW) if entry["method"] == "POST" else (
-                            QColor(_GRN) if entry["method"] == "GET" else QColor(_FG)))
-                    item = QTreeWidgetItem([entry["ts"], entry["method"], entry["path"],
-                                             str(entry["status"]), entry["ct"], sz_s])
-                    for c in range(item.columnCount()):
-                        item.setForeground(c, color)
-                    _fwd_row_counter[0] += 1
-                    iid = str(_fwd_row_counter[0])
-                    item.setData(0, Qt.ItemDataRole.UserRole, iid)
-                    _fwd_row_data[iid] = entry
-                    if fwd_tree.topLevelItemCount() > _MAX_ROWS:
-                        fwd_tree.takeTopLevelItem(0)
-                    fwd_tree.scrollToItem(item)
-                    count += 1
+                # Wrapped in try/except so a slot exception is logged, not
+                # swallowed — same protection as the main _poll() loop.
+                try:
+                    count = 0
+                    while count < 60:
+                        try:
+                            entry = _gui_fwd_log_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        sz = entry["size"]
+                        sz_s = f"{sz/1024:.1f}KB" if sz >= 1024 else (f"{sz}B" if sz else "—")
+                        is_err = isinstance(entry["status"], int) and entry["status"] >= 400
+                        color = QColor(_RED) if is_err else (
+                            QColor(_YLW) if entry["method"] == "POST" else (
+                                QColor(_GRN) if entry["method"] == "GET" else QColor(_FG)))
+                        item = QTreeWidgetItem([entry["ts"], entry["method"], entry["path"],
+                                                 str(entry["status"]), entry["ct"], sz_s])
+                        for c in range(item.columnCount()):
+                            item.setForeground(c, color)
+                        _fwd_row_counter[0] += 1
+                        iid = str(_fwd_row_counter[0])
+                        item.setData(0, Qt.ItemDataRole.UserRole, iid)
+                        fwd_tree.addTopLevelItem(item)
+                        _fwd_row_data[iid] = entry
+                        if fwd_tree.topLevelItemCount() > _MAX_ROWS:
+                            fwd_tree.takeTopLevelItem(0)
+                        fwd_tree.scrollToItem(item)
+                        count += 1
+                except Exception as _e:
+                    import traceback as _tb
+                    log(f"_fwd_poll() raised {_e.__class__.__name__}: {_e}\n"
+                        + "".join(_tb.format_exception(type(_e), _e, _e.__traceback__)),
+                        "ERROR")
             fwd_poll_timer = QTimer(fwd_bot_area)
             fwd_poll_timer.timeout.connect(_fwd_poll)
             fwd_poll_timer.start(150)
