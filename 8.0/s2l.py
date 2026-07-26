@@ -250,14 +250,14 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = 256 * 1024        # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = False                   # crawl at startup; False = proxy-on-demand only
+CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = False                # Tkinter traffic inspector + live hook editor
+HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (KDE Breeze Dark theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
@@ -1135,404 +1135,529 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
 
     return save, delete, load_all
 
+
 def _launch_hook_gui() -> None:
     """
-    Launch the Tkinter GUI. Must be called from the MAIN thread on Linux/X11.
+    Launch the PyQt6 GUI. Must be called from the MAIN thread.
     When HOOK_GUI=True, Flask moves to a daemon thread and this blocks main.
+
+    Theme: KDE Breeze Dark — `app.setStyle("Fusion")` paired with the official
+    KDE Breeze Dark QPalette (sourced from KDE/breeze:colors/BreezeDark.colors).
+    Reproduces the authentic KDE Breeze look on every platform (Linux/macOS/
+    Windows): flat buttons, Breeze-blue (#3daee9) highlight + focus ring,
+    amber (#fdbc4b) find-highlight tint, muted dark grays for window/button/
+    view backgrounds.
+
+    Behavior is identical to the previous Tk version: three tabs
+    (Traffic/Hooks, WebSocket Hooks, Firefox Proxy), live queue polling via
+    QTimer, the same hook schema on disk, and the same keyboard shortcuts.
     """
     try:
-        import tkinter as tk
-        from tkinter import ttk, scrolledtext, messagebox, simpledialog
+        from PyQt6.QtCore import Qt, QTimer
+        from PyQt6.QtGui import (
+            QPalette, QColor, QFont, QKeySequence, QShortcut,
+            QTextCursor, QTextCharFormat,
+        )
+        from PyQt6.QtWidgets import (
+            QApplication, QMainWindow, QWidget, QTabWidget,
+            QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QLineEdit, QComboBox,
+            QCheckBox, QPushButton, QLabel, QSplitter, QScrollArea, QGridLayout,
+            QVBoxLayout, QHBoxLayout, QMessageBox, QInputDialog,
+            QFileDialog, QHeaderView, QAbstractItemView, QTextEdit,
+        )
     except ImportError:
-        log("tkinter not available — HOOK_GUI ignored", "WARN")
+        log("PyQt6 not available — HOOK_GUI ignored "
+            "(pip install PyQt6 --break-system-packages)", "WARN")
         return
 
     def _gui_main() -> None:
-        root = tk.Tk()
-        root.title("S2L — Hook Inspector")
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setStyle("Fusion")
 
-        # ── Responsive sizing: fill 90% of screen ────────────────────────────
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        w  = max(1000, int(sw * 0.90))
-        h  = max(640,  int(sh * 0.88))
-        x  = (sw - w) // 2
-        y  = max(0, (sh - h) // 2 - 20)
-        root.geometry(f"{w}x{h}+{x}+{y}")
-        root.minsize(900, 560)
+        # ── Capture unhandled exceptions in Qt slots ───────────────────────
+        # Without this, an exception inside a QTimer slot (e.g. _poll) is
+        # printed to stderr but the timer keeps firing — and on Windows the
+        # traceback may never flush, leaving the GUI silently empty with no
+        # clue why. Route every slot exception through log() so it shows up
+        # in the same terminal window as the rest of s2l's output.
+        import traceback as _tb_mod
+        def _s2l_excepthook(exc_type, exc_value, exc_tb):
+            try:
+                msg = "".join(_tb_mod.format_exception(exc_type, exc_value, exc_tb))
+                log(f"GUI slot raised {exc_type.__name__}: {exc_value}\n{msg}", "ERROR")
+            except Exception:
+                # If even logging fails, fall back to the default hook.
+                sys.__excepthook__(exc_type, exc_value, exc_tb)
+        sys.excepthook = _s2l_excepthook
+        # PyQt6 6.5+ honors sys.excepthook for slot exceptions. For older
+        # versions we also wrap each slot body in try/except (done below).
 
-        # ── Theme: black background, white accent ─────────────────────────────
-        _BG  = "#000000"
-        _PNL = "#0d0d0d"
-        _ACC = "#ffffff"
-        _FG  = "#e0e0e0"
-        _DIM = "#666677"
-        _GRN = "#69ff69"
-        _YLW = "#ffcc00"
-        _RED = "#ff5555"
-        _CYN = "#00d0d0"   # cyan accent for origin column
-        _ENT = "#1a1a1a"   # entry/input background
+        # ── Theme: KDE Breeze Dark (official palette from KDE/breeze repo) ──
+        # Source: https://github.com/KDE/breeze/blob/master/colors/BreezeDark.colors
+        #   Colors:Window   BackgroundNormal=32,35,38   BackgroundAlternate=41,44,48
+        #   Colors:View     BackgroundNormal=20,22,24   BackgroundAlternate=29,31,34
+        #   Colors:Button   BackgroundNormal=41,44,48    ForegroundNormal=252,252,252
+        #   DecorationFocus=61,174,233 (the canonical Breeze blue, #3daee9)
+        #   ForegroundNegative=218,68,83 (#da4453) ForegroundPositive=39,174,96 (#27ae60)
+        #   ForegroundNeutral=246,116,0 (#f67400)  ForegroundInactive=161,169,177 (#a1a9b1)
+        # `app.setStyle("Fusion")` is the cross-platform Qt style KDE apps fall
+        # back to; pairing it with this QPalette reproduces the authentic KDE
+        # Breeze Dark look on every platform (Linux/macOS/Windows).
+        _BG   = "#202326"   # Window BackgroundNormal  (32,35,38)
+        _PNL  = "#141618"   # View  BackgroundNormal  (20,22,24) — tree/text fields
+        _PNL_ALT = "#1d1f22" # View BackgroundAlternate (29,31,34)
+        _BTN  = "#292c30"   # Button BackgroundNormal  (41,44,48)
+        _HDR  = "#292c30"   # Header BackgroundNormal  (41,44,48)
+        _ACC  = "#fcfcfc"   # ForegroundNormal         (252,252,252)
+        _FG   = "#fcfcfc"   # ForegroundNormal
+        _DIM  = "#a1a9b1"   # ForegroundInactive        (161,169,177)
+        _BLUE = "#3daee9"   # DecorationFocus — the Breeze blue accent
+        _GRN  = "#27ae60"   # ForegroundPositive        (39,174,96)
+        _YLW  = "#f67400"   # ForegroundNeutral         (246,116,0)
+        _RED  = "#da4453"   # ForegroundNegative        (218,68,83)
+        _CYN  = "#3daee9"   # cyan accent → Breeze blue (no pure cyan in Breeze)
+        _PURP = "#9b59b6"   # ForegroundVisited         (155,89,182)
+        _LINK = "#1d99f3"   # ForegroundLink            (29,153,243)
+        _ENT  = _BTN        # entry/input background = button bg
+        # Breeze-derived button tints (darkened negative/positive — used for
+        # destructive / affirmative action buttons so they read as semantic
+        # without breaking Breeze's muted aesthetic).
+        _RED_BG = "#3a1d21"   # darkened #da4453 — destructive button bg
+        _GRN_BG = "#1a3324"   # darkened #27ae60 — affirmative button bg
+        _YLW_HI = "#fdbc4b"   # Breeze search-highlight amber (Kate's find tint)
 
-        root.configure(bg=_BG)
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window,          QColor(_BG))
+        pal.setColor(QPalette.ColorRole.WindowText,      QColor(_FG))
+        pal.setColor(QPalette.ColorRole.Base,            QColor(_PNL))
+        pal.setColor(QPalette.ColorRole.AlternateBase,   QColor(_PNL_ALT))
+        pal.setColor(QPalette.ColorRole.Text,            QColor(_ACC))
+        pal.setColor(QPalette.ColorRole.Button,          QColor(_BTN))
+        pal.setColor(QPalette.ColorRole.ButtonText,      QColor(_ACC))
+        pal.setColor(QPalette.ColorRole.Highlight,       QColor(_BLUE))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(_DIM))
+        pal.setColor(QPalette.ColorRole.ToolTipBase,     QColor(_BTN))
+        pal.setColor(QPalette.ColorRole.ToolTipText,     QColor(_ACC))
+        pal.setColor(QPalette.ColorRole.Link,            QColor(_LINK))
+        pal.setColor(QPalette.ColorRole.LinkVisited,     QColor(_PURP))
+        pal.setColor(QPalette.ColorRole.BrightText,      QColor(_RED))
+        # Inactive group (Breeze dims inactive windows slightly)
+        pal.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.WindowText, QColor(_DIM))
+        # Disabled group — Breeze uses ForegroundInactive (#a1a9b1) for disabled
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(_DIM))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,      QColor(_DIM))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(_DIM))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor("#1e5774"))
+        app.setPalette(pal)
 
-        style = ttk.Style(root)
-        style.theme_use("clam")
-        style.configure("Treeview",
-                        background=_PNL, foreground=_FG,
-                        fieldbackground=_PNL, rowheight=22,
-                        font=("Consolas", 10))
-        style.configure("Treeview.Heading",
-                        background="#111111", foreground=_ACC,
-                        font=("Consolas", 10, "bold"))
-        style.map("Treeview", background=[("selected", "#222222")])
-        style.configure("TNotebook",         background=_BG, borderwidth=0)
-        style.configure("TNotebook.Tab",     background="#111111", foreground=_FG,
-                        padding=[10, 4], font=("Consolas", 10, "bold"))
-        style.map("TNotebook.Tab",
-                  background=[("selected", _PNL)],
-                  foreground=[("selected", _ACC)])
-        style.configure("TCombobox", fieldbackground=_ENT, background=_ENT,
-                        foreground=_ACC, selectbackground="#333333",
-                        selectforeground="#000000")
-        style.configure("Vertical.TScrollbar",   background=_ENT, troughcolor=_BG)
-        style.configure("Horizontal.TScrollbar", background=_ENT, troughcolor=_BG)
-        # Fix combobox dropdown listbox — selected text must be black (visible)
-        root.option_add("*TCombobox*Listbox.background",       "#ffffff")
-        root.option_add("*TCombobox*Listbox.foreground",       "#000000")
-        root.option_add("*TCombobox*Listbox.selectBackground", "#3a7bd5")
-        root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        # Monospace fonts — Consolas where available, else a generic mono.
+        _mono       = QFont("Consolas", 10)
+        _mono_b     = QFont("Consolas", 10);  _mono_b.setBold(True)
+        _mono_lg    = QFont("Consolas", 11);  _mono_lg.setBold(True)
+        _mono_sm    = QFont("Consolas", 9)
+        _mono_sm_b  = QFont("Consolas", 9);   _mono_sm_b.setBold(True)
+        _mono_xs    = QFont("Consolas", 8)
 
-        def _btn(parent, text, cmd, **kw):
-            return tk.Button(parent, text=text, command=cmd,
-                             bg=kw.pop("bg", "#1a1a1a"), fg=kw.pop("fg", _ACC),
-                             relief="flat", activebackground="#2a2a2a",
-                             activeforeground=_ACC,
-                             font=kw.pop("font", ("Consolas", 9)), **kw)
+        # ── Stylesheet for widgets that the QPalette doesn't fully cover ───
+        # Breeze's QSS uses flat buttons, subtle hover tints of the Breeze
+        # blue, and a 2px focus ring. Reproduced here.
+        _QSS = f"""
+            QMainWindow, QWidget {{ background-color: {_BG}; color: {_FG}; }}
+            QTabWidget::pane {{ border: 0; background: {_BG}; }}
+            QTabBar::tab {{
+                background: {_BTN}; color: {_FG};
+                padding: 6px 14px; font-family: Consolas; font-size: 10pt; font-weight: bold;
+                border: 0; border-top: 2px solid transparent;
+            }}
+            QTabBar::tab:hover    {{ background: #31363b; color: {_ACC}; }}
+            QTabBar::tab:selected {{ background: {_BG}; color: {_BLUE}; border-top: 2px solid {_BLUE}; }}
+            QTreeWidget {{
+                background: {_PNL}; color: {_FG}; border: 0;
+                alternate-background-color: {_PNL_ALT};
+                font-family: Consolas; font-size: 10pt;
+                selection-background-color: {_BLUE}; selection-color: #ffffff;
+                outline: 0;
+            }}
+            QTreeWidget::item:hover {{ background: #2a2e32; }}
+            QHeaderView::section {{
+                background: {_HDR}; color: {_ACC};
+                font-family: Consolas; font-size: 10pt; font-weight: bold;
+                padding: 5px 6px; border: 0; border-right: 1px solid {_BG};
+            }}
+            QPlainTextEdit {{
+                background: {_PNL}; color: {_FG}; border: 0;
+                font-family: Consolas; font-size: 10pt;
+                selection-background-color: {_BLUE}; selection-color: #ffffff;
+            }}
+            QLineEdit, QComboBox {{
+                background: {_PNL}; color: {_ACC}; border: 1px solid #1e2124;
+                font-family: Consolas; font-size: 10pt;
+                padding: 3px 6px;
+                selection-background-color: {_BLUE}; selection-color: #ffffff;
+            }}
+            QLineEdit:focus, QComboBox:focus {{ border: 1px solid {_BLUE}; }}
+            QComboBox QAbstractItemView {{
+                background: {_BTN}; color: {_ACC};
+                selection-background-color: {_BLUE}; selection-color: #ffffff;
+                outline: 0; border: 1px solid #1e2124;
+            }}
+            QPushButton {{
+                background: {_BTN}; color: {_ACC}; border: 0;
+                font-family: Consolas; font-size: 9pt;
+                padding: 5px 14px;
+            }}
+            QPushButton:hover    {{ background: #31363b; color: {_BLUE}; }}
+            QPushButton:pressed {{ background: #1e2124; }}
+            QPushButton:default {{ border: 1px solid {_BLUE}; }}
+            QCheckBox {{ color: {_FG}; spacing: 6px; }}
+            QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 2px; }}
+            QCheckBox::indicator:unchecked {{ background: {_PNL}; border: 1px solid #5a5e62; }}
+            QCheckBox::indicator:unchecked:hover {{ border: 1px solid {_BLUE}; }}
+            QCheckBox::indicator:checked   {{ background: {_BLUE}; border: 1px solid {_BLUE}; }}
+            QScrollBar:vertical   {{ background: {_BG}; width: 12px; margin: 0; }}
+            QScrollBar:horizontal {{ background: {_BG}; height: 12px; margin: 0; }}
+            QScrollBar::handle {{ background: #5a5e62; border-radius: 4px; min-width: 24px; min-height: 24px; }}
+            QScrollBar::handle:hover {{ background: {_BLUE}; }}
+            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; background: none; }}
+            QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
+            QScrollArea {{ border: 0; background: {_BTN}; }}
+            QScrollArea > QWidget > QWidget {{ background: {_BTN}; }}
+            QSplitter::handle {{ background: {_BG}; }}
+            QSplitter::handle:horizontal {{ width: 5px; }}
+            QSplitter::handle:vertical   {{ height: 5px; }}
+            QLabel {{ background: transparent; }}
+            QMessageBox, QInputDialog, QFileDialog {{ background: {_BG}; }}
+            QMessageBox QLabel, QInputDialog QLabel {{ color: {_FG}; background: transparent; }}
+        """
+        app.setStyleSheet(_QSS)
 
-        def _lbl(parent, text=None, **kw):
-            font = kw.pop("font", ("Consolas", 9))
-            bg   = kw.pop("bg", _PNL)
-            fg   = kw.pop("fg", _DIM)
-            kwargs = {"bg": bg, "fg": fg, "font": font}
-            if text is not None:
-                kwargs["text"] = text
-            kwargs.update(kw)
-            return tk.Label(parent, **kwargs)
+        win = QMainWindow()
+        win.setWindowTitle("S2L — Hook Inspector")
 
-        def _entry(parent, **kw):
-            return tk.Entry(parent, bg=_ENT, fg=_ACC, insertbackground=_ACC,
-                            relief="flat", font=("Consolas", 10), **kw)
+        # ── Responsive sizing: fill 90% of screen ──────────────────────────
+        screen = app.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            w = max(1000, int(geo.width() * 0.90))
+            h = max(640,  int(geo.height() * 0.88))
+            x = geo.x() + (geo.width() - w) // 2
+            y = max(geo.y(), geo.y() + (geo.height() - h) // 2 - 20)
+            win.setGeometry(x, y, w, h)
+        win.setMinimumSize(900, 560)
 
-        def _text_box(parent, **kw):
-            return scrolledtext.ScrolledText(
-                parent, bg="#050505", fg=_FG, insertbackground=_ACC,
-                font=("Consolas", 10), relief="flat", **kw)
+        # Central widget + root vertical layout
+        central = QWidget(win)
+        win.setCentralWidget(central)
+        root_lay = QVBoxLayout(central)
+        root_lay.setContentsMargins(4, 4, 4, 4)
+        root_lay.setSpacing(4)
 
-        def _bind_editor_keys(widget):
-            """Bind Ctrl+A/C/V/X on Linux for any ScrolledText."""
-            def _sa(_e): widget.tag_add("sel","1.0","end"); return "break"
-            def _sc(_e):
-                try:
-                    s = widget.get("sel.first","sel.last")
-                    root.clipboard_clear(); root.clipboard_append(s)
-                except tk.TclError: pass
-                return "break"
-            def _sv(_e):
-                try:
-                    t = root.clipboard_get()
-                    try: widget.delete("sel.first","sel.last")
-                    except tk.TclError: pass
-                    widget.insert("insert", t)
-                except tk.TclError: pass
-                return "break"
-            def _sx(_e):
-                _sc(_e)
-                try: widget.delete("sel.first","sel.last")
-                except tk.TclError: pass
-                return "break"
-            for seq in ("<Control-a>","<Control-A>"): widget.bind(seq, _sa)
-            for seq in ("<Control-c>","<Control-C>"): widget.bind(seq, _sc)
-            for seq in ("<Control-v>","<Control-V>"): widget.bind(seq, _sv)
-            for seq in ("<Control-x>","<Control-X>"): widget.bind(seq, _sx)
+        # ── Helper builders (mirror the old _btn/_lbl/_entry/_text_box) ─────
+        def _btn(parent, text, cmd, font=None):
+            b = QPushButton(text, parent)
+            b.clicked.connect(cmd)
+            b.setFont(font or _mono_sm)
+            return b
 
-        # ── Notebook (tabs) ───────────────────────────────────────────────────
-        nb = ttk.Notebook(root)
-        nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        def _lbl(parent, text="", font=None, color=None):
+            l = QLabel(text, parent)
+            l.setFont(font or _mono_sm)
+            if color:
+                l.setStyleSheet(f"color: {color}; background: transparent;")
+            return l
 
-        # ══════════════════════════════════════════════════════════════════════
+        def _entry(parent, width=0):
+            e = QLineEdit(parent)
+            e.setFont(_mono)
+            if width:
+                e.setMaximumWidth(width * 8)  # rough char→px
+            return e
+
+        def _text_box(parent, wrap=False, mono=None, readonly=False):
+            t = QPlainTextEdit(parent)
+            t.setFont(mono or _mono)
+            t.setReadOnly(readonly)
+            if not wrap:
+                t.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            return t
+
+        # ── Notebook (tabs) ─────────────────────────────────────────────────
+        nb = QTabWidget(central)
+        nb.setFont(_mono)
+        root_lay.addWidget(nb)
+
+        # Cursor-based case-insensitive find for a QPlainTextEdit.
+        # Returns the list of start positions and highlights every match.
+        def _find_all(edit: QPlainTextEdit, query: str):
+            edit.setExtraSelections([])
+            if not query:
+                return []
+            doc = edit.document()
+            positions = []
+            cur = QTextCursor(doc)
+            cur.movePosition(QTextCursor.MoveOperation.Start)
+            ql = len(query)
+            while True:
+                cur = doc.find(query, cur)
+                if cur.isNull():
+                    break
+                positions.append(cur.selectionStart())
+            if positions:
+                fmt = QTextCharFormat()
+                fmt.setBackground(QColor(_YLW_HI))
+                fmt.setForeground(QColor("#000000"))
+                sels = []
+                for p in positions:
+                    sel = QTextEdit.ExtraSelection()
+                    sel.cursor = QTextCursor(doc)
+                    sel.cursor.setPosition(p)
+                    sel.cursor.setPosition(p + ql, QTextCursor.MoveMode.KeepAnchor)
+                    sel.format = fmt
+                    sels.append(sel)
+                edit.setExtraSelections(sels)
+            return positions
+
+        # ════════════════════════════════════════════════════════════════════
         # TAB 1: Traffic + Hooks
-        # ══════════════════════════════════════════════════════════════════════
-        tab_traffic = tk.Frame(nb, bg=_BG)
-        nb.add(tab_traffic, text="  Traffic / Hooks")
+        # ════════════════════════════════════════════════════════════════════
+        tab_traffic = QWidget()
+        nb.addTab(tab_traffic, "  Traffic / Hooks")
 
-        # Vertical split: top area (traffic + editor) | bottom (active hooks)
-        v_pane = tk.PanedWindow(tab_traffic, orient=tk.VERTICAL, bg=_BG, sashwidth=5,
-                                sashrelief="flat")
-        v_pane.pack(fill=tk.BOTH, expand=True)
+        # Vertical split: top (traffic + editor) | bottom (active hooks)
+        v_split = QSplitter(Qt.Orientation.Vertical, tab_traffic)
+        v_split.setChildrenCollapsible(False)
+        top_area = QWidget()
+        bot_area = QWidget()
+        bot_area.setStyleSheet(f"background: {_PNL};")
+        top_lay = QVBoxLayout(top_area);  top_lay.setContentsMargins(0, 0, 0, 0)
+        bot_lay = QVBoxLayout(bot_area); bot_lay.setContentsMargins(0, 0, 0, 0)
+        v_split.addWidget(top_area)
+        v_split.addWidget(bot_area)
+        v_split.setStretchFactor(0, 6)
+        v_split.setStretchFactor(1, 1)
+        v_split.setSizes([600, 120])
 
-        top_area = tk.Frame(v_pane, bg=_BG)
-        bot_area = tk.Frame(v_pane, bg=_PNL)
-        # Give the top area (traffic log + body editor) the lion's share of
-        # vertical space. Active hooks only needs ~120px for 3-4 rows.
-        v_pane.add(top_area, minsize=360, height=600)
-        v_pane.add(bot_area, minsize=100, height=120)
+        tv_lay = QVBoxLayout(tab_traffic); tv_lay.setContentsMargins(0, 0, 0, 0)
+        tv_lay.addWidget(v_split)
 
         # Horizontal split inside top_area: left (traffic log) | right (body editor)
-        # Give the traffic log MORE width than the body editor — the path column
-        # was too narrow to read. 55/45 split instead of the old ~50/50.
-        h_pane = tk.PanedWindow(top_area, orient=tk.HORIZONTAL, bg=_BG, sashwidth=5,
-                                sashrelief="flat")
-        h_pane.pack(fill=tk.BOTH, expand=True)
+        h_split = QSplitter(Qt.Orientation.Horizontal, top_area)
+        h_split.setChildrenCollapsible(False)
+        left  = QWidget(); left.setStyleSheet(f"background: {_PNL};")
+        right = QWidget(); right.setStyleSheet(f"background: {_PNL};")
+        left_lay  = QVBoxLayout(left);  left_lay.setContentsMargins(4, 4, 4, 4);  left_lay.setSpacing(2)
+        right_lay = QVBoxLayout(right); right_lay.setContentsMargins(4, 4, 4, 4); right_lay.setSpacing(2)
+        h_split.addWidget(left)
+        h_split.addWidget(right)
+        h_split.setStretchFactor(0, 55)
+        h_split.setStretchFactor(1, 45)
+        h_split.setSizes([560, 420])
+        top_lay.addWidget(h_split)
 
-        left  = tk.Frame(h_pane, bg=_PNL)
-        right = tk.Frame(h_pane, bg=_PNL)
-        h_pane.add(left,  minsize=520, width=560)
-        h_pane.add(right, minsize=300, width=420)
+        # ── LEFT: traffic log ───────────────────────────────────────────────
+        left_lay.addWidget(_lbl(left, "Traffic Log", font=_mono_lg, color=_ACC))
 
-        # ── LEFT: traffic log ─────────────────────────────────────────────────
-        _lbl(left, "Traffic Log", fg=_ACC, font=("Consolas", 11, "bold"),
-             bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
+        cols = ["ts", "method", "origin", "path", "status", "web_type", "ct", "size"]
+        labels = ["Time", "Method", "Origin", "Path", "Status", "Web Type", "File Type", "Size"]
+        widths = {"ts": 58, "method": 50, "origin": 110, "status": 44,
+                  "web_type": 72, "ct": 100, "size": 56}
+        tree = QTreeWidget(left)
+        tree.setColumnCount(len(cols))
+        tree.setHeaderLabels(labels)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        tree.setRootIsDecorated(False)
+        tree.setAlternatingRowColors(False)
+        tree.setFont(_mono)
+        hdr = tree.header()
+        hdr.setMinimumSectionSize(40)
+        for i, c in enumerate(cols):
+            if c == "path":
+                hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+            else:
+                hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+                if c in widths:
+                    tree.setColumnWidth(i, widths[c])
+        left_lay.addWidget(tree, 1)
 
-        tree_frame = tk.Frame(left, bg=_PNL)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4)
+        ctrl = QWidget(left); ctrl.setStyleSheet(f"background: {_PNL};")
+        ctrl_lay = QHBoxLayout(ctrl); ctrl_lay.setContentsMargins(8, 0, 8, 0); ctrl_lay.setSpacing(6)
+        left_lay.addWidget(ctrl)
 
-        cols = ("ts", "method", "origin", "path", "status", "web_type", "ct", "size")
-        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
-        for c, w, label in (
-            ("ts",       58,  "Time"),
-            ("method",   50,  "Method"),
-            ("origin",   110, "Origin"),
-            ("path",     0,   "Path"),      # 0 = stretch (gets the remaining space)
-            ("status",   44,  "Status"),
-            ("web_type", 72,  "Web Type"),  # [cdn], [ext], [stream], [cdn:8081]
-            ("ct",       100, "File Type"), # MIME type only
-            ("size",     56,  "Size"),
-        ):
-            tree.heading(c, text=label)
-            tree.column(c, width=w, anchor="w", stretch=(c == "path"))
+        auto_scroll_cb = QCheckBox("Auto-scroll", ctrl); auto_scroll_cb.setChecked(True)
+        paused_cb     = QCheckBox("Pause", ctrl)
+        ctrl_lay.addWidget(auto_scroll_cb)
+        ctrl_lay.addWidget(paused_cb)
 
-        tree.tag_configure("GET",    foreground=_GRN)
-        tree.tag_configure("POST",   foreground=_YLW)
-        tree.tag_configure("PUT",    foreground="#ff9944")
-        tree.tag_configure("PATCH",  foreground="#ff9944")
-        tree.tag_configure("DELETE", foreground=_RED)
-        tree.tag_configure("err",    foreground=_RED)
-        tree.tag_configure("hooked", foreground="#ff44ff", font=("Consolas",10,"bold"))
-        tree.tag_configure("api",    foreground="#44ddff")
-
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        tree.pack(fill=tk.BOTH, expand=True)
-
-        ctrl = tk.Frame(left, bg=_PNL)
-        ctrl.pack(fill=tk.X, padx=8, pady=4)
-
-        auto_scroll = tk.BooleanVar(value=True)
-        paused      = tk.BooleanVar(value=False)
-        tk.Checkbutton(ctrl, text="Auto-scroll", variable=auto_scroll,
-                       bg=_PNL, fg=_FG, selectcolor=_BG,
-                       activebackground=_PNL).pack(side=tk.LEFT)
-        tk.Checkbutton(ctrl, text="Pause", variable=paused,
-                       bg=_PNL, fg=_FG, selectcolor=_BG,
-                       activebackground=_PNL).pack(side=tk.LEFT, padx=8)
-        _btn(ctrl, "Clear", lambda: (
-            [tree.delete(i) for i in tree.get_children()],
+        def _clear_tree():
+            tree.clear()
             _row_data.clear()
-        )).pack(side=tk.LEFT)
+        ctrl_lay.addWidget(_btn(ctrl, "Clear", _clear_tree))
+        ctrl_lay.addStretch(1)
 
-        # ── Traffic Ctrl+F search bar ─────────────────────────────────────────
-        search_frame = tk.Frame(left, bg=_PNL)
-        search_frame.pack(fill=tk.X, padx=4, pady=(0, 2))
-        _lbl(search_frame, "Find:", fg=_DIM, bg=_PNL).pack(side=tk.LEFT, padx=(4, 2))
-        traffic_search_var = tk.StringVar()
-        traffic_search_entry = _entry(search_frame)
-        traffic_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        search_frame.pack_forget()   # hidden until Ctrl+F
-
-        def _traffic_search_apply(*_):
-            q = traffic_search_var.get().lower()
-            for iid, d in _row_data.items():
-                visible = (not q or q in d["path"].lower()
-                           or q in str(d["status"])
-                           or q in d["ct"].lower()
-                           or q in d["method"].lower())
-                if not visible:
-                    try:
-                        tree.detach(iid)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        tree.reattach(iid, "", "end")
-                    except Exception:
-                        pass
-
-        def _traffic_search_close(*_):
-            traffic_search_var.set("")
-            _traffic_search_apply()
-            search_frame.pack_forget()
-            tree.focus_set()
-
-        traffic_search_var.trace_add("write", _traffic_search_apply)
-        traffic_search_entry.bind("<Escape>", _traffic_search_close)
-        traffic_search_entry.bind("<Return>", lambda e: tree.focus_set())
-
-        def _show_traffic_search(_event=None):
-            search_frame.pack(fill=tk.X, padx=4, pady=(0, 2),
-                              after=ctrl)
-            traffic_search_entry.focus_set()
-            return "break"
-
-        left.bind_all("<Control-f>", _show_traffic_search)
-        left.bind_all("<Control-F>", _show_traffic_search)
+        # ── Traffic Ctrl+F search bar (hidden until Ctrl+F) ──────────────────
+        search_frame = QWidget(left); search_frame.setStyleSheet(f"background: {_PNL};")
+        sf_lay = QHBoxLayout(search_frame); sf_lay.setContentsMargins(4, 0, 4, 0); sf_lay.setSpacing(4)
+        sf_lay.addWidget(_lbl(search_frame, "Find:", color=_DIM))
+        traffic_search_edit = _entry(search_frame)
+        sf_lay.addWidget(traffic_search_edit, 1)
+        search_frame.setVisible(False)
+        left_lay.addWidget(search_frame)
 
         _row_data: dict[str, dict] = {}
+        _row_counter = [0]   # monotonic iid generator (id() can collide after GC)
         _MAX_ROWS = 800
 
-        # ── RIGHT: body editor ────────────────────────────────────────────────
-        _lbl(right, "Body Editor", fg=_ACC, font=("Consolas", 11, "bold"),
-             bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
+        def _traffic_search_apply(*_):
+            q = traffic_search_edit.text().lower()
+            for i in range(tree.topLevelItemCount()):
+                item = tree.topLevelItem(i)
+                iid = item.data(0, Qt.ItemDataRole.UserRole)
+                d = _row_data.get(iid, {})
+                visible = (not q or q in str(d.get("path", "")).lower()
+                           or q in str(d.get("status", ""))
+                           or q in str(d.get("ct", "")).lower()
+                           or q in str(d.get("method", "")).lower())
+                item.setHidden(not visible)
 
-        info_var = tk.StringVar(value="← Select a request")
-        _lbl(right, textvariable=info_var, fg=_ACC, bg=_PNL).pack(anchor="w", padx=8)
+        traffic_search_edit.textChanged.connect(_traffic_search_apply)
 
-        body_box = _text_box(right)
-        body_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        _bind_editor_keys(body_box)
+        def _traffic_search_close():
+            traffic_search_edit.clear()
+            search_frame.setVisible(False)
+            tree.setFocus()
 
-        # ── Body editor Ctrl+F find bar ───────────────────────────────────────
-        body_find_frame = tk.Frame(right, bg=_PNL)
-        body_find_frame.pack(fill=tk.X, padx=8, pady=(0, 2))
-        _lbl(body_find_frame, "Find:", fg=_DIM, bg=_PNL).pack(side=tk.LEFT, padx=(0, 2))
-        body_find_entry = _entry(body_find_frame, width=22)
-        body_find_entry.pack(side=tk.LEFT, padx=(0, 4))
-        body_find_match_lbl = _lbl(body_find_frame, text="", fg=_DIM, bg=_PNL)
-        body_find_match_lbl.pack(side=tk.LEFT)
-        body_find_frame.pack_forget()  # hidden until Ctrl+F
+        def _traffic_search_show(*_):
+            search_frame.setVisible(True)
+            traffic_search_edit.setFocus()
+        _sc1 = QShortcut(QKeySequence("Ctrl+F"), win)
+        _sc1.activated.connect(_traffic_search_show)
+        _sc2 = QShortcut(QKeySequence("Escape"), traffic_search_edit)
+        _sc2.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _sc2.activated.connect(_traffic_search_close)
+
+        # ── RIGHT: body editor ──────────────────────────────────────────────
+        right_lay.addWidget(_lbl(right, "Body Editor", font=_mono_lg, color=_ACC))
+        info_lbl = _lbl(right, "← Select a request", color=_ACC)
+        right_lay.addWidget(info_lbl)
+
+        body_box = _text_box(right, wrap=True)
+        right_lay.addWidget(body_box, 1)
+
+        # Body editor Ctrl+F find bar (hidden until Ctrl+F in body_box)
+        body_find_frame = QWidget(right); body_find_frame.setStyleSheet(f"background: {_PNL};")
+        bf_lay = QHBoxLayout(body_find_frame); bf_lay.setContentsMargins(0, 0, 0, 0); bf_lay.setSpacing(4)
+        bf_lay.addWidget(_lbl(body_find_frame, "Find:", color=_DIM))
+        body_find_edit = _entry(body_find_frame)
+        bf_lay.addWidget(body_find_edit, 1)
+        body_find_match_lbl = _lbl(body_find_frame, "", color=_DIM)
+        bf_lay.addWidget(body_find_match_lbl)
+        body_find_frame.setVisible(False)
+        right_lay.addWidget(body_find_frame)
 
         _body_find_positions: list = []
-        _body_find_idx       = [0]
+        _body_find_idx = [0]
 
         def _body_find_apply(*_):
-            body_box.tag_remove("find_hi", "1.0", "end")
+            q = body_find_edit.text()
             _body_find_positions.clear()
-            q = body_find_entry.get()
-            if not q:
-                body_find_match_lbl.config(text="")
-                return
-            start = "1.0"
-            while True:
-                pos = body_box.search(q, start, stopindex="end", nocase=True)
-                if not pos:
-                    break
-                end_pos = f"{pos}+{len(q)}c"
-                body_box.tag_add("find_hi", pos, end_pos)
-                _body_find_positions.append(pos)
-                start = end_pos
-            body_box.tag_config("find_hi", background="#ffcc00", foreground="#000000")
+            _body_find_positions.extend(_find_all(body_box, q))
             n = len(_body_find_positions)
-            body_find_match_lbl.config(text=f"{n} match{'es' if n != 1 else ''}")
+            body_find_match_lbl.setText(f"{n} match{'es' if n != 1 else ''}")
             if _body_find_positions:
                 _body_find_idx[0] = 0
-                body_box.see(_body_find_positions[0])
+                cur = QTextCursor(body_box.document())
+                cur.setPosition(_body_find_positions[0])
+                body_box.setTextCursor(cur)
 
-        def _body_find_next(_event=None):
+        def _body_find_next():
             if not _body_find_positions:
-                return "break"
+                return
             _body_find_idx[0] = (_body_find_idx[0] + 1) % len(_body_find_positions)
-            body_box.see(_body_find_positions[_body_find_idx[0]])
-            return "break"
+            cur = QTextCursor(body_box.document())
+            cur.setPosition(_body_find_positions[_body_find_idx[0]])
+            body_box.setTextCursor(cur)
 
-        def _body_find_prev(_event=None):
+        def _body_find_prev():
             if not _body_find_positions:
-                return "break"
+                return
             _body_find_idx[0] = (_body_find_idx[0] - 1) % len(_body_find_positions)
-            body_box.see(_body_find_positions[_body_find_idx[0]])
-            return "break"
+            cur = QTextCursor(body_box.document())
+            cur.setPosition(_body_find_positions[_body_find_idx[0]])
+            body_box.setTextCursor(cur)
 
-        def _body_find_close(_event=None):
-            body_box.tag_remove("find_hi", "1.0", "end")
-            body_find_frame.pack_forget()
-            body_box.focus_set()
+        def _body_find_close():
+            body_box.setExtraSelections([])
+            body_find_frame.setVisible(False)
+            body_box.setFocus()
 
-        body_find_entry.bind("<Return>",       _body_find_next)
-        body_find_entry.bind("<Shift-Return>", _body_find_prev)
-        body_find_entry.bind("<Escape>",       _body_find_close)
-        body_find_entry.bind("<KeyRelease>",   _body_find_apply)
+        body_find_edit.textChanged.connect(_body_find_apply)
+        body_find_edit.returnPressed.connect(_body_find_next)
+        _sc3 = QShortcut(QKeySequence("Shift+Return"), body_find_edit)
+        _sc3.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _sc3.activated.connect(_body_find_prev)
+        _sc4 = QShortcut(QKeySequence("Escape"), body_find_edit)
+        _sc4.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _sc4.activated.connect(_body_find_close)
 
-        def _show_body_find(_event=None):
-            body_find_frame.pack(fill=tk.X, padx=8, pady=(0, 2), before=body_box)
-            body_find_entry.focus_set()
-            sel = ""
-            try:
-                sel = body_box.get("sel.first", "sel.last")
-            except tk.TclError:
-                pass
+        def _show_body_find(*_):
+            body_find_frame.setVisible(True)
+            body_find_edit.setFocus()
+            sel = body_box.textCursor().selectedText()
             if sel:
-                body_find_entry.delete(0, "end")
-                body_find_entry.insert(0, sel)
+                body_find_edit.setText(sel)
                 _body_find_apply()
-            return "break"
+        _sc5 = QShortcut(QKeySequence("Ctrl+F"), body_box)
+        _sc5.setContext(Qt.ShortcutContext.WidgetShortcut)
+        _sc5.activated.connect(_show_body_find)
 
-        body_box.bind("<Control-f>", _show_body_find)
-        body_box.bind("<Control-F>", _show_body_find)
+        # ── Hook save controls ──────────────────────────────────────────────
+        save_frame = QWidget(right); save_frame.setStyleSheet(f"background: {_PNL};")
+        sf2 = QVBoxLayout(save_frame); sf2.setContentsMargins(0, 0, 0, 0); sf2.setSpacing(2)
+        right_lay.addWidget(save_frame)
 
-        # Hook save controls
-        save_frame = tk.Frame(right, bg=_PNL)
-        save_frame.pack(fill=tk.X, padx=8, pady=(0, 2))
+        row1 = QWidget(save_frame); r1 = QHBoxLayout(row1); r1.setContentsMargins(0, 0, 0, 0); r1.setSpacing(4)
+        row2 = QWidget(save_frame); r2 = QHBoxLayout(row2); r2.setContentsMargins(0, 0, 0, 0); r2.setSpacing(4)
+        row3 = QWidget(save_frame); r3 = QHBoxLayout(row3); r3.setContentsMargins(0, 0, 0, 0); r3.setSpacing(4)
+        sf2.addWidget(row1); sf2.addWidget(row2); sf2.addWidget(row3)
 
-        row1 = tk.Frame(save_frame, bg=_PNL); row1.pack(fill=tk.X, pady=2)
-        row2 = tk.Frame(save_frame, bg=_PNL); row2.pack(fill=tk.X, pady=2)
-        row3 = tk.Frame(save_frame, bg=_PNL); row3.pack(fill=tk.X, pady=2)
-
-        _lbl(row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        name_entry = _entry(row1, width=14)
-        name_entry.pack(side=tk.LEFT, padx=(2, 10))
-
-        _lbl(row1, "Method:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        r1.addWidget(_lbl(row1, "Name:", color=_ACC))
+        name_edit = _entry(row1, width=14); r1.addWidget(name_edit)
+        r1.addWidget(_lbl(row1, "Method:", color=_ACC))
         _METHOD_OPTS = ["*", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
         _RH_METHOD_OPTS = _METHOD_OPTS   # shared by the Firefox-Proxy request-hook tab
-        method_var = tk.StringVar(value="*")
-        method_menu = ttk.Combobox(row1, textvariable=method_var, values=_METHOD_OPTS,
-                                   width=7, state="readonly", font=("Consolas", 10))
-        method_menu.pack(side=tk.LEFT, padx=(2, 10))
-
-        _lbl(row1, "Status:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
+        method_combo = QComboBox(row1); method_combo.setEditable(False)
+        method_combo.addItems(_METHOD_OPTS); method_combo.setCurrentText("*")
+        method_combo.setFont(_mono); method_combo.setMaximumWidth(90)
+        r1.addWidget(method_combo)
+        r1.addWidget(_lbl(row1, "Status:", color=_ACC))
         _STATUS_OPTS = ["*", "200", "201", "204", "301", "302", "304",
                         "400", "401", "403", "404", "405", "419", "422",
                         "500", "502", "503"]
-        status_var = tk.StringVar(value="*")
-        status_menu = ttk.Combobox(row1, textvariable=status_var, values=_STATUS_OPTS,
-                                   width=6, state="readonly", font=("Consolas", 10))
-        status_menu.pack(side=tk.LEFT, padx=(2, 0))
+        status_combo = QComboBox(row1); status_combo.setEditable(False)
+        status_combo.addItems(_STATUS_OPTS); status_combo.setCurrentText("*")
+        status_combo.setFont(_mono); status_combo.setMaximumWidth(80)
+        r1.addWidget(status_combo)
+        r1.addStretch(1)
 
-        _lbl(row2, "Pattern URL:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        pat_entry = _entry(row2, width=34)
-        pat_entry.insert(0, r".*")
-        pat_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
+        r2.addWidget(_lbl(row2, "Pattern URL:", color=_ACC))
+        pat_edit = _entry(row2); pat_edit.setText(r".*")
+        r2.addWidget(pat_edit, 1)
 
-        # Origin URL — which domain/host this hook targets.
-        #   * / empty / "any"  → any origin (target site + all CDNs)
-        #   "target"           → only the main target site (MAIN_HOST)
-        #   a hostname         → that specific host (suffix match: "example.com"
-        #                        also matches "cdn.example.com")
-        _lbl(row3, "Origin URL:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        origin_entry = _entry(row3, width=20)
-        origin_entry.insert(0, "*")
-        origin_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
-        _lbl(row3, "  (target / * / host)", fg=_DIM, bg=_PNL).pack(side=tk.LEFT)
+        r3.addWidget(_lbl(row3, "Origin URL:", color=_ACC))
+        origin_edit = _entry(row3); origin_edit.setText("*")
+        r3.addWidget(origin_edit, 1)
+        r3.addWidget(_lbl(row3, "  (target / * / host)", color=_DIM))
 
-        save_status = _lbl(right, text="", fg=_DIM, bg=_PNL)
-        save_status.pack(anchor="w", padx=8, pady=(0, 2))
+        save_status_lbl = _lbl(right, "", color=_DIM)
+        right_lay.addWidget(save_status_lbl)
 
-        def _on_select(_event):
-            sel = tree.selection()
-            if not sel:
+        def _on_select(*_):
+            items = tree.selectedItems()
+            if not items:
                 return
-            iid  = sel[0]
+            item = items[0]
+            iid = item.data(0, Qt.ItemDataRole.UserRole)
             data = _row_data.get(iid)
             if not data:
                 return
@@ -1542,11 +1667,10 @@ def _launch_hook_gui() -> None:
             _info_prefix = f"[{_info_origin}]  " if _info_origin else ""
             _info_wt = data.get("web_type", "")
             _info_wt_s = f"  {_info_wt}" if _info_wt else ""
-            info_var.set(f"{_info_prefix}{data['method']}  {path_qs}  [{data['status']}]{_info_wt_s}  {data['ct']}")
+            info_lbl.setText(
+                f"{_info_prefix}{data['method']}  {path_qs}  [{data['status']}]{_info_wt_s}  {data['ct']}")
 
             raw_body = data["body"]
-            body_box.config(state="normal")
-            body_box.delete("1.0", "end")
             try:
                 txt = raw_body.decode("utf-8", errors="replace")
             except Exception:
@@ -1556,63 +1680,48 @@ def _launch_hook_gui() -> None:
                     txt = json.dumps(json.loads(txt), indent=2, ensure_ascii=False)
                 except Exception:
                     pass
-            body_box.insert("1.0", txt)
+            body_box.setPlainText(txt)
 
-            # Auto-populate hook editor fields from selected request
-            method_var.set(data["method"] if data["method"] in _METHOD_OPTS else "*")
+            method_combo.setCurrentText(data["method"] if data["method"] in _METHOD_OPTS else "*")
             sc = str(data["status"])
-            status_var.set(sc if sc in _STATUS_OPTS else "*")
-            # Path pattern: insert raw path — user can add anchors/wildcards manually.
-            # re.escape() was here before and produced ugly \/ and \. escapes.
-            pat_entry.delete(0, "end")
-            pat_entry.insert(0, data["path"])
-            # Origin: auto-populate from the traffic log entry's origin field.
-            # If it's the main target site, use "target"; otherwise use the CDN host.
+            status_combo.setCurrentText(sc if sc in _STATUS_OPTS else "*")
+            pat_edit.setText(data["path"])
             _data_origin = data.get("origin", "")
-            origin_entry.delete(0, "end")
-            if _data_origin:
-                origin_entry.insert(0, _data_origin)
-            else:
-                origin_entry.insert(0, "*")
-            # Auto-suggest name from path (only if name field is empty).
-            # Use the deepest meaningful segment, skipping hashes/UUIDs.
-            if not name_entry.get().strip():
+            origin_edit.setText(_data_origin if _data_origin else "*")
+            if not name_edit.text().strip():
                 segs = [s for s in data["path"].split("/") if s]
                 name_candidate = ""
                 for seg in reversed(segs):
-                    # Skip hash-like or UUID-like segments (long, mostly hex/dots)
-                    clean = seg.split("=")[-1]   # strip k= prefix
+                    clean = seg.split("=")[-1]
                     if len(clean) > 32 and re.search(r'^[A-Za-z0-9._-]+$', clean):
-                        continue   # looks like a hash — skip
+                        continue
                     name_candidate = clean[:28]
                     break
                 if not name_candidate and segs:
-                    # Fallback: use last two segments joined
                     name_candidate = "_".join(s[:12] for s in segs[-2:])[:28]
                 if name_candidate:
-                    name_entry.delete(0, "end")
-                    name_entry.insert(0, name_candidate)
+                    name_edit.setText(name_candidate)
 
-        tree.bind("<<TreeviewSelect>>", _on_select)
+        tree.itemSelectionChanged.connect(_on_select)
 
-        # ── Toolbar: Copy as cURL + Export/Import hooks ───────────────────────
-        toolbar = tk.Frame(right, bg=_PNL)
-        toolbar.pack(fill=tk.X, padx=8, pady=(0, 4))
+        # ── Toolbar: Copy as cURL + Export/Import hooks ─────────────────────
+        toolbar = QWidget(right); toolbar.setStyleSheet(f"background: {_PNL};")
+        tb_lay = QHBoxLayout(toolbar); tb_lay.setContentsMargins(0, 0, 0, 0); tb_lay.setSpacing(4)
+        right_lay.addWidget(toolbar)
 
         def _copy_as_curl():
-            sel = tree.selection()
-            if not sel:
+            items = tree.selectedItems()
+            if not items:
                 return
-            data = _row_data.get(sel[0])
+            iid = items[0].data(0, Qt.ItemDataRole.UserRole)
+            data = _row_data.get(iid)
             if not data:
                 return
-            # Build a minimal cURL command from traffic log entry
-            url   = f"http://localhost:{PORT}{data['path']}"
+            url = f"http://localhost:{PORT}{data['path']}"
             if data.get("query"):
                 url += f"?{data['query']}"
             method = data["method"]
-            parts  = [f"curl -X {method}"]
-            # Include request headers in cURL command
+            parts = [f"curl -X {method}"]
             for k, v in (data.get("req_headers") or {}).items():
                 kl = k.lower()
                 if kl in ("host", "content-length", "transfer-encoding"):
@@ -1624,42 +1733,39 @@ def _launch_hook_gui() -> None:
                 parts.append(f"  -d '{body_str}'")
             parts.append(f"  '{url}'")
             curl_str = " \\\n".join(parts)
-            root.clipboard_clear()
-            root.clipboard_append(curl_str)
-            save_status.config(text="cURL copied to clipboard.", fg=_GRN)
+            QApplication.clipboard().setText(curl_str)
+            save_status_lbl.setText("cURL copied to clipboard.")
+            save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
 
         def _copy_req_headers():
-            """Copy request headers of selected traffic log entry to clipboard."""
-            sel = tree.selection()
-            if not sel:
-                save_status.config(text="Select a request first.", fg=_RED)
+            items = tree.selectedItems()
+            if not items:
+                save_status_lbl.setText("Select a request first.")
+                save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
                 return
-            data = _row_data.get(sel[0])
+            iid = items[0].data(0, Qt.ItemDataRole.UserRole)
+            data = _row_data.get(iid)
             if not data:
                 return
             hdrs = data.get("req_headers") or {}
             if not hdrs:
-                save_status.config(text="No request headers captured for this entry.", fg=_RED)
+                save_status_lbl.setText("No request headers captured for this entry.")
+                save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
                 return
             lines = []
-            # First line: method + path
             path_qs = data["path"] + (f"?{data['query']}" if data.get("query") else "")
             lines.append(f"{data['method']} {path_qs}")
             lines.append("")
             for k, v in hdrs.items():
                 lines.append(f"{k}: {v}")
-            txt = "\n".join(lines)
-            root.clipboard_clear()
-            root.clipboard_append(txt)
-            save_status.config(text=f"Request headers copied ({len(hdrs)} headers).", fg=_GRN)
+            QApplication.clipboard().setText("\n".join(lines))
+            save_status_lbl.setText(f"Request headers copied ({len(hdrs)} headers).")
+            save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
 
         def _export_hooks():
-            from tkinter.filedialog import asksaveasfilename
-            fp = asksaveasfilename(
-                title="Export Hooks", defaultextension=".json",
-                filetypes=[("JSON", "*.json"), ("All", "*.*")],
-                initialfile=f"{SITE_NAME}_hooks.json",
-            )
+            fp, _ = QFileDialog.getSaveFileName(
+                win, "Export Hooks", f"{SITE_NAME}_hooks.json",
+                "JSON (*.json);;All (*)")
             if not fp:
                 return
             with _gui_hooks_lock:
@@ -1670,14 +1776,11 @@ def _launch_hook_gui() -> None:
                 ]
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(export_data, f, indent=2)
-            save_status.config(text=f"Exported {len(export_data)} hook(s).", fg=_GRN)
+            save_status_lbl.setText(f"Exported {len(export_data)} hook(s).")
+            save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
 
         def _import_hooks():
-            from tkinter.filedialog import askopenfilename
-            fp = askopenfilename(
-                title="Import Hooks",
-                filetypes=[("JSON", "*.json"), ("All", "*.*")],
-            )
+            fp, _ = QFileDialog.getOpenFileName(win, "Import Hooks", "", "JSON (*.json);;All (*)")
             if not fp:
                 return
             try:
@@ -1686,13 +1789,13 @@ def _launch_hook_gui() -> None:
                 imported = 0
                 for item in items:
                     hook = {
-                        "name":        item.get("name", "imported"),
-                        "method":      item.get("method", "*"),
-                        "status":      int(item.get("status", 200)),
-                        "pattern":     item.get("pattern", ".*"),
-                        "origin_url":  item.get("origin_url", item.get("origin", "*")),
-                        "body_bytes":  item.get("body", "").encode("utf-8"),
-                        "enabled":     item.get("enabled", True),
+                        "name":       item.get("name", "imported"),
+                        "method":     item.get("method", "*"),
+                        "status":     int(item.get("status", 200)),
+                        "pattern":    item.get("pattern", ".*"),
+                        "origin_url": item.get("origin_url", item.get("origin", "*")),
+                        "body_bytes": item.get("body", "").encode("utf-8"),
+                        "enabled":    item.get("enabled", True),
                     }
                     with _gui_hooks_lock:
                         names = [h["name"] for h in _gui_hooks]
@@ -1700,102 +1803,95 @@ def _launch_hook_gui() -> None:
                             _gui_hooks.append(hook)
                             imported += 1
                 _render_hook_rows()
-                save_status.config(text=f"Imported {imported} hook(s).", fg=_GRN)
+                save_status_lbl.setText(f"Imported {imported} hook(s).")
+                save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
             except Exception as e:
-                messagebox.showerror("S2L", f"Import failed: {e}")
+                QMessageBox.critical(win, "S2L", f"Import failed: {e}")
 
-        _btn(toolbar, "Copy as cURL",        _copy_as_curl,      font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 4))
-        _btn(toolbar, "Copy Request Headers", _copy_req_headers,  font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 4))
-        _btn(toolbar, "Export Hooks",         _export_hooks,      font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 4))
-        _btn(toolbar, "Import Hooks",         _import_hooks,      font=("Consolas", 9)).pack(side=tk.LEFT)
+        tb_lay.addWidget(_btn(toolbar, "Copy as cURL", _copy_as_curl, font=_mono_sm))
+        tb_lay.addWidget(_btn(toolbar, "Copy Request Headers", _copy_req_headers, font=_mono_sm))
+        tb_lay.addWidget(_btn(toolbar, "Export Hooks", _export_hooks, font=_mono_sm))
+        tb_lay.addWidget(_btn(toolbar, "Import Hooks", _import_hooks, font=_mono_sm))
+        tb_lay.addStretch(1)
 
-        # ── BOTTOM: Active Hooks ──────────────────────────────────────────────
-        _lbl(bot_area, "Active Hooks", fg=_ACC,
-             font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(4, 2))
+        # ── BOTTOM: Active Hooks ───────────────────────────────────────────
+        bot_lay.addWidget(_lbl(bot_area, "Active Hooks", font=_mono_lg, color=_ACC))
 
-        hooks_scroll_frame = tk.Frame(bot_area, bg=_PNL)
-        hooks_scroll_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
-
-        hksb = ttk.Scrollbar(hooks_scroll_frame, orient="vertical")
-        hksb.pack(side=tk.RIGHT, fill=tk.Y)
-        hooks_canvas = tk.Canvas(hooks_scroll_frame, bg=_PNL, bd=0,
-                                 highlightthickness=0, yscrollcommand=hksb.set)
-        hooks_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        hksb.config(command=hooks_canvas.yview)
-
-        hooks_frame = tk.Frame(hooks_canvas, bg=_PNL)
-        hf_win = hooks_canvas.create_window((0, 0), window=hooks_frame, anchor="nw")
-
-        def _on_hf_configure(_e):
-            hooks_canvas.configure(scrollregion=hooks_canvas.bbox("all"))
-        def _on_canvas_configure(e):
-            hooks_canvas.itemconfig(hf_win, width=e.width)
-        hooks_frame.bind("<Configure>", _on_hf_configure)
-        hooks_canvas.bind("<Configure>", _on_canvas_configure)
+        hooks_scroll = QScrollArea(bot_area)
+        hooks_scroll.setWidgetResizable(True)
+        hooks_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        hooks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        hooks_inner = QWidget()
+        hooks_inner.setStyleSheet(f"background: {_PNL};")
+        hooks_grid = QGridLayout(hooks_inner)
+        hooks_grid.setContentsMargins(8, 4, 8, 4)
+        hooks_grid.setSpacing(4)
+        hooks_scroll.setWidget(hooks_inner)
+        bot_lay.addWidget(hooks_scroll, 1)
 
         _HOOK_COLS   = ("Name", "Method", "Status", "Origin", "Pattern", "On", "", "")
         _HOOK_WIDTHS = (16, 7, 6, 18, 28, 4, 4, 4)
 
         def _render_hook_rows():
-            for w in hooks_frame.winfo_children():
-                w.destroy()
+            # Clear existing rows (keep nothing — re-render from scratch)
+            while hooks_grid.count():
+                it = hooks_grid.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.deleteLater()
             for col_idx, (col_name, col_w) in enumerate(zip(_HOOK_COLS, _HOOK_WIDTHS)):
-                _lbl(hooks_frame, col_name, fg=_ACC, bg=_PNL,
-                     font=("Consolas", 9, "bold"),
-                     width=col_w, anchor="w").grid(row=0, column=col_idx, sticky="w", padx=3, pady=2)
+                lbl = _lbl(hooks_inner, col_name, font=_mono_sm_b, color=_ACC)
+                lbl.setMinimumWidth(col_w * 8)
+                hooks_grid.addWidget(lbl, 0, col_idx, Qt.AlignmentFlag.AlignLeft)
             with _gui_hooks_lock:
                 hooks_copy = list(_gui_hooks)
             if not hooks_copy:
-                _lbl(hooks_frame, "No hooks saved yet.", fg=_DIM, bg=_PNL).grid(
-                    row=1, column=0, columnspan=8, sticky="w", padx=4, pady=4)
+                hooks_grid.addWidget(_lbl(hooks_inner, "No hooks saved yet.", color=_DIM),
+                                      1, 0, 1, 8, Qt.AlignmentFlag.AlignLeft)
                 return
             for row_idx, h in enumerate(hooks_copy, start=1):
                 row_fg = _FG if h["enabled"] else _DIM
-                _lbl(hooks_frame, h["name"], bg=_PNL, fg=row_fg,
-                     width=16, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
-                _lbl(hooks_frame, h["method"], bg=_PNL,
-                     fg=_YLW if h["enabled"] else _DIM,
-                     width=7, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
-                _lbl(hooks_frame, str(h["status"]), bg=_PNL,
-                     fg=_GRN if h["enabled"] else _DIM,
-                     width=6, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
+                hooks_grid.addWidget(_lbl(hooks_inner, h["name"], color=row_fg),
+                                      row_idx, 0, Qt.AlignmentFlag.AlignLeft)
+                hooks_grid.addWidget(_lbl(hooks_inner, h["method"],
+                                          color=_YLW if h["enabled"] else _DIM),
+                                      row_idx, 1, Qt.AlignmentFlag.AlignLeft)
+                hooks_grid.addWidget(_lbl(hooks_inner, str(h["status"]),
+                                          color=_GRN if h["enabled"] else _DIM),
+                                      row_idx, 2, Qt.AlignmentFlag.AlignLeft)
                 _origin_disp = h.get("origin_url", "*") or "*"
                 if len(_origin_disp) > 18:
                     _origin_disp = _origin_disp[:17] + "…"
-                _lbl(hooks_frame, _origin_disp, bg=_PNL,
-                     fg=_CYN if h["enabled"] else _DIM,
-                     width=18, anchor="w").grid(row=row_idx, column=3, sticky="w", padx=3)
-                _lbl(hooks_frame,
-                     h["pattern"][:28] + ("…" if len(h["pattern"]) > 28 else ""),
-                     bg=_PNL, fg=_DIM, width=28, anchor="w").grid(row=row_idx, column=4, sticky="w", padx=3)
+                hooks_grid.addWidget(_lbl(hooks_inner, _origin_disp,
+                                          color=_CYN if h["enabled"] else _DIM),
+                                      row_idx, 3, Qt.AlignmentFlag.AlignLeft)
+                _pat_disp = h["pattern"][:28] + ("…" if len(h["pattern"]) > 28 else "")
+                hooks_grid.addWidget(_lbl(hooks_inner, _pat_disp, color=_DIM),
+                                      row_idx, 4, Qt.AlignmentFlag.AlignLeft)
 
                 # Enabled toggle
-                bv = tk.BooleanVar(value=h["enabled"])
-                def _make_toggle(hook_ref, var):
-                    def _toggle():
+                cb = QCheckBox(hooks_inner)
+                cb.setChecked(h["enabled"])
+
+                def _make_toggle(hook_ref, checkbox):
+                    def _toggle(_checked):
                         with _gui_hooks_lock:
-                            hook_ref["enabled"] = var.get()
+                            hook_ref["enabled"] = checkbox.isChecked()
                         _hook_save_to_disk(hook_ref)
                         _render_hook_rows()
                     return _toggle
-                tk.Checkbutton(hooks_frame, variable=bv, command=_make_toggle(h, bv),
-                               bg=_PNL, fg=_FG, selectcolor=_BG,
-                               activebackground=_PNL,
-                               width=2).grid(row=row_idx, column=5, padx=3)
+                cb.stateChanged.connect(_make_toggle(h, cb))
+                hooks_grid.addWidget(cb, row_idx, 5, Qt.AlignmentFlag.AlignCenter)
 
-                # Edit — load hook back into the editor
+                # Edit
                 def _make_edit(hook_ref):
                     def _edit():
-                        name_entry.delete(0, "end")
-                        name_entry.insert(0, hook_ref["name"])
-                        method_var.set(hook_ref["method"] if hook_ref["method"] in _METHOD_OPTS else "*")
+                        name_edit.setText(hook_ref["name"])
+                        method_combo.setCurrentText(hook_ref["method"] if hook_ref["method"] in _METHOD_OPTS else "*")
                         sc = str(hook_ref["status"])
-                        status_var.set(sc if sc in _STATUS_OPTS else "200")
-                        pat_entry.delete(0, "end")
-                        pat_entry.insert(0, hook_ref["pattern"])
-                        origin_entry.delete(0, "end")
-                        origin_entry.insert(0, hook_ref.get("origin_url", "*") or "*")
-                        body_box.delete("1.0", "end")
+                        status_combo.setCurrentText(sc if sc in _STATUS_OPTS else "200")
+                        pat_edit.setText(hook_ref["pattern"])
+                        origin_edit.setText(hook_ref.get("origin_url", "*") or "*")
                         try:
                             txt = hook_ref["body_bytes"].decode("utf-8", errors="replace")
                             if hook_ref["body_bytes"].startswith(b"{") or hook_ref["body_bytes"].startswith(b"["):
@@ -1805,12 +1901,15 @@ def _launch_hook_gui() -> None:
                                     pass
                         except Exception:
                             txt = hook_ref["body_bytes"].hex()
-                        body_box.insert("1.0", txt)
-                        save_status.config(text=f"Editing '{hook_ref['name']}'", fg=_YLW)
+                        body_box.setPlainText(txt)
+                        save_status_lbl.setText(f"Editing '{hook_ref['name']}'")
+                        save_status_lbl.setStyleSheet(f"color: {_YLW}; background: transparent;")
                     return _edit
-                _btn(hooks_frame, "Ed", _make_edit(h),
-                     font=("Consolas", 8), bg="#051a05",
-                     fg=_GRN).grid(row=row_idx, column=6, padx=3)
+                _ed_btn = _btn(hooks_inner, "Ed", _make_edit(h), font=_mono_xs)
+                _ed_btn.setStyleSheet(f"background: {_GRN_BG}; color: {_GRN}; border: 1px solid #2a4a35;")
+                _ed_btn.setMaximumWidth(36)
+                hooks_grid.addWidget(_ed_btn,
+                                      row_idx, 6, Qt.AlignmentFlag.AlignCenter)
 
                 # Delete
                 def _make_del(hook_name):
@@ -1822,15 +1921,17 @@ def _launch_hook_gui() -> None:
                                 _gui_hooks.pop(idx)
                         _hook_delete_from_disk(hook_name)
                         _render_hook_rows()
-                        save_status.config(text=f"Deleted '{hook_name}'.", fg=_YLW)
+                        save_status_lbl.setText(f"Deleted '{hook_name}'.")
+                        save_status_lbl.setStyleSheet(f"color: {_YLW}; background: transparent;")
                     return _del
-                _btn(hooks_frame, "X", _make_del(h["name"]),
-                     bg="#1a0505", fg=_RED,
-                     font=("Consolas", 8)).grid(row=row_idx, column=7, padx=3)
+                del_btn = _btn(hooks_inner, "X", _make_del(h["name"]), font=_mono_xs)
+                del_btn.setStyleSheet(f"background: {_RED_BG}; color: {_RED}; border: 1px solid #5a2a30;")
+                del_btn.setMaximumWidth(36)
+                hooks_grid.addWidget(del_btn, row_idx, 7, Qt.AlignmentFlag.AlignCenter)
 
         _render_hook_rows()
 
-        # ── Hook disk persistence — delegates to the shared store factory ──────
+        # ── Hook disk persistence — delegates to the shared store factory ──
         _hook_save_to_disk, _hook_delete_from_disk, _hook_load_all = _make_hook_store("MyHooks")
 
         def _load_hooks_from_disk() -> None:
@@ -1846,340 +1947,274 @@ def _launch_hook_gui() -> None:
                         _gui_hooks.append(hook)
                         log(f"Loaded hook '{hook['name']}' from disk", "HOOK")
 
-        root.after(100, lambda: (_load_hooks_from_disk(), _render_hook_rows()))
+        QTimer.singleShot(100, lambda: (_load_hooks_from_disk(), _render_hook_rows()))
 
         def _save_hook():
-            name = name_entry.get().strip()
+            name = name_edit.text().strip()
             if not name:
-                messagebox.showwarning("S2L", "Hook name is required.")
+                QMessageBox.warning(win, "S2L", "Hook name is required.")
                 return
             with _gui_hooks_lock:
                 existing_names = [h["name"] for h in _gui_hooks]
             if name in existing_names:
-                if not messagebox.askyesno("S2L",
-                        f"A hook named '{name}' already exists.\nReplace it?"):
+                if QMessageBox.question(win, "S2L",
+                        f"A hook named '{name}' already exists.\nReplace it?"
+                    ) != QMessageBox.StandardButton.Yes:
                     return
                 with _gui_hooks_lock:
                     for i, h in enumerate(_gui_hooks):
                         if h["name"] == name:
                             _gui_hooks.pop(i)
                             break
-            body_txt = body_box.get("1.0", "end-1c")
+            body_txt = body_box.toPlainText()
             if not body_txt.strip():
-                messagebox.showwarning("S2L", "Hook body is empty — nothing to inject.")
+                QMessageBox.warning(win, "S2L", "Hook body is empty — nothing to inject.")
                 return
-            _sv = status_var.get().strip()
-            status = 0 if _sv in ("*","any","") else (int(_sv) if _sv.isdigit() else None)
+            _sv = status_combo.currentText().strip()
+            status = 0 if _sv in ("*", "any", "") else (int(_sv) if _sv.isdigit() else None)
             if status is None:
-                messagebox.showerror("S2L", "Status must be a number or *.")
+                QMessageBox.critical(win, "S2L", "Status must be a number or *.")
                 return
-            pat_str = pat_entry.get().strip() or r".*"
+            pat_str = pat_edit.text().strip() or r".*"
             try:
                 re.compile(pat_str)
             except re.error as e:
-                messagebox.showerror("S2L", f"Invalid pattern: {e}")
+                QMessageBox.critical(win, "S2L", f"Invalid pattern: {e}")
                 return
-            origin_str = origin_entry.get().strip() or "*"
+            origin_str = origin_edit.text().strip() or "*"
             hook = {
-                "name":        name,
-                "method":      method_var.get(),
-                "status":      status,
-                "pattern":     pat_str,
-                "origin_url":  origin_str,
-                "body_bytes":  body_txt.encode("utf-8"),
-                "enabled":     True,
+                "name":       name,
+                "method":     method_combo.currentText(),
+                "status":     status,
+                "pattern":    pat_str,
+                "origin_url": origin_str,
+                "body_bytes": body_txt.encode("utf-8"),
+                "enabled":    True,
             }
             with _gui_hooks_lock:
                 _gui_hooks.append(hook)
             _hook_save_to_disk(hook)
             _render_hook_rows()
-            save_status.config(
-                text=f"Saved '{name}'  [{hook['method']}]  {hook['pattern']}",
-                fg=_GRN)
+            save_status_lbl.setText(
+                f"Saved '{name}'  [{hook['method']}]  {hook['pattern']}")
+            save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
             log(f"GUI hook saved: '{name}' [{hook['method']}] {hook['pattern']}", "HOOK")
 
         def _test_hook():
-            pat_str   = pat_entry.get().strip()
-            mf        = method_var.get()
-            test_path = simpledialog.askstring("Test Hook", "Enter a path to test:", parent=root)
-            if test_path is None:
+            pat_str = pat_edit.text().strip()
+            mf = method_combo.currentText()
+            test_path, ok = QInputDialog.getText(win, "Test Hook", "Enter a path to test:")
+            if not ok or test_path is None:
                 return
             try:
                 matched_pat = bool(re.search(pat_str, test_path, re.IGNORECASE))
             except re.error as e:
-                messagebox.showerror("S2L", f"Pattern error: {e}")
+                QMessageBox.critical(win, "S2L", f"Pattern error: {e}")
                 return
             matched_meth = mf in ("", "*")
             result = "MATCH" if matched_pat else "NO MATCH"
-            save_status.config(
-                text=f"{result}  pattern={'yes' if matched_pat else 'no'}  method={'any' if matched_meth else mf}",
-                fg=_GRN if matched_pat else _RED)
+            save_status_lbl.setText(
+                f"{result}  pattern={'yes' if matched_pat else 'no'}  "
+                f"method={'any' if matched_meth else mf}")
+            save_status_lbl.setStyleSheet(
+                f"color: {_GRN if matched_pat else _RED}; background: transparent;")
 
-        btn_row2 = tk.Frame(right, bg=_PNL)
-        btn_row2.pack(fill=tk.X, padx=8, pady=(0, 4))
-        _btn(btn_row2, "Save Hook", _save_hook,
-             font=("Consolas", 10, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        _btn(btn_row2, "Test Pattern", _test_hook,
-             font=("Consolas", 9)).pack(side=tk.LEFT)
+        btn_row2 = QWidget(right); btn_row2.setStyleSheet(f"background: {_PNL};")
+        br2 = QHBoxLayout(btn_row2); br2.setContentsMargins(0, 0, 0, 0); br2.setSpacing(4)
+        right_lay.addWidget(btn_row2)
+        _sb = _btn(btn_row2, "Save Hook", _save_hook, font=_mono_b)
+        br2.addWidget(_sb, 1)
+        br2.addWidget(_btn(btn_row2, "Test Pattern", _test_hook, font=_mono_sm))
 
-        # ══════════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
         # TAB 2: WebSocket Hooks
-        # Same shape as Tab 1 (Traffic / Hooks) but for WebSocket messages
-        # instead of HTTP responses. The body editor is split in two:
-        #   • LEFT  — fully editable hex dump (canonical: offset + hex bytes)
-        #   • RIGHT — read-only decoded text (UTF-8, best-effort), live-synced
-        # Hooks replace the payload of matching WS messages on the fly; the
-        # opcode is preserved so a text hook still ships as text and a binary
-        # hook still ships as binary.
-        # ══════════════════════════════════════════════════════════════════════
-        tab_ws = tk.Frame(nb, bg=_BG)
-        nb.add(tab_ws, text="  WebSocket Hooks")
+        # ════════════════════════════════════════════════════════════════════
+        tab_ws = QWidget()
+        nb.addTab(tab_ws, "  WebSocket Hooks")
 
-        ws_v_pane = tk.PanedWindow(tab_ws, orient=tk.VERTICAL, bg=_BG,
-                                   sashwidth=5, sashrelief="flat")
-        ws_v_pane.pack(fill=tk.BOTH, expand=True)
-        ws_top = tk.Frame(ws_v_pane, bg=_BG)
-        ws_bot = tk.Frame(ws_v_pane, bg=_PNL)
-        ws_v_pane.add(ws_top, minsize=360, height=600)
-        ws_v_pane.add(ws_bot, minsize=100, height=120)
+        ws_v = QSplitter(Qt.Orientation.Vertical, tab_ws); ws_v.setChildrenCollapsible(False)
+        ws_top = QWidget(); ws_bot = QWidget(); ws_bot.setStyleSheet(f"background: {_PNL};")
+        ws_v.addWidget(ws_top); ws_v.addWidget(ws_bot)
+        ws_v.setStretchFactor(0, 6); ws_v.setStretchFactor(1, 1)
+        ws_v.setSizes([600, 120])
+        ws_v_lay = QVBoxLayout(tab_ws); ws_v_lay.setContentsMargins(0, 0, 0, 0)
+        ws_v_lay.addWidget(ws_v)
 
-        # Horizontal split inside ws_top: left (WS log) | right (hook editor)
-        ws_h_pane = tk.PanedWindow(ws_top, orient=tk.HORIZONTAL, bg=_BG,
-                                   sashwidth=5, sashrelief="flat")
-        ws_h_pane.pack(fill=tk.BOTH, expand=True)
-        ws_left  = tk.Frame(ws_h_pane, bg=_PNL)
-        ws_right = tk.Frame(ws_h_pane, bg=_PNL)
-        ws_h_pane.add(ws_left,  minsize=480, width=520)
-        ws_h_pane.add(ws_right, minsize=360, width=460)
+        ws_h = QSplitter(Qt.Orientation.Horizontal, ws_top); ws_h.setChildrenCollapsible(False)
+        ws_left  = QWidget(); ws_left.setStyleSheet(f"background: {_PNL};")
+        ws_right = QWidget(); ws_right.setStyleSheet(f"background: {_PNL};")
+        ws_h.addWidget(ws_left); ws_h.addWidget(ws_right)
+        ws_h.setStretchFactor(0, 50); ws_h.setStretchFactor(1, 50)
+        ws_h.setSizes([520, 460])
+        ws_top_lay = QVBoxLayout(ws_top); ws_top_lay.setContentsMargins(0, 0, 0, 0)
+        ws_top_lay.addWidget(ws_h)
 
-        # ── LEFT: WS message log ────────────────────────────────────────────
-        _lbl(ws_left, "WebSocket Messages", fg=_ACC,
-             font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
-        ws_tree_frame = tk.Frame(ws_left, bg=_PNL)
-        ws_tree_frame.pack(fill=tk.BOTH, expand=True, padx=4)
-        ws_cols = ("ts", "dir", "op", "origin", "path", "size")
-        ws_tree = ttk.Treeview(ws_tree_frame, columns=ws_cols, show="headings",
-                               selectmode="browse")
-        for c, w, label in (
-            ("ts",     58, "Time"),
-            ("dir",    36, "Dir"),
-            ("op",     50, "Op"),
-            ("origin", 130, "Origin"),
-            ("path",   0,  "Path"),
-            ("size",   56, "Size"),
-        ):
-            ws_tree.heading(c, text=label)
-            ws_tree.column(c, width=w, anchor="w", stretch=(c == "path"))
-        ws_tree.tag_configure("in",  foreground=_GRN)
-        ws_tree.tag_configure("out", foreground=_CYN)
-        ws_vsb = ttk.Scrollbar(ws_tree_frame, orient="vertical", command=ws_tree.yview)
-        ws_hsb = ttk.Scrollbar(ws_tree_frame, orient="horizontal", command=ws_tree.xview)
-        ws_tree.configure(yscrollcommand=ws_vsb.set, xscrollcommand=ws_hsb.set)
-        ws_vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        ws_hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        ws_tree.pack(fill=tk.BOTH, expand=True)
+        ws_left_lay  = QVBoxLayout(ws_left);  ws_left_lay.setContentsMargins(4, 4, 4, 4);  ws_left_lay.setSpacing(2)
+        ws_right_lay = QVBoxLayout(ws_right); ws_right_lay.setContentsMargins(4, 4, 4, 4); ws_right_lay.setSpacing(2)
 
-        ws_ctrl = tk.Frame(ws_left, bg=_PNL)
-        ws_ctrl.pack(fill=tk.X, padx=8, pady=4)
-        ws_auto_scroll = tk.BooleanVar(value=True)
-        ws_paused = tk.BooleanVar(value=False)
-        tk.Checkbutton(ws_ctrl, text="Auto-scroll", variable=ws_auto_scroll,
-                       bg=_PNL, fg=_FG, selectcolor=_BG,
-                       activebackground=_PNL).pack(side=tk.LEFT)
-        tk.Checkbutton(ws_ctrl, text="Pause", variable=ws_paused,
-                       bg=_PNL, fg=_FG, selectcolor=_BG,
-                       activebackground=_PNL).pack(side=tk.LEFT, padx=8)
+        # ── LEFT: WS message log ───────────────────────────────────────────
+        ws_left_lay.addWidget(_lbl(ws_left, "WebSocket Messages", font=_mono_lg, color=_ACC))
+        ws_cols = ["ts", "dir", "op", "origin", "path", "size"]
+        ws_labels = ["Time", "Dir", "Op", "Origin", "Path", "Size"]
+        ws_widths = {"ts": 58, "dir": 36, "op": 50, "origin": 130, "size": 56}
+        ws_tree = QTreeWidget(ws_left)
+        ws_tree.setColumnCount(len(ws_cols))
+        ws_tree.setHeaderLabels(ws_labels)
+        ws_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        ws_tree.setRootIsDecorated(False)
+        ws_tree.setFont(_mono)
+        ws_hdr = ws_tree.header()
+        for i, c in enumerate(ws_cols):
+            if c == "path":
+                ws_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+            else:
+                ws_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+                if c in ws_widths:
+                    ws_tree.setColumnWidth(i, ws_widths[c])
+        ws_left_lay.addWidget(ws_tree, 1)
+
+        ws_ctrl = QWidget(ws_left); ws_ctrl.setStyleSheet(f"background: {_PNL};")
+        wsc = QHBoxLayout(ws_ctrl); wsc.setContentsMargins(8, 0, 8, 0); wsc.setSpacing(6)
+        ws_left_lay.addWidget(ws_ctrl)
+        ws_auto_scroll_cb = QCheckBox("Auto-scroll", ws_ctrl); ws_auto_scroll_cb.setChecked(True)
+        ws_paused_cb = QCheckBox("Pause", ws_ctrl)
+        wsc.addWidget(ws_auto_scroll_cb); wsc.addWidget(ws_paused_cb)
         _ws_row_data: dict[str, dict] = {}
+        _ws_row_counter = [0]
         _WS_MAX_ROWS = 800
 
         def _ws_clear():
-            for i in ws_tree.get_children():
-                ws_tree.delete(i)
+            ws_tree.clear()
             _ws_row_data.clear()
-        _btn(ws_ctrl, "Clear", _ws_clear).pack(side=tk.LEFT)
+        wsc.addWidget(_btn(ws_ctrl, "Clear", _ws_clear))
+        wsc.addStretch(1)
 
-        # ── RIGHT: WS hook editor ───────────────────────────────────────────
-        _lbl(ws_right, "WebSocket Hook Editor", fg=_ACC,
-             font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
-        ws_info_var = tk.StringVar(value="← Select a WS message")
-        _lbl(ws_right, textvariable=ws_info_var, fg=_ACC, bg=_PNL).pack(anchor="w", padx=8)
+        # ── RIGHT: WS hook editor ──────────────────────────────────────────
+        ws_right_lay.addWidget(_lbl(ws_right, "WebSocket Hook Editor", font=_mono_lg, color=_ACC))
+        ws_info_lbl = _lbl(ws_right, "← Select a WS message", color=_ACC)
+        ws_right_lay.addWidget(ws_info_lbl)
 
-        ws_row1 = tk.Frame(ws_right, bg=_PNL); ws_row1.pack(fill=tk.X, padx=8, pady=2)
-        ws_row2 = tk.Frame(ws_right, bg=_PNL); ws_row2.pack(fill=tk.X, padx=8, pady=2)
-        ws_row3 = tk.Frame(ws_right, bg=_PNL); ws_row3.pack(fill=tk.X, padx=8, pady=2)
+        ws_row1 = QWidget(ws_right); wr1 = QHBoxLayout(ws_row1); wr1.setContentsMargins(0, 0, 0, 0); wr1.setSpacing(4)
+        ws_row2 = QWidget(ws_right); wr2 = QHBoxLayout(ws_row2); wr2.setContentsMargins(0, 0, 0, 0); wr2.setSpacing(4)
+        ws_row3 = QWidget(ws_right); wr3 = QHBoxLayout(ws_row3); wr3.setContentsMargins(0, 0, 0, 0); wr3.setSpacing(4)
+        ws_right_lay.addWidget(ws_row1); ws_right_lay.addWidget(ws_row2); ws_right_lay.addWidget(ws_row3)
 
-        _lbl(ws_row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        ws_name_entry = _entry(ws_row1, width=14)
-        ws_name_entry.pack(side=tk.LEFT, padx=(2, 10))
+        wr1.addWidget(_lbl(ws_row1, "Name:", color=_ACC))
+        ws_name_edit = _entry(ws_row1, width=14); wr1.addWidget(ws_name_edit)
+        wr1.addWidget(_lbl(ws_row1, "Dir:", color=_ACC))
+        ws_dir_combo = QComboBox(ws_row1); ws_dir_combo.setEditable(False)
+        ws_dir_combo.addItems(["*", "in", "out"]); ws_dir_combo.setFont(_mono)
+        ws_dir_combo.setMaximumWidth(70); wr1.addWidget(ws_dir_combo)
+        wr1.addWidget(_lbl(ws_row1, "Op:", color=_ACC))
+        ws_op_combo = QComboBox(ws_row1); ws_op_combo.setEditable(False)
+        ws_op_combo.addItems(["*", "text", "bin"]); ws_op_combo.setFont(_mono)
+        ws_op_combo.setMaximumWidth(80); wr1.addWidget(ws_op_combo)
+        wr1.addStretch(1)
 
-        _lbl(ws_row1, "Dir:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        ws_dir_var = tk.StringVar(value="*")
-        ttk.Combobox(ws_row1, textvariable=ws_dir_var,
-                     values=["*", "in", "out"], width=5, state="readonly",
-                     font=("Consolas", 10)).pack(side=tk.LEFT, padx=(2, 10))
+        wr2.addWidget(_lbl(ws_row2, "Pattern URL:", color=_ACC))
+        ws_pat_edit = _entry(ws_row2); ws_pat_edit.setText(r".*")
+        wr2.addWidget(ws_pat_edit, 1)
 
-        _lbl(ws_row1, "Op:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        ws_op_var = tk.StringVar(value="*")
-        ttk.Combobox(ws_row1, textvariable=ws_op_var,
-                     values=["*", "text", "bin"], width=6, state="readonly",
-                     font=("Consolas", 10)).pack(side=tk.LEFT)
+        wr3.addWidget(_lbl(ws_row3, "Origin URL:", color=_ACC))
+        ws_origin_edit = _entry(ws_row3); ws_origin_edit.setText("*")
+        wr3.addWidget(ws_origin_edit, 1)
+        wr3.addWidget(_lbl(ws_row3, "  (target / * / host)", color=_DIM))
 
-        _lbl(ws_row2, "Pattern URL:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        ws_pat_entry = _entry(ws_row2, width=34)
-        ws_pat_entry.insert(0, r".*")
-        ws_pat_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
-
-        _lbl(ws_row3, "Origin URL:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-        ws_origin_entry = _entry(ws_row3, width=20)
-        ws_origin_entry.insert(0, "*")
-        ws_origin_entry.pack(side=tk.LEFT, padx=(2, 0), fill=tk.X, expand=True)
-        _lbl(ws_row3, "  (target / * / host)", fg=_DIM, bg=_PNL).pack(side=tk.LEFT)
-
-        # ── Match mode (internal — no GUI combobox) ──────────────────────
-        # The match mode is now determined AUTOMATICALLY from whether a
-        # message has been captured:
-        #   - match_payload is set (user clicked a row) → "exact"
-        #     The hook fires ONLY when the incoming payload equals the
-        #     captured one byte-for-byte.
-        #   - match_payload is empty (no row clicked) → "any"
-        #     The hook fires on EVERY message matching the path/dir/op
-        #     filters above.
-        # The user no longer needs to choose — the WHEN panel makes it
-        # obvious what will trigger the hook.
-        ws_match_mode_var = tk.StringVar(value="any")
-        # Hidden payload holder — populated when a row is selected, sent to
-        # the hook store on Save. Storing as bytes (not as a StringVar) so
-        # binary payloads survive intact.
+        # ── Match mode (internal — auto-determined) ───────────────────────
+        ws_match_mode = ["any"]            # current mode (mutable holder)
         ws_match_payload_holder: list[bytes] = [b""]
 
-        # ── Bottom rows (packed FIRST at bottom so they're always visible) ──
-        # CRITICAL: these must be packed with side=BOTTOM BEFORE the
-        # expandable when→then pane, otherwise the pane eats all vertical
-        # space and pushes the Save button off-screen.
-        ws_btn_row = tk.Frame(ws_right, bg=_PNL)
-        ws_btn_row.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
-        ws_save_status = _lbl(ws_right, text="", fg=_DIM, bg=_PNL)
-        ws_save_status.pack(side=tk.BOTTOM, anchor="w", padx=8, pady=(0, 2))
+        # ── Bottom rows (added FIRST so they sit at the bottom) ───────────
+        ws_btn_row = QWidget(ws_right); ws_btn_row.setStyleSheet(f"background: {_PNL};")
+        wsbr = QHBoxLayout(ws_btn_row); wsbr.setContentsMargins(0, 0, 0, 0); wsbr.setSpacing(4)
+        ws_right_lay.addWidget(ws_btn_row)
+        ws_save_status_lbl = _lbl(ws_right, "", color=_DIM)
+        ws_right_lay.addWidget(ws_save_status_lbl)
 
-        # ── When → Then layout ─────────────────────────────────────────────
-        # The editor is split into two side-by-side panels that make the
-        # hook's behavior self-explanatory:
-        #
-        #   LEFT  (WHEN): "If the site sends or tries to send:"
-        #      Read-only text preview of match_payload — the exact content
-        #      that triggers this hook. Auto-populated when you click a
-        #      message in the traffic log. Shows "(any message on this
-        #      path)" when match_mode is "any" (no specific trigger).
-        #
-        #   RIGHT (THEN): "Immediately changes to my hook before it gets
-        #                  actually sent:"
-        #      Editable hex editor (top) + live decoded text preview
-        #      (bottom). This is body_bytes — what the hook replaces the
-        #      original message with.
-        #
-        # The arrow between the panels (►) reinforces the data flow:
-        # captured message → your replacement.
-        ws_when_then_pane = tk.PanedWindow(ws_right, orient=tk.HORIZONTAL,
-                                           bg=_BG, sashwidth=5, sashrelief="flat")
-        ws_when_then_pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 4))
+        # ── When → Then layout (horizontal splitter) ─────────────────────
+        ws_when_then = QSplitter(Qt.Orientation.Horizontal, ws_right)
+        ws_when_then.setChildrenCollapsible(False)
+        ws_when_frame  = QWidget(); ws_when_frame.setStyleSheet(f"background: {_PNL};")
+        ws_then_frame  = QWidget(); ws_then_frame.setStyleSheet(f"background: {_PNL};")
+        ws_when_then.addWidget(ws_when_frame)
+        ws_when_then.addWidget(ws_then_frame)
+        ws_when_then.setStretchFactor(0, 45)
+        ws_when_then.setStretchFactor(1, 55)
+        ws_when_then.setSizes([300, 380])
+        ws_right_lay.addWidget(ws_when_then, 1)
 
-        # ── LEFT: WHEN panel (match condition — read-only) ─────────────
-        ws_when_frame = tk.Frame(ws_when_then_pane, bg=_PNL)
-        ws_when_then_pane.add(ws_when_frame, minsize=260, width=300)
+        wwf = QVBoxLayout(ws_when_frame); wwf.setContentsMargins(4, 2, 4, 2); wwf.setSpacing(2)
+        wtf = QVBoxLayout(ws_then_frame); wtf.setContentsMargins(4, 2, 4, 2); wtf.setSpacing(2)
 
-        _lbl(ws_when_frame, "If the site sends or tries to send:",
-             fg=_RED, bg=_PNL,
-             font=("Consolas", 9, "bold")).pack(anchor="w", padx=4, pady=(2, 0))
+        wwf.addWidget(_lbl(ws_when_frame, "If the site sends or tries to send:",
+                           font=_mono_sm_b, color=_RED))
 
-        # ── Freeze toggle ────────────────────────────────────────────────
-        # When frozen, clicking new traffic log rows does NOT update the
-        # WHEN panel content (match_payload, match_mode, text preview).
-        # This prevents the hook's expected trigger from being silently
-        # replaced by whatever message arrived last — the #1 cause of
-        # "my WS hook stopped working after the next event" bugs.
-        ws_when_top_row = tk.Frame(ws_when_frame, bg=_PNL)
-        ws_when_top_row.pack(fill=tk.X, padx=4, pady=(0, 2))
-        _lbl(ws_when_top_row, "(read-only — auto-filled when you click a message)",
-             fg=_DIM, bg=_PNL, font=("Consolas", 8)).pack(side=tk.LEFT)
-        ws_freeze_var = tk.BooleanVar(value=False)
-        def _on_freeze_toggle():
-            if ws_freeze_var.get():
-                ws_freeze_lbl.config(text="[FROZEN]", fg=_ACC)
+        ws_when_top_row = QWidget(ws_when_frame); ws_when_top_row.setStyleSheet(f"background: {_PNL};")
+        wwtr = QHBoxLayout(ws_when_top_row); wwtr.setContentsMargins(0, 0, 0, 0); wwtr.setSpacing(4)
+        wwf.addWidget(ws_when_top_row)
+        wwtr.addWidget(_lbl(ws_when_frame,
+                             "(read-only — auto-filled when you click a message)",
+                             font=_mono_xs, color=_DIM), 1)
+        ws_freeze_cb = QCheckBox("Freeze", ws_when_top_row); ws_freeze_cb.setFont(_mono_xs)
+        ws_freeze_lbl = _lbl(ws_when_top_row, "", font=_mono_sm_b, color=_ACC)
+        wwtr.addWidget(ws_freeze_lbl)
+        wwtr.addWidget(ws_freeze_cb)
+
+        def _on_freeze_toggle(_state):
+            if ws_freeze_cb.isChecked():
+                ws_freeze_lbl.setText("[FROZEN]")
+                ws_freeze_lbl.setStyleSheet(f"color: {_ACC}; background: transparent;")
             else:
-                ws_freeze_lbl.config(text="", fg=_DIM)
-        ws_freeze_lbl = _lbl(ws_when_top_row, "", fg=_ACC, bg=_PNL,
-                              font=("Consolas", 8, "bold"))
-        ws_freeze_lbl.pack(side=tk.RIGHT)
-        tk.Checkbutton(ws_when_top_row, text="Freeze", variable=ws_freeze_var,
-                       command=_on_freeze_toggle, bg=_PNL, fg=_FG,
-                       selectcolor=_BG, activebackground=_PNL,
-                       font=("Consolas", 8)).pack(side=tk.RIGHT, padx=(0, 4))
+                ws_freeze_lbl.setText("")
+        ws_freeze_cb.stateChanged.connect(_on_freeze_toggle)
 
-        ws_when_text = scrolledtext.ScrolledText(
-            ws_when_frame, bg="#0a0505", fg=_YLW, insertbackground=_ACC,
-            font=("Consolas", 10), relief="flat", wrap="word")
-        ws_when_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
-        ws_when_text.config(state="disabled")
-        _bind_editor_keys(ws_when_text)
+        ws_when_text = _text_box(ws_when_frame, wrap=True, readonly=True)
+        ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_YLW};")
+        wwf.addWidget(ws_when_text, 1)
 
-        # ── RIGHT: THEN panel (replacement — editable hex + preview) ────
-        ws_then_frame = tk.Frame(ws_when_then_pane, bg=_PNL)
-        ws_when_then_pane.add(ws_then_frame, minsize=320, width=380)
+        # ── RIGHT: THEN panel (editable hex + read-only text preview) ────
+        wtf.addWidget(_lbl(ws_then_frame,
+                            "Immediately replace with my hook before it is actually sent:",
+                            font=_mono_sm_b, color=_GRN))
 
-        _lbl(ws_then_frame, "Immediately replace with my hook before it is actually sent:",
-             fg=_GRN, bg=_PNL,
-             font=("Consolas", 9, "bold")).pack(anchor="w", padx=4, pady=(2, 0))
+        ws_then_split = QSplitter(Qt.Orientation.Vertical, ws_then_frame)
+        ws_then_split.setChildrenCollapsible(False)
+        ws_hex_frame = QWidget(); ws_hex_frame.setStyleSheet(f"background: {_PNL};")
+        ws_txt_frame = QWidget(); ws_txt_frame.setStyleSheet(f"background: {_PNL};")
+        ws_then_split.addWidget(ws_hex_frame)
+        ws_then_split.addWidget(ws_txt_frame)
+        ws_then_split.setSizes([180, 100])
+        wtf.addWidget(ws_then_split, 1)
 
-        # THEN panel internally split: hex (editable, top) + text (preview, bottom)
-        ws_then_split = tk.PanedWindow(ws_then_frame, orient=tk.VERTICAL,
-                                       bg=_BG, sashwidth=4, sashrelief="flat")
-        ws_then_split.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+        whf = QVBoxLayout(ws_hex_frame); whf.setContentsMargins(0, 0, 0, 0); whf.setSpacing(2)
+        wtf2 = QVBoxLayout(ws_txt_frame); wtf2.setContentsMargins(0, 0, 0, 0); wtf2.setSpacing(2)
 
-        ws_hex_frame = tk.Frame(ws_then_split, bg=_PNL)
-        ws_txt_frame = tk.Frame(ws_then_split, bg=_PNL)
-        ws_then_split.add(ws_hex_frame, minsize=120)
-        ws_then_split.add(ws_txt_frame, minsize=80)
+        whf.addWidget(_lbl(ws_hex_frame, "Hex  (editable)", font=_mono_sm_b, color=_YLW))
+        ws_hex_box = _text_box(ws_hex_frame, wrap=False)
+        ws_hex_box.setStyleSheet(f"background: {_PNL}; color: {_GRN};")
+        whf.addWidget(ws_hex_box, 1)
 
-        _lbl(ws_hex_frame, "Hex  (editable)", fg=_YLW, bg=_PNL,
-             font=("Consolas", 9, "bold")).pack(anchor="w", padx=4, pady=(2, 0))
-        ws_hex_box = scrolledtext.ScrolledText(
-            ws_hex_frame, bg="#050505", fg=_GRN, insertbackground=_ACC,
-            font=("Consolas", 10), relief="flat", undo=True, wrap="none")
-        ws_hex_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
-        _bind_editor_keys(ws_hex_box)
+        wtf2.addWidget(_lbl(ws_txt_frame, "Text  (live preview)", font=_mono_sm_b, color=_DIM))
+        ws_txt_box = _text_box(ws_txt_frame, wrap=False, readonly=True)
+        ws_txt_box.setStyleSheet(f"background: {_PNL_ALT}; color: {_FG};")
+        wtf2.addWidget(ws_txt_box, 1)
 
-        _lbl(ws_txt_frame, "Text  (live preview)", fg=_DIM, bg=_PNL,
-             font=("Consolas", 9, "bold")).pack(anchor="w", padx=4, pady=(2, 0))
-        ws_txt_box = scrolledtext.ScrolledText(
-            ws_txt_frame, bg="#080808", fg=_FG, insertbackground=_ACC,
-            font=("Consolas", 10), relief="flat", wrap="none")
-        ws_txt_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
-        ws_txt_box.config(state="disabled")
-        _bind_editor_keys(ws_txt_box)
-
-        # ── Hex / text helpers + live sync ──────────────────────────────────
+        # ── Hex / text helpers + live sync ────────────────────────────────
         def _bytes_to_hexdump(data: bytes) -> str:
-            """Canonical hex dump: '00000000  48 54 54 50 ...' (16 bytes/line).
-            Empty input → empty string (the editor shows a placeholder hint)."""
+            """Canonical hex dump: '00000000  48 54 54 50 ...' (16 bytes/line)."""
             if not data:
                 return ""
             lines = []
             for off in range(0, len(data), 16):
                 chunk = data[off:off + 16]
                 hex_part = " ".join(f"{b:02x}" for b in chunk)
-                # Wider gap after the 8th byte for readability.
                 if len(chunk) > 8:
                     hex_part = hex_part[:24] + " " + hex_part[24:]
                 lines.append(f"{off:08x}  {hex_part}")
             return "\n".join(lines)
 
-        def _hexdump_to_bytes(text: str) -> bytes | None:
-            """Parse a hex dump back to bytes. Returns None on invalid input.
-
-            Strips an optional 8-hex-digit offset prefix per line; every
-            whitespace-separated token after that MUST be valid hex with an
-            even number of digits. Anything else → None (caller shows error).
-            """
+        def _hexdump_to_bytes(text: str):
+            """Parse a hex dump back to bytes. Returns None on invalid input."""
             out = bytearray()
             for line in text.splitlines():
                 stripped = re.sub(r"^[0-9a-fA-F]{8}\s+", "", line).strip()
@@ -2195,56 +2230,39 @@ def _launch_hook_gui() -> None:
 
         def _ws_sync_text_from_hex(*_):
             """Live-update the read-only text pane from the hex pane."""
-            raw = ws_hex_box.get("1.0", "end-1c")
+            raw = ws_hex_box.toPlainText()
             parsed = _hexdump_to_bytes(raw)
             if parsed is None:
-                ws_save_status.config(text="Hex invalid — odd digits or non-hex char.", fg=_RED)
+                ws_save_status_lbl.setText("Hex invalid — odd digits or non-hex char.")
+                ws_save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
                 return
             decoded = parsed.decode("utf-8", errors="replace")
-            # Replace non-printable control chars (except common whitespace)
             display = "".join(
                 c if (c.isprintable() or c in "\n\r\t") else "·"
                 for c in decoded
             )
-            ws_txt_box.config(state="normal")
-            ws_txt_box.delete("1.0", "end")
-            ws_txt_box.insert("1.0", display)
-            ws_txt_box.config(state="disabled")
-            ws_save_status.config(
-                text=f"Replacement OK — {len(parsed)} byte(s). Preview below the hex editor.",
-                fg=_DIM)
+            ws_txt_box.setPlainText(display)
+            ws_save_status_lbl.setText(
+                f"Replacement OK — {len(parsed)} byte(s). Preview below the hex editor.")
+            ws_save_status_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
 
-        ws_hex_box.bind("<KeyRelease>", _ws_sync_text_from_hex)
-        # Also re-sync on paste / cut (Tk doesn't always fire KeyRelease for those)
-        for _seq in ("<<Paste>>", "<<Cut>>", "<<PasteSelection>>"):
-            ws_hex_box.bind(_seq, lambda e: (_ws_sync_text_from_hex(), "break")[1])
+        ws_hex_box.textChanged.connect(_ws_sync_text_from_hex)
 
         # ── WHEN panel updater ───────────────────────────────────────────
-        # Refreshes the left "If the site sends..." panel to show the
-        # current match_payload (decoded as text) or a placeholder when
-        # match_mode is "any" (no specific trigger). Called on row select,
-        # on match_mode change, and on hook edit.
         def _ws_update_when_panel(*_):
-            mode = ws_match_mode_var.get().strip().lower() or "any"
+            mode = (ws_match_mode[0] or "any").strip().lower() or "any"
             mp = ws_match_payload_holder[0]
-            ws_when_text.config(state="normal")
-            ws_when_text.delete("1.0", "end")
             if mode == "any" or not mp:
-                # "any" = no specific trigger → show placeholder.
-                # The hook will fire on EVERY message matching the
-                # path/dir/op filters above.
-                ws_when_text.insert("1.0",
+                ws_when_text.setPlainText(
                     "(any message matching the path/dir/op filters above)\n\n"
                     "Every message on this WebSocket path will be replaced.\n\n"
                     "Click a message in the traffic log on the left to\n"
                     "target a specific payload — only that exact content\n"
                     "will trigger the hook.")
-                ws_when_text.config(state="disabled", fg=_DIM)
+                ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_DIM};")
             else:
-                # exact / contains / regex — show the decoded match_payload so
-                # the user can see what the trigger is.
                 if mode == "regex":
-                    ws_when_text.insert("1.0",
+                    ws_when_text.setPlainText(
                         f"[regex pattern]\n"
                         f"{mp.decode('utf-8', 'replace')}\n\n"
                         f"Incoming payloads matching this regex will be replaced.")
@@ -2254,99 +2272,72 @@ def _launch_hook_gui() -> None:
                         c if (c.isprintable() or c in "\n\r\t") else "·"
                         for c in decoded
                     )
-                    ws_when_text.insert("1.0", display)
-                ws_when_text.config(state="disabled", fg=_YLW)
-
-        # trace_add fires when match_mode_var is set programmatically
-        # (on row select, on hook edit). No combobox needed — the mode
-        # is auto-determined from whether a payload was captured.
-        ws_match_mode_var.trace_add("write", _ws_update_when_panel)
-        # Initial render
+                    ws_when_text.setPlainText(display)
+                ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_YLW};")
         _ws_update_when_panel()
 
-        def _ws_on_select(_event):
-            sel = ws_tree.selection()
-            if not sel:
+        def _ws_on_select(*_):
+            items = ws_tree.selectedItems()
+            if not items:
                 return
-            data = _ws_row_data.get(sel[0])
+            item = items[0]
+            iid = item.data(0, Qt.ItemDataRole.UserRole)
+            data = _ws_row_data.get(iid)
             if not data:
                 return
             payload = data.get("payload") or b""
             _dir_raw = data.get("direction", "?")
             _dir_disp = "[->] IN" if _dir_raw == "in" else ("[<-] OUT" if _dir_raw == "out" else _dir_raw.upper())
             _op_disp = (data.get("op_name") or "?").upper()
-            ws_info_var.set(
+            ws_info_lbl.setText(
                 f"{_dir_disp}  {_op_disp}  {data['ws_url']}  "
                 f"[{_fmt_size(len(payload))}]")
-            # Load the payload into the THEN panel's hex editor (the
-            # replacement starts as a copy of the original — user edits
-            # from there). Re-rendered canonically.
-            ws_hex_box.config(state="normal")
-            ws_hex_box.delete("1.0", "end")
-            ws_hex_box.insert("1.0", _bytes_to_hexdump(payload))
+            ws_hex_box.setPlainText(_bytes_to_hexdump(payload))
             _ws_sync_text_from_hex()
-            # Auto-populate hook editor fields from selected message
-            ws_dir_var.set(_dir_raw if _dir_raw in ("in", "out") else "*")
-            ws_op_var.set({1: "text", 2: "bin"}.get(data.get("opcode", 0), "*"))
-            ws_pat_entry.delete(0, "end")
+            ws_dir_combo.setCurrentText(_dir_raw if _dir_raw in ("in", "out") else "*")
+            ws_op_combo.setCurrentText({1: "text", 2: "bin"}.get(data.get("opcode", 0), "*"))
             try:
-                ws_pat_entry.insert(0, re.escape(urlparse(data["ws_url"]).path or "/"))
+                ws_pat_edit.setText(re.escape(urlparse(data["ws_url"]).path or "/"))
             except Exception:
-                ws_pat_entry.insert(0, r".*")
-            ws_origin_entry.delete(0, "end")
-            ws_origin_entry.insert(0, data.get("origin", "") or "*")
-            if not ws_name_entry.get().strip():
-                ws_name_entry.delete(0, "end")
-                ws_name_entry.insert(0, f"ws_{_dir_raw}_{_op_disp.lower()}")
+                ws_pat_edit.setText(r".*")
+            ws_origin_edit.setText(data.get("origin", "") or "*")
+            if not ws_name_edit.text().strip():
+                ws_name_edit.setText(f"ws_{_dir_raw}_{_op_disp.lower()}")
             # ── FREEZE GUARD ─────────────────────────────────────────────
-            # When the WHEN panel is frozen, do NOT update match_payload,
-            # match_mode, or the WHEN text preview. The currently-saved
-            # trigger stays put so the next hook save won't silently swap
-            # it for whatever message just arrived. Other fields (dir, op,
-            # path, origin, name, hex replacement) still update normally —
-            # freeze locks ONLY the trigger.
-            if ws_freeze_var.get():
+            if ws_freeze_cb.isChecked():
                 return
-            # Capture THIS message's payload as the WHEN trigger and
-            # default to "exact" — clicking a row means "replace THIS
-            # specific message". User can switch to any/contains/regex
-            # via the combobox if they want a broader match.
             ws_match_payload_holder[0] = bytes(payload)
-            ws_match_mode_var.set("exact")   # triggers _ws_update_when_panel
-        ws_tree.bind("<<TreeviewSelect>>", _ws_on_select)
+            ws_match_mode[0] = "exact"
+            _ws_update_when_panel()
+        ws_tree.itemSelectionChanged.connect(_ws_on_select)
 
-        # ── Disk persistence + Save / Test buttons ──────────────────────────
+        # ── Disk persistence + Save / Test buttons ───────────────────────
         _ws_hook_save_to_disk, _ws_hook_delete_from_disk, _ws_hook_load_all = \
             _make_hook_store("MyWSHooks", extra_binary_fields=("match_payload",))
 
         def _ws_save_hook():
-            name = ws_name_entry.get().strip()
+            name = ws_name_edit.text().strip()
             if not name:
-                messagebox.showwarning("S2L", "Hook name is required.")
+                QMessageBox.warning(win, "S2L", "Hook name is required.")
                 return
-            raw_hex = ws_hex_box.get("1.0", "end-1c")
+            raw_hex = ws_hex_box.toPlainText()
             body_bytes = _hexdump_to_bytes(raw_hex)
             if body_bytes is None:
-                messagebox.showerror("S2L",
+                QMessageBox.critical(win, "S2L",
                     "Invalid hex — fix the highlighted error before saving.")
                 return
             if not body_bytes:
-                messagebox.showwarning("S2L",
+                QMessageBox.warning(win, "S2L",
                     "Hook payload is empty — nothing to inject.")
                 return
-            pat_str = ws_pat_entry.get().strip() or r".*"
+            pat_str = ws_pat_edit.text().strip() or r".*"
             try:
                 re.compile(pat_str)
             except re.error as e:
-                messagebox.showerror("S2L", f"Invalid pattern: {e}")
+                QMessageBox.critical(win, "S2L", f"Invalid pattern: {e}")
                 return
             op_map = {"text": 1, "bin": 2}
-            opcode = op_map.get(ws_op_var.get(), 0)
-            # Match mode is AUTO-DETERMINED: if a payload was captured
-            # (user clicked a message in the traffic log), use "exact" —
-            # the hook fires ONLY on that specific payload. If no payload
-            # was captured, use "any" — the hook fires on every message
-            # matching the path/dir/op filters.
+            opcode = op_map.get(ws_op_combo.currentText(), 0)
             match_payload = ws_match_payload_holder[0]
             if match_payload:
                 match_mode = "exact"
@@ -2354,21 +2345,22 @@ def _launch_hook_gui() -> None:
                 match_mode = "any"
                 match_payload = b""
             hook = {
-                "name":           name,
-                "direction":      ws_dir_var.get(),
-                "opcode":         opcode,
-                "pattern":        pat_str,
-                "origin_url":     ws_origin_entry.get().strip() or "*",
-                "body_bytes":     body_bytes,
-                "enabled":        True,
-                "match_mode":     match_mode,
-                "match_payload":  match_payload,
+                "name":          name,
+                "direction":     ws_dir_combo.currentText(),
+                "opcode":        opcode,
+                "pattern":       pat_str,
+                "origin_url":    ws_origin_edit.text().strip() or "*",
+                "body_bytes":    body_bytes,
+                "enabled":       True,
+                "match_mode":    match_mode,
+                "match_payload": match_payload,
             }
             with _gui_ws_hooks_lock:
                 existing = next((h for h in _gui_ws_hooks if h["name"] == name), None)
                 if existing is not None:
-                    if not messagebox.askyesno("S2L",
-                            f"A WS hook named '{name}' already exists.\nReplace it?"):
+                    if QMessageBox.question(win, "S2L",
+                            f"A WS hook named '{name}' already exists.\nReplace it?"
+                        ) != QMessageBox.StandardButton.Yes:
                         return
                     _gui_ws_hooks[:] = [h for h in _gui_ws_hooks if h["name"] != name]
                 _gui_ws_hooks.append(hook)
@@ -2376,162 +2368,146 @@ def _launch_hook_gui() -> None:
             _render_ws_hook_rows()
             _trigger_desc = ("exact payload" if match_mode == "exact"
                              else "any message on path")
-            ws_save_status.config(
-                text=f"Saved '{name}'  [dir={hook['direction']} op={ws_op_var.get()} "
-                     f"trigger={_trigger_desc}]  {hook['pattern']}",
-                fg=_GRN)
-            log(f"GUI WS hook saved: '{name}' [dir={hook['direction']} op={ws_op_var.get()} "
-                f"trigger={_trigger_desc}] {hook['pattern']}", "HOOK")
+            ws_save_status_lbl.setText(
+                f"Saved '{name}'  [dir={hook['direction']} op={ws_op_combo.currentText()} "
+                f"trigger={_trigger_desc}]  {hook['pattern']}")
+            ws_save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
+            log(f"GUI WS hook saved: '{name}' [dir={hook['direction']} "
+                f"op={ws_op_combo.currentText()} trigger={_trigger_desc}] {hook['pattern']}", "HOOK")
 
         def _ws_test_hook():
-            pat_str = ws_pat_entry.get().strip()
-            test_path = simpledialog.askstring("Test WS Hook",
-                "Enter a WS path to test (e.g. /ws/chat):", parent=root)
-            if test_path is None:
+            pat_str = ws_pat_edit.text().strip()
+            test_path, ok = QInputDialog.getText(win, "Test WS Hook",
+                "Enter a WS path to test (e.g. /ws/chat):")
+            if not ok or test_path is None:
                 return
             try:
                 matched = bool(re.search(pat_str, test_path, re.IGNORECASE))
             except re.error as e:
-                messagebox.showerror("S2L", f"Pattern error: {e}")
+                QMessageBox.critical(win, "S2L", f"Pattern error: {e}")
                 return
-            ws_save_status.config(
-                text=f"{'MATCH' if matched else 'NO MATCH'}  pattern against '{test_path}'",
-                fg=_GRN if matched else _RED)
+            ws_save_status_lbl.setText(
+                f"{'MATCH' if matched else 'NO MATCH'}  pattern against '{test_path}'")
+            ws_save_status_lbl.setStyleSheet(
+                f"color: {_GRN if matched else _RED}; background: transparent;")
 
-        # Populate the button row (frame was created earlier and packed at
-        # BOTTOM — we just add the buttons now that the callbacks exist).
-        _btn(ws_btn_row, "Save WS Hook", _ws_save_hook,
-             font=("Consolas", 10, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        _btn(ws_btn_row, "Test Pattern", _ws_test_hook,
-             font=("Consolas", 9)).pack(side=tk.LEFT)
+        _sb2 = _btn(ws_btn_row, "Save WS Hook", _ws_save_hook, font=_mono_b)
+        wsbr.addWidget(_sb2, 1)
+        wsbr.addWidget(_btn(ws_btn_row, "Test Pattern", _ws_test_hook, font=_mono_sm))
 
-        # ── BOTTOM: Active WS Hooks ─────────────────────────────────────────
-        _lbl(ws_bot, "Active WebSocket Hooks", fg=_ACC,
-             font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(4, 2))
-        ws_hooks_scroll = tk.Frame(ws_bot, bg=_PNL)
-        ws_hooks_scroll.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
-        ws_h_sb = ttk.Scrollbar(ws_hooks_scroll, orient="vertical")
-        ws_h_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        ws_hooks_canvas = tk.Canvas(ws_hooks_scroll, bg=_PNL, bd=0,
-                                    highlightthickness=0, yscrollcommand=ws_h_sb.set)
-        ws_hooks_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ws_h_sb.config(command=ws_hooks_canvas.yview)
-        ws_hooks_frame = tk.Frame(ws_hooks_canvas, bg=_PNL)
-        ws_h_win = ws_hooks_canvas.create_window((0, 0), window=ws_hooks_frame, anchor="nw")
+        # ── BOTTOM: Active WS Hooks ───────────────────────────────────────
+        ws_bot_lay = QVBoxLayout(ws_bot); ws_bot_lay.setContentsMargins(0, 4, 0, 0); ws_bot_lay.setSpacing(2)
+        ws_bot_lay.addWidget(_lbl(ws_bot, "Active WebSocket Hooks", font=_mono_lg, color=_ACC))
 
-        def _on_ws_hf_configure(_e):
-            ws_hooks_canvas.configure(scrollregion=ws_hooks_canvas.bbox("all"))
-        def _on_ws_canvas_configure(e):
-            ws_hooks_canvas.itemconfig(ws_h_win, width=e.width)
-        ws_hooks_frame.bind("<Configure>", _on_ws_hf_configure)
-        ws_hooks_canvas.bind("<Configure>", _on_ws_canvas_configure)
+        ws_hooks_scroll = QScrollArea(ws_bot)
+        ws_hooks_scroll.setWidgetResizable(True)
+        ws_hooks_inner = QWidget(); ws_hooks_inner.setStyleSheet(f"background: {_PNL};")
+        ws_hooks_grid = QGridLayout(ws_hooks_inner)
+        ws_hooks_grid.setContentsMargins(8, 4, 8, 4); ws_hooks_grid.setSpacing(4)
+        ws_hooks_scroll.setWidget(ws_hooks_inner)
+        ws_bot_lay.addWidget(ws_hooks_scroll, 1)
 
         _WS_HOOK_COLS   = ("Name", "Dir", "Op", "Origin", "Pattern", "On", "", "")
         _WS_HOOK_WIDTHS = (12, 5, 5, 14, 22, 4, 4, 4)
 
         def _render_ws_hook_rows():
-            for w in ws_hooks_frame.winfo_children():
-                w.destroy()
+            while ws_hooks_grid.count():
+                it = ws_hooks_grid.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.deleteLater()
             for col_idx, (col_name, col_w) in enumerate(zip(_WS_HOOK_COLS, _WS_HOOK_WIDTHS)):
-                _lbl(ws_hooks_frame, col_name, fg=_ACC, bg=_PNL,
-                     font=("Consolas", 9, "bold"),
-                     width=col_w, anchor="w").grid(row=0, column=col_idx, sticky="w", padx=3, pady=2)
+                lbl = _lbl(ws_hooks_inner, col_name, font=_mono_sm_b, color=_ACC)
+                lbl.setMinimumWidth(col_w * 8)
+                ws_hooks_grid.addWidget(lbl, 0, col_idx, Qt.AlignmentFlag.AlignLeft)
             with _gui_ws_hooks_lock:
                 hooks_copy = list(_gui_ws_hooks)
             if not hooks_copy:
-                _lbl(ws_hooks_frame, "No WS hooks saved yet.", fg=_DIM, bg=_PNL).grid(
-                    row=1, column=0, columnspan=8, sticky="w", padx=4, pady=4)
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner, "No WS hooks saved yet.", color=_DIM),
+                                        1, 0, 1, 8, Qt.AlignmentFlag.AlignLeft)
                 return
             op_name_map = {1: "TEXT", 2: "BIN", 0: "*"}
             for row_idx, h in enumerate(hooks_copy, start=1):
                 row_fg = _FG if h["enabled"] else _DIM
-                _lbl(ws_hooks_frame, h["name"], bg=_PNL, fg=row_fg,
-                     width=12, anchor="w").grid(row=row_idx, column=0, sticky="w", padx=3)
-                _lbl(ws_hooks_frame, h.get("direction", "*") or "*", bg=_PNL,
-                     fg=_YLW if h["enabled"] else _DIM,
-                     width=5, anchor="w").grid(row=row_idx, column=1, sticky="w", padx=3)
-                _lbl(ws_hooks_frame, op_name_map.get(h.get("opcode", 0), "*"), bg=_PNL,
-                     fg=_GRN if h["enabled"] else _DIM,
-                     width=5, anchor="w").grid(row=row_idx, column=2, sticky="w", padx=3)
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner, h["name"], color=row_fg),
+                                         row_idx, 0, Qt.AlignmentFlag.AlignLeft)
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner,
+                                             h.get("direction", "*") or "*",
+                                             color=_YLW if h["enabled"] else _DIM),
+                                         row_idx, 1, Qt.AlignmentFlag.AlignLeft)
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner,
+                                             op_name_map.get(h.get("opcode", 0), "*"),
+                                             color=_GRN if h["enabled"] else _DIM),
+                                         row_idx, 2, Qt.AlignmentFlag.AlignLeft)
                 _origin_disp = h.get("origin_url", "*") or "*"
                 if len(_origin_disp) > 14:
                     _origin_disp = _origin_disp[:13] + "…"
-                _lbl(ws_hooks_frame, _origin_disp, bg=_PNL,
-                     fg=_CYN if h["enabled"] else _DIM,
-                     width=14, anchor="w").grid(row=row_idx, column=3, sticky="w", padx=3)
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner, _origin_disp,
+                                             color=_CYN if h["enabled"] else _DIM),
+                                         row_idx, 3, Qt.AlignmentFlag.AlignLeft)
                 _pat_disp = h["pattern"][:22] + ("…" if len(h["pattern"]) > 22 else "")
-                _lbl(ws_hooks_frame, _pat_disp, bg=_PNL, fg=_DIM,
-                     width=22, anchor="w").grid(row=row_idx, column=4, sticky="w", padx=3)
-                # Enabled toggle
-                bv = tk.BooleanVar(value=h["enabled"])
-                def _make_ws_toggle(hook_ref, var):
-                    def _toggle():
+                ws_hooks_grid.addWidget(_lbl(ws_hooks_inner, _pat_disp, color=_DIM),
+                                         row_idx, 4, Qt.AlignmentFlag.AlignLeft)
+
+                cb = QCheckBox(ws_hooks_inner)
+                cb.setChecked(h["enabled"])
+
+                def _make_ws_toggle(hook_ref, checkbox):
+                    def _toggle(_checked):
                         with _gui_ws_hooks_lock:
-                            hook_ref["enabled"] = var.get()
+                            hook_ref["enabled"] = checkbox.isChecked()
                         _ws_hook_save_to_disk(hook_ref)
                         _render_ws_hook_rows()
                     return _toggle
-                tk.Checkbutton(ws_hooks_frame, variable=bv, command=_make_ws_toggle(h, bv),
-                               bg=_PNL, fg=_FG, selectcolor=_BG,
-                               activebackground=_PNL,
-                               width=2).grid(row=row_idx, column=5, padx=3)
-                # Edit — load hook back into the editor
+                cb.stateChanged.connect(_make_ws_toggle(h, cb))
+                ws_hooks_grid.addWidget(cb, row_idx, 5, Qt.AlignmentFlag.AlignCenter)
+
                 def _make_ws_edit(hook_ref):
                     def _edit():
-                        ws_name_entry.delete(0, "end")
-                        ws_name_entry.insert(0, hook_ref["name"])
-                        ws_dir_var.set(hook_ref.get("direction", "*") or "*")
+                        ws_name_edit.setText(hook_ref["name"])
+                        ws_dir_combo.setCurrentText(hook_ref.get("direction", "*") or "*")
                         op_val = hook_ref.get("opcode", 0)
-                        ws_op_var.set({1: "text", 2: "bin"}.get(op_val, "*"))  # combobox values are lowercase
-                        ws_pat_entry.delete(0, "end")
-                        ws_pat_entry.insert(0, hook_ref["pattern"])
-                        ws_origin_entry.delete(0, "end")
-                        ws_origin_entry.insert(0, hook_ref.get("origin_url", "*") or "*")
-                        ws_hex_box.config(state="normal")
-                        ws_hex_box.delete("1.0", "end")
-                        ws_hex_box.insert("1.0", _bytes_to_hexdump(hook_ref["body_bytes"]))
+                        ws_op_combo.setCurrentText({1: "text", 2: "bin"}.get(op_val, "*"))
+                        ws_pat_edit.setText(hook_ref["pattern"])
+                        ws_origin_edit.setText(hook_ref.get("origin_url", "*") or "*")
+                        ws_hex_box.setPlainText(_bytes_to_hexdump(hook_ref["body_bytes"]))
                         _ws_sync_text_from_hex()
-                        # Restore instanced-match fields. IMPORTANT: set the
-                        # payload holder BEFORE the mode var, because setting
-                        # the mode var triggers _ws_update_when_panel (via the
-                        # trace_add binding) which reads the holder to render
-                        # the WHEN panel. Wrong order = panel renders empty.
+                        # Restore instanced-match fields: set the payload holder
+                        # BEFORE the mode, because _ws_update_when_panel reads
+                        # the holder to render the WHEN panel.
                         ws_match_payload_holder[0] = hook_ref.get("match_payload", b"") or b""
-                        _mm = hook_ref.get("match_mode", "any") or "any"
-                        ws_match_mode_var.set(_mm)   # triggers _ws_update_when_panel
-                        ws_save_status.config(text=f"Editing '{hook_ref['name']}'", fg=_YLW)
+                        ws_match_mode[0] = hook_ref.get("match_mode", "any") or "any"
+                        _ws_update_when_panel()
+                        ws_save_status_lbl.setText(f"Editing '{hook_ref['name']}'")
+                        ws_save_status_lbl.setStyleSheet(f"color: {_YLW}; background: transparent;")
                     return _edit
-                _btn(ws_hooks_frame, "Ed", _make_ws_edit(h),
-                     font=("Consolas", 8), bg="#051a05",
-                     fg=_GRN).grid(row=row_idx, column=6, padx=3)
-                # Delete
+                _ws_ed_btn = _btn(ws_hooks_inner, "Ed", _make_ws_edit(h), font=_mono_xs)
+                _ws_ed_btn.setStyleSheet(f"background: {_GRN_BG}; color: {_GRN}; border: 1px solid #2a4a35;")
+                ws_hooks_grid.addWidget(_ws_ed_btn,
+                                         row_idx, 6, Qt.AlignmentFlag.AlignCenter)
+
                 def _make_ws_del(hook_name):
                     def _del():
                         with _gui_ws_hooks_lock:
                             _gui_ws_hooks[:] = [x for x in _gui_ws_hooks if x["name"] != hook_name]
                         _ws_hook_delete_from_disk(hook_name)
                         _render_ws_hook_rows()
-                        ws_save_status.config(text=f"Deleted '{hook_name}'.", fg=_YLW)
+                        ws_save_status_lbl.setText(f"Deleted '{hook_name}'.")
+                        ws_save_status_lbl.setStyleSheet(f"color: {_YLW}; background: transparent;")
                     return _del
-                _btn(ws_hooks_frame, "X", _make_ws_del(h["name"]),
-                     bg="#1a0505", fg=_RED,
-                     font=("Consolas", 8)).grid(row=row_idx, column=7, padx=3)
+                _del_btn = _btn(ws_hooks_inner, "X", _make_ws_del(h["name"]), font=_mono_xs)
+                _del_btn.setStyleSheet(f"background: {_RED_BG}; color: {_RED}; border: 1px solid #5a2a30;")
+                ws_hooks_grid.addWidget(_del_btn, row_idx, 7, Qt.AlignmentFlag.AlignCenter)
 
         _render_ws_hook_rows()
 
         def _load_ws_hooks_from_disk() -> None:
-            """Load previously saved WS hooks from site_data/MyWSHooks/{host}/.
-
-            Hooks saved without instanced-match fields (match_mode/match_payload)
-            get the defaults ("any" / empty) so they still load cleanly and
-            behave as "override every message on this path".
-            """
+            """Load previously saved WS hooks from site_data/MyWSHooks/{host}/."""
             for hook in _ws_hook_load_all({"name": "?", "direction": "*",
                                             "opcode": 0, "pattern": ".*",
                                             "origin_url": "*", "enabled": True,
                                             "match_mode": "any",
                                             "match_payload": b""}):
-                # Backfill any missing instanced fields.
                 hook.setdefault("match_mode", "any")
                 hook.setdefault("match_payload", b"")
                 with _gui_ws_hooks_lock:
@@ -2540,11 +2516,11 @@ def _launch_hook_gui() -> None:
                         log(f"Loaded WS hook '{hook['name']}' "
                             f"(match={hook.get('match_mode', 'any')}) from disk", "HOOK")
 
-        root.after(100, lambda: (_load_ws_hooks_from_disk(), _render_ws_hook_rows()))
+        QTimer.singleShot(100, lambda: (_load_ws_hooks_from_disk(), _render_ws_hook_rows()))
 
-        # ── WS log queue poller ─────────────────────────────────────────────
+        # ── WS log queue poller ───────────────────────────────────────────
         def _ws_poll():
-            if not ws_paused.get():
+            if not ws_paused_cb.isChecked():
                 count = 0
                 while count < 60:
                     try:
@@ -2563,83 +2539,88 @@ def _launch_hook_gui() -> None:
                     _dir = entry["direction"]
                     dir_disp = "[->] IN" if _dir == "in" else ("[<-] OUT" if _dir == "out" else _dir)
                     _op_upper = (entry.get("op_name") or "").upper()
-                    iid = ws_tree.insert("", "end", values=(
-                        entry["ts"], dir_disp, _op_upper,
-                        entry["origin"], entry["path"], sz_s,
-                    ), tags=(entry["direction"],))
+                    color = QColor(_GRN) if _dir == "in" else QColor(_CYN)
+                    item = QTreeWidgetItem([entry["ts"], dir_disp, _op_upper,
+                                             entry["origin"], entry["path"], sz_s])
+                    for c in range(item.columnCount()):
+                        item.setForeground(c, color)
+                    _ws_row_counter[0] += 1
+                    iid = str(_ws_row_counter[0])
+                    item.setData(0, Qt.ItemDataRole.UserRole, iid)
+                    ws_tree.addTopLevelItem(item)
                     _ws_row_data[iid] = entry
-                    if len(ws_tree.get_children()) > _WS_MAX_ROWS:
-                        old = ws_tree.get_children()[0]
-                        _ws_row_data.pop(old, None)
-                        ws_tree.delete(old)
-                    if ws_auto_scroll.get():
-                        ws_tree.see(iid)
+                    if ws_tree.topLevelItemCount() > _WS_MAX_ROWS:
+                        ws_tree.takeTopLevelItem(0)
+                    if ws_auto_scroll_cb.isChecked():
+                        ws_tree.scrollToItem(item)
                     count += 1
-            root.after(150, _ws_poll)
-        root.after(150, _ws_poll)
+        ws_poll_timer = QTimer(ws_bot)
+        ws_poll_timer.timeout.connect(_ws_poll)
+        ws_poll_timer.start(150)
 
-        # ══════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
         # TAB 3: Firefox Proxy  (only shown when FIREFOX_PROXY is enabled)
-        # Live log of every request the MITM forward proxy has seen — real
-        # browser traffic, any site, not just MAIN_HOST — on the left, with
-        # a hook editor for overriding matching request bodies before
-        # they're forwarded. Same shape as Tab 1, mirrored for requests.
-        # ══════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
         if FIREFOX_PROXY:
-            tab_fwd = tk.Frame(nb, bg=_BG)
-            nb.add(tab_fwd, text="  Firefox Proxy")
+            tab_fwd = QWidget()
+            nb.addTab(tab_fwd, "  Firefox Proxy")
 
-            fwd_v = tk.PanedWindow(tab_fwd, orient=tk.VERTICAL, bg=_BG, sashwidth=5)
-            fwd_v.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-            fwd_top_area = tk.Frame(fwd_v, bg=_BG)
-            fwd_bot_area = tk.Frame(fwd_v, bg=_PNL)
-            fwd_v.add(fwd_top_area, minsize=280)
-            fwd_v.add(fwd_bot_area, minsize=160)
+            fwd_v = QSplitter(Qt.Orientation.Vertical, tab_fwd); fwd_v.setChildrenCollapsible(False)
+            fwd_top_area = QWidget()
+            fwd_bot_area = QWidget(); fwd_bot_area.setStyleSheet(f"background: {_PNL};")
+            fwd_v.addWidget(fwd_top_area); fwd_v.addWidget(fwd_bot_area)
+            fwd_v.setStretchFactor(0, 5); fwd_v.setStretchFactor(1, 2)
+            fwd_v.setSizes([280, 160])
+            fv_lay = QVBoxLayout(tab_fwd); fv_lay.setContentsMargins(4, 4, 4, 4)
+            fv_lay.addWidget(fwd_v)
 
-            fwd_h = tk.PanedWindow(fwd_top_area, orient=tk.HORIZONTAL, bg=_BG, sashwidth=5)
-            fwd_h.pack(fill=tk.BOTH, expand=True)
-            fwd_left  = tk.Frame(fwd_h, bg=_PNL)
-            fwd_right = tk.Frame(fwd_h, bg=_PNL)
-            fwd_h.add(fwd_left,  minsize=460)
-            fwd_h.add(fwd_right, minsize=340)
+            fwd_h = QSplitter(Qt.Orientation.Horizontal, fwd_top_area); fwd_h.setChildrenCollapsible(False)
+            fwd_left  = QWidget(); fwd_left.setStyleSheet(f"background: {_PNL};")
+            fwd_right = QWidget(); fwd_right.setStyleSheet(f"background: {_PNL};")
+            fwd_h.addWidget(fwd_left); fwd_h.addWidget(fwd_right)
+            fwd_h.setStretchFactor(0, 55); fwd_h.setStretchFactor(1, 45)
+            fwd_h.setSizes([460, 340])
+            ft_lay = QVBoxLayout(fwd_top_area); ft_lay.setContentsMargins(0, 0, 0, 0)
+            ft_lay.addWidget(fwd_h)
 
-            _lbl(fwd_left, "Request Log  (live browser traffic via MITM)", fg=_ACC,
-                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
-            fwd_tree_frame = tk.Frame(fwd_left, bg=_PNL)
-            fwd_tree_frame.pack(fill=tk.BOTH, expand=True, padx=4)
-            fwd_tree = ttk.Treeview(fwd_tree_frame, columns=("ts", "method", "path", "status", "ct", "size"),
-                                     show="headings", selectmode="browse")
-            for c, w, label in (("ts", 70, "Time"), ("method", 60, "Method"), ("path", 0, "Host + Path"),
-                                 ("status", 60, "Status"), ("ct", 130, "Content-Type"), ("size", 68, "Size")):
-                fwd_tree.heading(c, text=label)
-                fwd_tree.column(c, width=w, anchor="w", stretch=(c == "path"))
-            fwd_tree.tag_configure("GET", foreground=_GRN)
-            fwd_tree.tag_configure("POST", foreground=_YLW)
-            fwd_tree.tag_configure("err", foreground=_RED)
-            fwd_vsb = ttk.Scrollbar(fwd_tree_frame, orient="vertical", command=fwd_tree.yview)
-            fwd_tree.configure(yscrollcommand=fwd_vsb.set)
-            fwd_vsb.pack(side=tk.RIGHT, fill=tk.Y)
-            fwd_tree.pack(fill=tk.BOTH, expand=True)
+            fl = QVBoxLayout(fwd_left);  fl.setContentsMargins(4, 4, 4, 4);  fl.setSpacing(2)
+            fr = QVBoxLayout(fwd_right); fr.setContentsMargins(4, 4, 4, 4); fr.setSpacing(2)
+
+            fl.addWidget(_lbl(fwd_left, "Request Log  (live browser traffic via MITM)",
+                               font=_mono_lg, color=_ACC))
+            fwd_tree = QTreeWidget(fwd_left)
+            fwd_tree.setColumnCount(6)
+            fwd_tree.setHeaderLabels(["Time", "Method", "Host + Path", "Status", "Content-Type", "Size"])
+            fwd_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            fwd_tree.setRootIsDecorated(False)
+            fwd_tree.setFont(_mono)
+            fwd_hdr = fwd_tree.header()
+            for i, w in enumerate([70, 60, 0, 60, 130, 68]):
+                if i == 2:
+                    fwd_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+                else:
+                    fwd_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+                    fwd_tree.setColumnWidth(i, w)
+            fl.addWidget(fwd_tree, 1)
             _fwd_row_data: dict = {}
+            _fwd_row_counter = [0]
 
-            _lbl(fwd_right, "Request Body / Headers", fg=_ACC,
-                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(6, 2))
-            fwd_info_var = tk.StringVar(value="← Select a request")
-            _lbl(fwd_right, textvariable=fwd_info_var, fg=_ACC, bg=_PNL).pack(anchor="w", padx=8)
-            fwd_body_box = _text_box(fwd_right)
-            fwd_body_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-            _bind_editor_keys(fwd_body_box)
+            fr.addWidget(_lbl(fwd_right, "Request Body / Headers", font=_mono_lg, color=_ACC))
+            fwd_info_lbl = _lbl(fwd_right, "← Select a request", color=_ACC)
+            fr.addWidget(fwd_info_lbl)
+            fwd_body_box = _text_box(fwd_right, wrap=False)
+            fr.addWidget(fwd_body_box, 1)
 
-            def _fwd_on_select(_event):
-                sel = fwd_tree.selection()
-                if not sel:
+            def _fwd_on_select(*_):
+                items = fwd_tree.selectedItems()
+                if not items:
                     return
-                data = _fwd_row_data.get(sel[0])
+                item = items[0]
+                iid = item.data(0, Qt.ItemDataRole.UserRole)
+                data = _fwd_row_data.get(iid)
                 if not data:
                     return
-                fwd_info_var.set(f"{data['method']}  {data['path']}  [{data['status']}]")
-                fwd_body_box.config(state="normal")
-                fwd_body_box.delete("1.0", "end")
+                fwd_info_lbl.setText(f"{data['method']}  {data['path']}  [{data['status']}]")
                 hdrs = data.get("req_headers") or {}
                 hdr_txt = "\n".join(f"{k}: {v}" for k, v in hdrs.items())
                 body_raw = data.get("body") or b""
@@ -2647,61 +2628,98 @@ def _launch_hook_gui() -> None:
                     body_txt = body_raw.decode("utf-8", errors="replace")
                 except Exception:
                     body_txt = body_raw.hex()
-                fwd_body_box.insert("1.0", hdr_txt + ("\n\n" if hdr_txt else "") + body_txt)
-                fwd_name_entry.delete(0, "end")
-                fwd_pat_entry.delete(0, "end")
-                fwd_pat_entry.insert(0, re.escape(data["path"].split("] ", 1)[-1]))
-                fwd_method_var.set(data["method"] if data["method"] in _RH_METHOD_OPTS else "*")
-            fwd_tree.bind("<<TreeviewSelect>>", _fwd_on_select)
+                fwd_body_box.setPlainText(hdr_txt + ("\n\n" if hdr_txt else "") + body_txt)
+                fwd_name_edit.setText("")
+                try:
+                    fwd_pat_edit.setText(re.escape(data["path"].split("] ", 1)[-1]))
+                except Exception:
+                    fwd_pat_edit.setText(r".*")
+                fwd_method_combo.setCurrentText(
+                    data["method"] if data["method"] in _RH_METHOD_OPTS else "*")
+            fwd_tree.itemSelectionChanged.connect(_fwd_on_select)
 
-            _lbl(fwd_right, "New Request Hook (overrides the body of matching live requests):",
-                 fg=_ACC, bg=_PNL, wraplength=380, justify="left").pack(anchor="w", padx=8, pady=(6, 2))
-            fwd_row1 = tk.Frame(fwd_right, bg=_PNL); fwd_row1.pack(fill=tk.X, padx=8, pady=2)
-            _lbl(fwd_row1, "Name:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-            fwd_name_entry = _entry(fwd_row1, width=12)
-            fwd_name_entry.pack(side=tk.LEFT, padx=(2, 10))
-            _lbl(fwd_row1, "Method:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-            fwd_method_var = tk.StringVar(value="*")
-            ttk.Combobox(fwd_row1, textvariable=fwd_method_var, values=_RH_METHOD_OPTS,
-                         width=7, state="readonly", font=("Consolas", 10)).pack(side=tk.LEFT)
-            fwd_row2 = tk.Frame(fwd_right, bg=_PNL); fwd_row2.pack(fill=tk.X, padx=8, pady=2)
-            _lbl(fwd_row2, "Path pattern:", fg=_ACC, bg=_PNL).pack(side=tk.LEFT)
-            fwd_pat_entry = _entry(fwd_row2, width=30)
-            fwd_pat_entry.insert(0, r".*")
-            fwd_pat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
-            fwd_save_status = _lbl(fwd_right, text="", fg=_DIM, bg=_PNL)
-            fwd_save_status.pack(anchor="w", padx=8, pady=(0, 2))
+            fr.addWidget(_lbl(fwd_right,
+                               "New Request Hook (overrides the body of matching live requests):",
+                               font=_mono_sm, color=_ACC))
+            fwd_row1 = QWidget(fwd_right); fr1 = QHBoxLayout(fwd_row1)
+            fr1.setContentsMargins(0, 0, 0, 0); fr1.setSpacing(4)
+            fr.addWidget(fwd_row1)
+            fr1.addWidget(_lbl(fwd_row1, "Name:", color=_ACC))
+            fwd_name_edit = _entry(fwd_row1, width=12); fr1.addWidget(fwd_name_edit)
+            fr1.addWidget(_lbl(fwd_row1, "Method:", color=_ACC))
+            fwd_method_combo = QComboBox(fwd_row1); fwd_method_combo.setEditable(False)
+            fwd_method_combo.addItems(_RH_METHOD_OPTS); fwd_method_combo.setFont(_mono)
+            fwd_method_combo.setMaximumWidth(90); fr1.addWidget(fwd_method_combo)
+            fr1.addStretch(1)
+
+            fwd_row2 = QWidget(fwd_right); fr2 = QHBoxLayout(fwd_row2)
+            fr2.setContentsMargins(0, 0, 0, 0); fr2.setSpacing(4)
+            fr.addWidget(fwd_row2)
+            fr2.addWidget(_lbl(fwd_row2, "Path pattern:", color=_ACC))
+            fwd_pat_edit = _entry(fwd_row2); fwd_pat_edit.setText(r".*")
+            fr2.addWidget(fwd_pat_edit, 1)
+
+            fwd_save_status_lbl = _lbl(fwd_right, "", color=_DIM)
+            fr.addWidget(fwd_save_status_lbl)
 
             _fwd_hook_save_to_disk, _fwd_hook_delete_from_disk, _fwd_hook_load_all = \
                 _make_hook_store("MyFwdHooks")
 
+            # Active hooks frame (created before _render_fwd_hook_rows is called)
+            fwd_hooks_widget = QWidget(fwd_bot_area)
+            fwd_hooks_widget.setStyleSheet(f"background: {_PNL};")
+            fhw = QVBoxLayout(fwd_hooks_widget); fhw.setContentsMargins(8, 4, 8, 4); fhw.setSpacing(2)
+
+            fhw.addWidget(_lbl(fwd_hooks_widget, "Active Firefox-Proxy Request Hooks",
+                               font=_mono_lg, color=_ACC))
+            fwd_hooks_grid_w = QWidget(fwd_hooks_widget)
+            fwd_hooks_grid_w.setStyleSheet(f"background: {_PNL};")
+            fwd_hooks_grid = QGridLayout(fwd_hooks_grid_w)
+            fwd_hooks_grid.setContentsMargins(0, 0, 0, 0); fwd_hooks_grid.setSpacing(4)
+            fhw.addWidget(fwd_hooks_grid_w, 1)
+            fwd_bot_lay = QVBoxLayout(fwd_bot_area); fwd_bot_lay.setContentsMargins(0, 0, 0, 0)
+            fwd_bot_lay.addWidget(fwd_hooks_widget)
+
             def _render_fwd_hook_rows():
-                for w in fwd_hooks_frame.winfo_children():
-                    w.destroy()
+                while fwd_hooks_grid.count():
+                    it = fwd_hooks_grid.takeAt(0)
+                    w = it.widget()
+                    if w is not None:
+                        w.deleteLater()
                 for col_idx, col_name in enumerate(("Name", "Method", "Pattern", "On", "")):
-                    _lbl(fwd_hooks_frame, col_name, fg=_ACC, bg=_PNL,
-                         font=("Consolas", 9, "bold")).grid(row=0, column=col_idx, sticky="w", padx=6)
+                    fwd_hooks_grid.addWidget(
+                        _lbl(fwd_hooks_grid_w, col_name, font=_mono_sm_b, color=_ACC),
+                        0, col_idx, Qt.AlignmentFlag.AlignLeft)
                 with _gui_fwd_req_hooks_lock:
                     hooks_copy = list(_gui_fwd_req_hooks)
                 if not hooks_copy:
-                    _lbl(fwd_hooks_frame, "No hooks saved yet.", fg=_DIM, bg=_PNL).grid(
-                        row=1, column=0, columnspan=5, sticky="w", padx=4, pady=4)
+                    fwd_hooks_grid.addWidget(
+                        _lbl(fwd_hooks_grid_w, "No hooks saved yet.", color=_DIM),
+                        1, 0, 1, 5, Qt.AlignmentFlag.AlignLeft)
                     return
                 for row_idx, h in enumerate(hooks_copy, start=1):
                     fg = _FG if h["enabled"] else _DIM
-                    _lbl(fwd_hooks_frame, h["name"], bg=_PNL, fg=fg).grid(row=row_idx, column=0, sticky="w", padx=6)
-                    _lbl(fwd_hooks_frame, h["method"], bg=_PNL, fg=fg).grid(row=row_idx, column=1, sticky="w", padx=6)
-                    _lbl(fwd_hooks_frame, h["pattern"][:36], bg=_PNL, fg=_DIM).grid(row=row_idx, column=2, sticky="w", padx=6)
-                    bv = tk.BooleanVar(value=h["enabled"])
-                    def _mk_toggle(hook_ref=h, var=bv):
-                        def _t():
+                    fwd_hooks_grid.addWidget(
+                        _lbl(fwd_hooks_grid_w, h["name"], color=fg),
+                        row_idx, 0, Qt.AlignmentFlag.AlignLeft)
+                    fwd_hooks_grid.addWidget(
+                        _lbl(fwd_hooks_grid_w, h["method"], color=fg),
+                        row_idx, 1, Qt.AlignmentFlag.AlignLeft)
+                    fwd_hooks_grid.addWidget(
+                        _lbl(fwd_hooks_grid_w, h["pattern"][:36], color=_DIM),
+                        row_idx, 2, Qt.AlignmentFlag.AlignLeft)
+                    cb = QCheckBox(fwd_hooks_grid_w); cb.setChecked(h["enabled"])
+
+                    def _mk_toggle(hook_ref=h, var=cb):
+                        def _t(_checked):
                             with _gui_fwd_req_hooks_lock:
-                                hook_ref["enabled"] = var.get()
+                                hook_ref["enabled"] = var.isChecked()
                             _fwd_hook_save_to_disk(hook_ref)
                             _render_fwd_hook_rows()
                         return _t
-                    tk.Checkbutton(fwd_hooks_frame, variable=bv, command=_mk_toggle(),
-                                   bg=_PNL, selectcolor=_BG).grid(row=row_idx, column=3, padx=3)
+                    cb.stateChanged.connect(_mk_toggle())
+                    fwd_hooks_grid.addWidget(cb, row_idx, 3, Qt.AlignmentFlag.AlignCenter)
+
                     def _mk_del(name=h["name"]):
                         def _d():
                             with _gui_fwd_req_hooks_lock:
@@ -2709,48 +2727,47 @@ def _launch_hook_gui() -> None:
                             _fwd_hook_delete_from_disk(name)
                             _render_fwd_hook_rows()
                         return _d
-                    _btn(fwd_hooks_frame, "X", _mk_del(), bg="#1a0505", fg=_RED,
-                         font=("Consolas", 8)).grid(row=row_idx, column=4, padx=3)
+                    _fwd_del = _btn(fwd_hooks_grid_w, "X", _mk_del(), font=_mono_xs)
+                    _fwd_del.setStyleSheet(f"background: {_RED_BG}; color: {_RED}; border: 1px solid #5a2a30;")
+                    fwd_hooks_grid.addWidget(_fwd_del, row_idx, 4, Qt.AlignmentFlag.AlignCenter)
 
             def _fwd_save_hook():
-                name = fwd_name_entry.get().strip()
+                name = fwd_name_edit.text().strip()
                 if not name:
-                    messagebox.showwarning("S2L", "Hook name is required.")
+                    QMessageBox.warning(win, "S2L", "Hook name is required.")
                     return
-                body_full = fwd_body_box.get("1.0", "end-1c")
+                body_full = fwd_body_box.toPlainText()
                 body_only = body_full.split("\n\n", 1)[-1] if "\n\n" in body_full else body_full
-                pat = fwd_pat_entry.get().strip() or r".*"
+                pat = fwd_pat_edit.text().strip() or r".*"
                 try:
                     re.compile(pat)
                 except re.error as e:
-                    messagebox.showerror("S2L", f"Invalid pattern: {e}")
+                    QMessageBox.critical(win, "S2L", f"Invalid pattern: {e}")
                     return
-                hook = {"name": name, "method": fwd_method_var.get(), "pattern": pat,
+                hook = {"name": name, "method": fwd_method_combo.currentText(),
+                        "pattern": pat,
                         "body_bytes": body_only.encode("utf-8"), "enabled": True}
                 with _gui_fwd_req_hooks_lock:
                     _gui_fwd_req_hooks[:] = [h for h in _gui_fwd_req_hooks if h["name"] != name] + [hook]
                 _fwd_hook_save_to_disk(hook)
                 _render_fwd_hook_rows()
-                fwd_save_status.config(text=f"Saved '{name}'", fg=_GRN)
+                fwd_save_status_lbl.setText(f"Saved '{name}'")
+                fwd_save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
                 log(f"GUI fwd request hook saved: '{name}' [{hook['method']}] {hook['pattern']}", "HOOK")
 
-            fwd_btn_row = tk.Frame(fwd_right, bg=_PNL)
-            fwd_btn_row.pack(fill=tk.X, padx=8, pady=(0, 6))
-            _btn(fwd_btn_row, "Save Request Hook", _fwd_save_hook,
-                 font=("Consolas", 10, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-            _lbl(fwd_bot_area, "Active Firefox-Proxy Request Hooks", fg=_ACC,
-                 font=("Consolas", 11, "bold"), bg=_PNL).pack(anchor="w", padx=8, pady=(4, 2))
-            fwd_hooks_frame = tk.Frame(fwd_bot_area, bg=_PNL)
-            fwd_hooks_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+            fwd_btn_row = QWidget(fwd_right); fwd_btn_row.setStyleSheet(f"background: {_PNL};")
+            fbr = QHBoxLayout(fwd_btn_row); fbr.setContentsMargins(0, 0, 0, 0); fbr.setSpacing(4)
+            fr.addWidget(fwd_btn_row)
+            fbr.addWidget(_btn(fwd_btn_row, "Save Request Hook", _fwd_save_hook, font=_mono_b), 1)
 
             def _load_fwd_hooks_from_disk():
-                for hook in _fwd_hook_load_all({"name": "?", "method": "*", "pattern": ".*", "enabled": True}):
+                for hook in _fwd_hook_load_all(
+                        {"name": "?", "method": "*", "pattern": ".*", "enabled": True}):
                     with _gui_fwd_req_hooks_lock:
                         if hook["name"] not in [h["name"] for h in _gui_fwd_req_hooks]:
                             _gui_fwd_req_hooks.append(hook)
 
-            root.after(100, lambda: (_load_fwd_hooks_from_disk(), _render_fwd_hook_rows()))
+            QTimer.singleShot(100, lambda: (_load_fwd_hooks_from_disk(), _render_fwd_hook_rows()))
 
             def _fwd_poll():
                 count = 0
@@ -2761,62 +2778,118 @@ def _launch_hook_gui() -> None:
                         break
                     sz = entry["size"]
                     sz_s = f"{sz/1024:.1f}KB" if sz >= 1024 else (f"{sz}B" if sz else "—")
-                    tagn = "err" if isinstance(entry["status"], int) and entry["status"] >= 400 else entry["method"]
-                    iid = fwd_tree.insert("", "end", values=(
-                        entry["ts"], entry["method"], entry["path"], entry["status"],
-                        entry["ct"], sz_s), tags=(tagn,))
+                    is_err = isinstance(entry["status"], int) and entry["status"] >= 400
+                    color = QColor(_RED) if is_err else (
+                        QColor(_YLW) if entry["method"] == "POST" else (
+                            QColor(_GRN) if entry["method"] == "GET" else QColor(_FG)))
+                    item = QTreeWidgetItem([entry["ts"], entry["method"], entry["path"],
+                                             str(entry["status"]), entry["ct"], sz_s])
+                    for c in range(item.columnCount()):
+                        item.setForeground(c, color)
+                    _fwd_row_counter[0] += 1
+                    iid = str(_fwd_row_counter[0])
+                    item.setData(0, Qt.ItemDataRole.UserRole, iid)
                     _fwd_row_data[iid] = entry
-                    if len(fwd_tree.get_children()) > _MAX_ROWS:
-                        old = fwd_tree.get_children()[0]
-                        _fwd_row_data.pop(old, None)
-                        fwd_tree.delete(old)
-                    fwd_tree.see(iid)
+                    if fwd_tree.topLevelItemCount() > _MAX_ROWS:
+                        fwd_tree.takeTopLevelItem(0)
+                    fwd_tree.scrollToItem(item)
                     count += 1
-                root.after(150, _fwd_poll)
-            root.after(150, _fwd_poll)
+            fwd_poll_timer = QTimer(fwd_bot_area)
+            fwd_poll_timer.timeout.connect(_fwd_poll)
+            fwd_poll_timer.start(150)
 
-        # ── Polling loop ──────────────────────────────────────────────────────
+        # ── Main polling loop for the HTTP traffic log ────────────────────
+        _poll_tick = [0]   # debug counter — used for periodic queue diagnostics
         def _poll():
-            if not paused.get():
-                count = 0
-                while count < 60:
+            # Wrap the whole body in try/except so a slot exception is LOGGED,
+            # not swallowed. Without this, a single KeyError on a malformed
+            # queue entry would silently break the timer on every tick and
+            # the Traffic Log would stay forever empty with no clue why.
+            try:
+                if not paused_cb.isChecked():
+                    count = 0
+                    while count < 60:
+                        try:
+                            entry = _gui_log_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        method = entry["method"]
+                        status = entry["status"]
+                        sz = entry["size"]
+                        if sz >= 1024 * 1024:
+                            sz_s = f"{sz / 1024 / 1024:.1f}MB"
+                        elif sz >= 1024:
+                            sz_s = f"{sz // 1024}KB"
+                        elif sz > 0:
+                            sz_s = f"{sz}B"
+                        else:
+                            sz_s = "—"
+                        if entry.get("hooked"):
+                            color = QColor(_PURP)
+                        elif status >= 400:
+                            color = QColor(_RED)
+                        elif any(x in entry.get("ct", "") for x in ("json", "xml", "event-stream")):
+                            color = QColor(_BLUE)
+                        elif method == "GET":
+                            color = QColor(_GRN)
+                        elif method == "POST":
+                            color = QColor(_YLW)
+                        elif method in ("PUT", "PATCH"):
+                            color = QColor(_YLW)
+                        elif method == "DELETE":
+                            color = QColor(_RED)
+                        else:
+                            color = QColor(_FG)
+                        _origin_val = entry.get("origin", "") or ""
+                        _web_type_val = entry.get("web_type", "") or "None"
+                        item = QTreeWidgetItem([
+                            entry["ts"], method, _origin_val, entry["path"],
+                            str(status), _web_type_val, entry["ct"], sz_s,
+                        ])
+                        for c in range(item.columnCount()):
+                            item.setForeground(c, color)
+                        _row_counter[0] += 1
+                        iid = str(_row_counter[0])
+                        item.setData(0, Qt.ItemDataRole.UserRole, iid)
+                        _row_data[iid] = entry
+                        tree.addTopLevelItem(item)
+                        if tree.topLevelItemCount() > _MAX_ROWS:
+                            tree.takeTopLevelItem(0)
+                        if auto_scroll_cb.isChecked():
+                            tree.scrollToItem(item)
+                        count += 1
+                # ── Periodic diagnostic (every ~50 ticks ≈ 6 s) ──────────────
+                # Confirms the poller is alive AND reveals whether the queue
+                # has pending entries the poller isn't draining. If you see
+                # "qsize>0 but drained 0" every cycle, the QTimer is firing
+                # but something in the loop body is throwing. If you never
+                # see this line at all, the QTimer itself isn't running.
+                _poll_tick[0] += 1
+                if _poll_tick[0] % 50 == 1:
                     try:
-                        entry = _gui_log_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    method = entry["method"]
-                    status = entry["status"]
-                    sz   = entry["size"]
-                    if sz >= 1024 * 1024:
-                        sz_s = f"{sz / 1024 / 1024:.1f}MB"
-                    elif sz >= 1024:
-                        sz_s = f"{sz // 1024}KB"
-                    elif sz > 0:
-                        sz_s = f"{sz}B"
-                    else:
-                        sz_s = "—"    # genuinely empty response; not a read error
-                    _tag = ("hooked" if entry.get("hooked") else "err" if status>=400 else "api" if any(x in entry.get("ct","") for x in ("json","xml","event-stream")) else method if method in ("GET","POST","PUT","PATCH","DELETE") else "")
-                    _origin_val = entry.get("origin", "") or ""
-                    _web_type_val = entry.get("web_type", "") or "None"
-                    iid  = tree.insert("", "end", values=(
-                        entry["ts"], method, _origin_val, entry["path"],
-                        status, _web_type_val, entry["ct"], sz_s,
-                    ), tags=(_tag,))
-                    _row_data[iid] = entry
-                    children = tree.get_children()
-                    if len(children) > _MAX_ROWS:
-                        old = children[0]
-                        _row_data.pop(old, None)
-                        tree.delete(old)
-                    if auto_scroll.get():
-                        tree.see(iid)
-                    count += 1
-            root.after(120, _poll)
+                        qsz = _gui_log_queue.qsize()
+                    except NotImplementedError:
+                        qsz = "?"
+                    log(f"GUI poll alive — tick #{_poll_tick[0]} "
+                        f"http_qsize={qsz} rows={tree.topLevelItemCount()}", "DEBUG")
+            except Exception as _e:
+                # Log the FULL traceback so the root cause is obvious. This is
+                # the line that turns "GUI silently empty" into "here's why".
+                import traceback as _tb
+                log(f"_poll() raised {_e.__class__.__name__}: {_e}\n"
+                    + "".join(_tb.format_exception(type(_e), _e, _e.__traceback__)),
+                    "ERROR")
+        poll_timer = QTimer(win)
+        poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        poll_timer.timeout.connect(_poll)
+        poll_timer.start(120)
+        log("PyQt6 GUI ready — Traffic Log poller started "
+            f"(HOOK_GUI={HOOK_GUI}, interval=120ms)", "INFO")
 
-        root.after(120, _poll)
-        root.mainloop()
+        win.show()
+        app.exec()   # blocks — caller must be on main thread
 
-    _gui_main()   # blocks — caller must be on main thread
+    _gui_main()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UA profiles + device detection
@@ -10356,7 +10429,7 @@ def _banner() -> None:
               f"{n_paths} paths · rate={_rate_disp} · progress={_bar_disp} → "
               f"{DATA_FOLDER}/hidden_paths.json{R}")
     if HOOK_GUI:
-        print(f"  {Y}▶ HOOK_GUI{R} {DIM}Tkinter traffic inspector + live hook editor{R}")
+        print(f"  {Y}▶ HOOK_GUI{R} {DIM}PyQt6 traffic inspector + live hook editor (KDE Breeze Dark){R}")
     if n_hooks:
         print(f"  {Y}▶ HOOKS{R}")
         for pat, mset, fn in _REQ_HOOKS:
@@ -10379,9 +10452,9 @@ def _banner() -> None:
 # NOT clear logging — ESC switches back (`\x1b[?1049l`) and the entire log
 # history reappears untouched, exactly as if the viewer had never opened.
 #
-# GUI mode caveat: when HOOK_GUI=True, tkinter owns the main thread and the
+# GUI mode caveat: when HOOK_GUI=True, PyQt6 owns the main thread and the
 # terminal is just a passive log sink — that's fine, the viewer still works
-# because it reads stdin directly, not through tkinter.
+# because it reads stdin directly, not through the Qt event loop.
 #
 # Safety:
 #   - Only starts if MULTIPORT is True AND stdin is a TTY (so piped input /
@@ -10855,7 +10928,9 @@ if __name__ == "__main__":
     log(f"Listening on http://{HOST}:{PORT}")
 
     if HOOK_GUI:
-        # On Linux/X11 Tkinter MUST run on the main thread.
+        # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
+        # dispatches via the main thread; creating QApplication off-main
+        # is unreliable across Wayland/X11 compositors).
         # Flask moves to a daemon thread so the main thread is free for the GUI.
         def _flask_thread():
             srv = make_server(HOST, PORT, app, threaded=True,
