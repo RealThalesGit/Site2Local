@@ -19,7 +19,7 @@ if _s2l_sem_filter not in _s2l_existing_warnings:
         (_s2l_existing_warnings + "," if _s2l_existing_warnings else "")
         + _s2l_sem_filter
     )
-# ── stdlib ────────────────────────────────────────────────────────────────────
+# ── STDLIB ────────────────────────────────────────────────────────────────────
 import os, sys, re, json, time, socket, queue, zlib, gc
 import hashlib, mimetypes, logging, threading, warnings
 import base64, struct, ssl, shutil, subprocess, tempfile
@@ -42,7 +42,7 @@ try:
         _s2l_rt._s2l_warn_patched = True
 except Exception:
     pass
-# ── third-party ───────────────────────────────────────────────────────────────
+# ── Third Party ───────────────────────────────────────────────────────────────
 import requests
 import requests.adapters
 import urllib3
@@ -135,6 +135,11 @@ _LEVEL_COLOR: dict[str, str] = {
     "WS":    Fore.BLUE    + Style.BRIGHT,    # WebSocket events
     "SSE":   Fore.MAGENTA,                    # SSE events
     "TUNNEL":Fore.MAGENTA + Style.BRIGHT,    # TCP/UDP tunnel
+    # 24-bit truecolor escape (#772953 → RGB 119,41,83). colorama's Fore has no
+    # arbitrary-HEX helper, so we emit the SGR sequence directly; every modern
+    # terminal (and the Win10+ console) supports 24-bit color, and the existing
+    # Style.RESET_ALL in log() still clears it at the end of the line.
+    "CAPTURE": "\x1b[38;2;119;41;83m",       # HTTP capture written to disk
 }
 
 def _lolcat_internal(text: str) -> str:
@@ -249,14 +254,14 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = 256 * 1024        # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = True                   # crawl at startup; False = proxy-on-demand only
+CRAWL = False                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (KDE Breeze Dark theme)
+HOOK_GUI = True                # PyQt6 traffic inspector + live hook editor (KDE Breeze Dark theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
@@ -283,6 +288,12 @@ CAPTURE_CDN = False              # include CDN responses in captures
 CAPTURE_BODIES = False            # include request bodies in captures
 CAPTURE_SKIP_STATIC = True       # skip images/fonts/JS/CSS from captures
 CAPTURE_WS = False                # record every WebSocket message (text+binary) as JSON
+# ── Web UI viewers (totally optional) ─────────────────────────────────────────
+# When False, the matching /__s2l_*__ routes return 404 and their cross-links
+# are hidden from the other page, so the proxy runs headless with zero web
+# surface. Flip either on to expose the corresponding self-contained viewer.
+WEB_CDNVIEWER    = False            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CAPTUREVIEWER = False            # /__s2l_captures__ + /__s2l_captures_data__ + /__s2l_captures_files__ + /__s2l_capture_file__
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -9116,12 +9127,23 @@ def _viewer_cors_headers(origin: str) -> dict:
         h["Access-Control-Allow-Origin"] = "*"
     return h
 
+def _viewer_disabled_response() -> Response:
+    """404 returned by any /__s2l_*__ viewer route when its master flag
+    (WEB_CDNVIEWER / WEB_CAPTUREVIEWER) is off. Served for BOTH GET and
+    OPTIONS so a disabled viewer has no discoverable CORS surface either.
+    """
+    r = Response("not found", status=404, content_type="text/plain; charset=utf-8")
+    r.headers["Cache-Control"] = "no-store"
+    return r
+
 # ── Reset-stats endpoint ─────────────────────────────────────────────────────
 # Zeros every counter + clears the rolling-window event log so a developer
 # can start a clean benchmark window from the viewer's "Reset" button without
 # restarting the server. POST-only (mutating action); OPTIONS for CORS.
 @app.route("/__s2l_reset_stats__", methods=["POST", "OPTIONS"])
 def _s2l_reset_stats_endpoint() -> Response:
+    if not WEB_CDNVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9192,6 +9214,8 @@ def _s2l_captures_files_endpoint() -> Response:
     The `url` points at /__s2l_capture_file__ so the browser can fetch the raw
     JSON without constructing the URL itself.
     """
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9249,6 +9273,8 @@ def _s2l_captures_files_endpoint() -> Response:
 @app.route("/__s2l_captures_data__", methods=["GET", "OPTIONS"])
 def _s2l_captures_data_endpoint() -> Response:
     """JSON listing of all HTTP + WS capture files, grouped by host."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9284,6 +9310,8 @@ def _s2l_captures_data_endpoint() -> Response:
 @app.route("/__s2l_capture_file__", methods=["GET", "OPTIONS"])
 def _s2l_capture_file_endpoint() -> Response:
     """Return the raw JSON contents of one capture file (by ?path=&kind=)."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9317,6 +9345,8 @@ def _s2l_capture_file_endpoint() -> Response:
 @app.route("/__s2l_captures__", methods=["GET", "OPTIONS"])
 def _s2l_captures_endpoint() -> Response:
     """Self-contained capture browser page (lists HTTP + WS captures)."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9358,12 +9388,25 @@ def _s2l_captures_endpoint() -> Response:
   .card.open .caret{transform:rotate(90deg)}
   .caret{display:inline-block;transition:transform .12s;color:var(--dim);font-size:10px}
   .host{color:var(--fg2);font-weight:500}
-  .kind-chip{font-size:9px;padding:1px 6px;border-radius:8px;border:1px solid var(--bd);cursor:pointer;font-weight:600}
-  .kind-chip.http{color:var(--acc);border-color:var(--acc)}
-  .kind-chip.ws{color:var(--mag);border-color:var(--mag)}
-  .kind-chip:hover{background:var(--pnl2)}
-  .kind-chip.active{background:var(--acc);color:#fff}
-  .kind-chip.ws.active{background:var(--mag);color:#fff}
+  /* Global Main/WS view tabs (header). Switching re-filters the host cards
+     to the selected capture kind so HTTP and WebSocket captures can be
+     browsed independently instead of mixed in one list. */
+  .kind-tabs{display:flex;gap:2px;background:var(--bg);border:1px solid var(--bd);
+    border-radius:7px;padding:2px}
+  .kind-tabs .ktab{background:none;border:0;color:var(--dim);font:inherit;font-size:11px;
+    font-weight:700;letter-spacing:.4px;padding:4px 14px;border-radius:5px;cursor:pointer;
+    text-transform:uppercase;transition:background .12s,color .12s}
+  .kind-tabs .ktab:hover{color:var(--fg2)}
+  .kind-tabs .ktab.active{background:var(--acc);color:#fff}
+  .kind-tabs .ktab.active[data-kind="ws"]{background:var(--mag)}
+  .kind-tabs .ktab .badge{font-size:9px;opacity:.7;margin-left:5px;font-variant-numeric:tabular-nums}
+  /* Per-card count badge for the active kind (replaces the old http/ws chips
+     now that the global tabs drive the kind). */
+  .kcount{display:inline-block;min-width:22px;text-align:center;font-size:10px;font-weight:700;
+    padding:1px 7px;border-radius:9px;border:1px solid var(--bd2);color:var(--dim);
+    font-variant-numeric:tabular-nums;background:var(--pnl2)}
+  .card.open .kcount{color:var(--acc);border-color:var(--acc)}
+  .card.open[data-kind="ws"] .kcount{color:var(--mag);border-color:var(--mag)}
   table.files{width:100%;border-collapse:collapse}
   table.files td,th{padding:6px 14px;border-bottom:1px solid var(--bd2);text-align:left;font-size:11px}
   table.files th{color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-size:9px;position:sticky;top:0;background:var(--pnl2)}
@@ -9432,7 +9475,11 @@ def _s2l_captures_endpoint() -> Response:
 <header>
   <span class="pulse"></span>
   <h1>S2L <span class="v">Captures</span></h1>
-  <a class="back" href="/__s2l_viewer__">← viewer</a>
+  <a class="back" id="s2l-back" href="/__s2l_viewer__">← viewer</a>
+  <div class="kind-tabs" id="kind-tabs" title="switch between HTTP (Main) and WebSocket captures">
+    <button class="ktab active" data-kind="http">Main <span class="badge" id="ktab-http">0</span></button>
+    <button class="ktab" data-kind="ws">WS <span class="badge" id="ktab-ws">0</span></button>
+  </div>
   <div class="stats">
     <span>HTTP: <b id="t-http">0</b> (<b id="t-http-sz">0B</b>)</span>
     <span>WS: <b id="t-ws">0</b> (<b id="t-ws-sz">0B</b>)</span>
@@ -9450,7 +9497,7 @@ def _s2l_captures_endpoint() -> Response:
 </main>
 <footer>
   <span>capture files under <b id="roots">—</b></span>
-  <span>click a host to expand · click a file to view its JSON · <span class="kind-chip http">HTTP</span>/<span class="kind-chip ws">WS</span> chips toggle kind</span>
+  <span>use the <b>Main</b> / <b>WS</b> tabs to switch kind · click a host to expand · click a file to view its JSON · the list auto-refreshes every 5 s (paused while a file is open)</span>
 </footer>
 <div class="modal-overlay" id="modal">
   <div class="modal" id="modal-box">
@@ -9476,56 +9523,131 @@ def _s2l_captures_endpoint() -> Response:
 </div>
 <div class="toast" id="toast"></div>
 <script>
+/* Server-injected config: hides the "← viewer" cross-link when the CDN
+   viewer has been disabled server-side (WEB_CDNVIEWER). The sentinel
+   __S2L_CDN__ is replaced with true/false below. */
+var S2L_CFG = { viewer: __S2L_CDN__ };
 (function(){
   function $(id){return document.getElementById(id);}
   function fmtSize(n){if(n<1024)return n+"B";if(n<1048576)return (n/1024).toFixed(1)+"KB";return (n/1048576).toFixed(1)+"MB";}
+  // Hide the back-link to a viewer that's been turned off server-side.
+  (function(){ if(!S2L_CFG.viewer){ var b=$("s2l-back"); if(b) b.style.display="none"; } })();
   function fmtTime(t){var d=new Date(t*1000);return d.toTimeString().slice(0,8);}
   function showToast(msg){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(function(){t.classList.remove("show");},1500);}
   // Theme persistence (shared with viewer via localStorage key)
   if(localStorage.getItem("s2l-theme")==="light") document.documentElement.setAttribute("data-theme","light");
   $("theme-btn").onclick=function(){var cur=document.documentElement.getAttribute("data-theme");var next=cur==="light"?"":"light";if(next)document.documentElement.setAttribute("data-theme",next);else document.documentElement.removeAttribute("data-theme");localStorage.setItem("s2l-theme",next||"dark");};
 
-  var hostKindState = {};  // host -> "http" | "ws"  (which kind is expanded)
+  // ── View state ──────────────────────────────────────────────────────
+  var activeKind = "http";                 // global kind set by the Main/WS tabs
+  var activeKindRendered = null;           // last kind we fully rendered (tab-switch rebuilds)
+  var openHosts = new Set();               // hosts whose card-body is currently expanded
+  var cardEls  = Object.create(null);       // host -> {card, head, kcount, n}
+  var lastData = null;
+
+  // Main/WS tabs: switching kind re-filters the host list to that kind and
+  // re-opens any host that was already expanded (loading the new kind's files).
+  document.querySelectorAll(".kind-tabs .ktab").forEach(function(tab){
+    tab.onclick=function(){
+      var k=tab.dataset.kind;
+      if(k===activeKind) return;
+      activeKind=k;
+      document.querySelectorAll(".kind-tabs .ktab").forEach(function(t){
+        t.classList.toggle("active", t.dataset.kind===k);
+      });
+      if(lastData) renderCards(lastData, true);
+      activeKindRendered=activeKind;
+    };
+  });
 
   function load(){
     fetch("/__s2l_captures_data__",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+      lastData=d;
+      // Header totals (always show BOTH kinds' totals regardless of active tab).
       $("t-http").textContent=d.http_total;$("t-http-sz").textContent=fmtSize(d.http_size);
       $("t-ws").textContent=d.ws_total;$("t-ws-sz").textContent=fmtSize(d.ws_size);
+      $("ktab-http").textContent=d.http_total;
+      $("ktab-ws").textContent=d.ws_total;
       $("t-hosts").textContent=d.hosts.length;
       $("roots").textContent=[d.http_root,d.ws_root].filter(Boolean).join(" + ")||"—";
-      var cards=$("cards"); cards.innerHTML="";
-      $("empty").style.display=d.hosts.length?"none":"block";
-      d.hosts.forEach(function(h){
-        var c=document.createElement("div");c.className="card";c.dataset.host=h.host;
-        var head=document.createElement("div");head.className="card-head";
-        var httpChip='<span class="kind-chip http'+(h.http?'':'" style="opacity:.3')+'" data-kind="http">'+h.http+'</span>';
-        var wsChip='<span class="kind-chip ws'+(h.ws?'':'" style="opacity:.3')+'" data-kind="ws">'+h.ws+'</span>';
-        head.innerHTML='<span class="caret">▶</span> <span class="host">'+h.host+'</span> '
-          + httpChip + ' ' + wsChip
-          + '<span class="n">'+fmtSize(h.size)+' · '+fmtTime(h.last)+'</span>';
-        head.onclick=function(ev){
-          var chip=ev.target.closest(".kind-chip");
-          if(chip){ ev.stopPropagation(); openHost(c, h.host, chip.dataset.kind); return; }
-          toggleCard(c, h.host);
-        };
-        c.appendChild(head);
-        var body=document.createElement("div");body.className="card-body";
-        c.appendChild(body);cards.appendChild(c);
-      });
+      renderCards(d, activeKindRendered!==activeKind);
+      activeKindRendered=activeKind;
     }).catch(function(e){$("empty").textContent="Error: "+e;$("empty").style.display="block";});
   }
+
+  // Smart-merge render: preserves already-open cards AND their loaded file
+  // lists (scroll position, filter text, diff selection all survive the 5s
+  // auto-refresh), only touching the header counts. This is what stops the
+  // "modal / expanded card closes at every update" bug — the body of an open
+  // card is never touched by a refresh tick. A full rebuild is only done when
+  // the active kind (tab) actually changes.
+  function renderCards(d, fullRebuild){
+    var cards=$("cards");
+    // Hosts visible in the active tab = hosts that have at least one capture
+    // of the active kind. Hosts with only the *other* kind are hidden.
+    var visible = d.hosts.filter(function(h){ return (h[activeKind]||0) > 0; });
+    if(fullRebuild){
+      cards.innerHTML=""; cardEls=Object.create(null);
+    }
+    var seen=Object.create(null);
+    var frag=document.createDocumentFragment();
+    visible.forEach(function(h){
+      seen[h.host]=true;
+      var existing=cardEls[h.host];
+      if(existing && !fullRebuild){
+        // Update only the header counts/size/time — leave the body untouched.
+        existing.kcount.textContent=h[activeKind]||0;
+        existing.n.textContent=fmtSize(h.size)+' · '+fmtTime(h.last);
+        frag.appendChild(existing.card);
+        return;
+      }
+      var c=document.createElement("div");c.className="card";c.dataset.host=h.host;
+      var head=document.createElement("div");head.className="card-head";
+      var kcount=document.createElement("span");kcount.className="kcount";kcount.textContent=h[activeKind]||0;
+      var n=document.createElement("span");n.className="n";n.textContent=fmtSize(h.size)+' · '+fmtTime(h.last);
+      head.innerHTML='<span class="caret">▶</span> <span class="host"></span> ';
+      head.querySelector(".host").textContent=h.host;
+      head.appendChild(kcount); head.appendChild(n);
+      head.onclick=function(ev){ toggleCard(c, h.host); };
+      c.appendChild(head);
+      var body=document.createElement("div");body.className="card-body";
+      c.appendChild(body);
+      cardEls[h.host]={card:c, head:head, kcount:kcount, n:n};
+      frag.appendChild(c);
+    });
+    cards.appendChild(frag);
+    // Drop cards for hosts no longer visible (gone host, or the active tab
+    // no longer includes them). Close + forget them.
+    Object.keys(cardEls).forEach(function(host){
+      if(!seen[host]){
+        var e=cardEls[host]; if(e && e.card.parentNode) e.card.parentNode.removeChild(e.card);
+        delete cardEls[host]; openHosts.delete(host);
+      }
+    });
+    // On a tab switch (fullRebuild), re-open any host the user had expanded,
+    // now loading the *new* kind's files into its body.
+    if(fullRebuild){
+      var toReopen=Array.from(openHosts);
+      openHosts=new Set();
+      toReopen.forEach(function(host){ var e=cardEls[host]; if(e) openHost(e.card, host, activeKind); });
+    }
+    var visCount=Object.keys(cardEls).length;
+    $("empty").style.display=visCount?"none":"block";
+  }
+
   function toggleCard(card, host){
     var isOpen=card.classList.contains("open");
-    if(isOpen){ card.classList.remove("open"); return; }
-    // default kind: http if it has http files, else ws
-    var kind = hostKindState[host] || (card.querySelector(".kind-chip.http").textContent!=="0" ? "http" : "ws");
-    openHost(card, host, kind);
+    if(isOpen){
+      card.classList.remove("open");
+      openHosts.delete(host);
+      return;
+    }
+    openHost(card, host, activeKind);
   }
   function openHost(card, host, kind){
-    hostKindState[host]=kind;
+    card.dataset.kind=kind;
     card.classList.add("open");
-    // highlight active chip
-    card.querySelectorAll(".kind-chip").forEach(function(ch){ch.classList.toggle("active", ch.dataset.kind===kind);});
+    openHosts.add(host);
     var body=card.querySelector(".card-body");
     body.innerHTML='<div class="loading">loading '+kind+' files…</div>';
     fetch("/__s2l_captures_files__?host="+encodeURIComponent(host)+"&kind="+kind,{cache:"no-store"})
@@ -9839,9 +9961,19 @@ def _s2l_captures_endpoint() -> Response:
   });
   $("refresh").onclick=load;
   load();
-  setInterval(load, 5000);
+  // Auto-refresh every 5 s, but PAUSE while the file-detail modal is open so
+  // the user can click around (Response tab, copy-body, prev/next, diff)
+  // without the underlying list rebuilding under their cursor. Resumes the
+  // tick after the modal closes, picking up any captures written meanwhile.
+  setInterval(function(){
+    if($("modal").classList.contains("open")) return;
+    load();
+  }, 5000);
 })();
 </script></body></html>"""
+    # Inject the viewer-enabled flag so the page can hide its "← viewer"
+    # back-link when the CDN viewer has been disabled server-side.
+    page = page.replace("__S2L_CDN__", "true" if WEB_CDNVIEWER else "false")
     resp = Response(page, content_type="text/html; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9859,6 +9991,8 @@ def _s2l_viewer_data_endpoint() -> Response:
     (events in the last STATS_WINDOW seconds) so the viewer can show a live
     throughput sparkline without keeping its own history.
     """
+    if not WEB_CDNVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -9926,6 +10060,10 @@ def _s2l_viewer_data_endpoint() -> Response:
             "UDP_TUNNEL":        UDP_TUNNEL,
             "WS_DEFLATE":        WS_DEFLATE,
             "WS_AUTO_RECONNECT": WS_AUTO_RECONNECT,
+            # Web-UI master switches (let the viewer hide the cross-link to a
+            # page that's been turned off server-side).
+            "WEB_CDNVIEWER":     WEB_CDNVIEWER,
+            "WEB_CAPTUREVIEWER": WEB_CAPTUREVIEWER,
         },
     }
     resp = Response(json.dumps(payload), content_type="application/json")
@@ -9936,6 +10074,8 @@ def _s2l_viewer_data_endpoint() -> Response:
 @app.route("/__s2l_viewer__", methods=["GET", "OPTIONS"])
 def _s2l_viewer_endpoint() -> Response:
     """Self-contained live CDN viewer page (refreshes every 50 ms)."""
+    if not WEB_CDNVIEWER:
+        return _viewer_disabled_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -10271,7 +10411,7 @@ def _s2l_viewer_endpoint() -> Response:
   </div>
 </main>
 <footer>
-  <span id="ft-left">S2L web viewer · <span class="tag" id="latency">— ms</span> · <span class="kbd">P</span> pause <span class="kbd">T</span> theme <span class="kbd">E</span> export <span class="kbd">O</span> open-all <span class="kbd">⇧A</span> copy-all <span class="kbd">C</span> captures <span class="kbd">R</span> reset <span class="kbd">/</span> filter <span class="kbd">?</span> help</span>
+  <span id="ft-left">S2L web viewer · <span class="tag" id="latency">— ms</span> · <span class="kbd">P</span> pause <span class="kbd">T</span> theme <span class="kbd">E</span> export <span class="kbd">O</span> open-all <span class="kbd">⇧A</span> copy-all <span id="ft-cap"><span class="kbd">C</span> captures </span><span class="kbd">R</span> reset <span class="kbd">/</span> filter <span class="kbd">?</span> help</span>
   <span class="flags" id="flags"></span>
   <span id="ft-right">—</span>
 </footer>
@@ -10286,7 +10426,7 @@ def _s2l_viewer_endpoint() -> Response:
       <div class="help-row"><span class="kbd">E</span><span>export as JSON (Shift+E = CSV)</span></div>
       <div class="help-row"><span class="kbd">O</span><span>open all CDN ports in new tabs</span></div>
       <div class="help-row"><span class="kbd">⇧A</span><span>copy all CDN URLs to clipboard</span></div>
-      <div class="help-row"><span class="kbd">C</span><span>open the capture browser</span></div>
+      <div class="help-row" id="help-cap"><span class="kbd">C</span><span>open the capture browser</span></div>
       <div class="help-row"><span class="kbd">R</span><span>reset all counters (benchmark window)</span></div>
       <div class="help-row"><span class="kbd">/</span><span>focus the CDN host filter</span></div>
       <div class="help-row"><span class="kbd">?</span><span>toggle this help overlay</span></div>
@@ -10296,6 +10436,10 @@ def _s2l_viewer_endpoint() -> Response:
   </div>
 </div>
 <script>
+/* Server-injected config: lets the page hide the cross-link to a viewer that
+   has been disabled server-side (WEB_CDNVIEWER / WEB_CAPTUREVIEWER). The
+   sentinels __S2L_CAP__ / __S2L_CDN__ are replaced with true/false below. */
+var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
 (function(){
   "use strict";
   var DEFAULT_REFRESH=50, rowsEl=document.getElementById("rows"), empty=document.getElementById("empty");
@@ -10331,6 +10475,16 @@ def _s2l_viewer_endpoint() -> Response:
 
   function $(id){return document.getElementById(id);}
   function setText(el,v){ if(el.textContent!==v) el.textContent=v; }
+  // ── Optional-viewer wiring ──────────────────────────────────────────
+  // Hide the cross-link to a viewer the server has turned off, so the user
+  // never sees a button that 404s. Runs once at init.
+  (function applyCfg(){
+    if(!S2L_CFG.captures){
+      var b=$("captures-btn"); if(b) b.style.display="none";
+      var f=$("ft-cap");       if(f) f.style.display="none";
+      var h=$("help-cap");     if(h) h.style.display="none";
+    }
+  })();
   function fmtUptime(s){
     if(s<60) return s+"s";
     if(s<3600) return Math.floor(s/60)+"m "+(s%60)+"s";
@@ -10485,7 +10639,8 @@ def _s2l_viewer_endpoint() -> Response:
 
   function renderFlags(flags){
     var el=$("flags"), order=["CAPTURE","CAPTURE_WS","HOOK_GUI","MULTIPORT","PROXY_CDN","CACHE_CDN",
-                              "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT"];
+                              "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
+                              "WEB_CDNVIEWER","WEB_CAPTUREVIEWER"];
     var html=[];
     for(var i=0;i<order.length;i++){
       var k=order[i], on=!!flags[k];
@@ -10706,7 +10861,7 @@ def _s2l_viewer_endpoint() -> Response:
     else if(e.key==="e"||e.key==="E"){ $("export-btn").click(); }
     else if(e.key==="o"||e.key==="O"){ $("open-all-btn").click(); }
     else if(e.key==="r"||e.key==="R"){ $("reset-btn").click(); }
-    else if(e.key==="c"||e.key==="C"){ window.open("/__s2l_captures__","_blank"); }
+    else if(S2L_CFG.captures && (e.key==="c"||e.key==="C")){ window.open("/__s2l_captures__","_blank"); }
     else if(e.shiftKey && (e.key==="a"||e.key==="A")){ $("copy-all-btn").click(); }
     else if(e.key==="/"){ e.preventDefault(); $("filter").focus(); }
   });
@@ -10716,6 +10871,11 @@ def _s2l_viewer_endpoint() -> Response:
 </script>
 </body>
 </html>"""
+    # Replace the S2L_CFG sentinels with real booleans so the page hides the
+    # cross-link to any viewer that's been disabled server-side.
+    page = (page
+           .replace("__S2L_CAP__", "true" if WEB_CAPTUREVIEWER else "false")
+           .replace("__S2L_CDN__", "true" if WEB_CDNVIEWER else "false"))
     resp = Response(page, content_type="text/html; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -11758,9 +11918,14 @@ def _banner() -> None:
 
     if PROXY_CDN and MULTIPORT:
         print(f"  {M}▶ MULTIPORT{R} {DIM}CDN hosts get a dedicated port starting at {PORT+1}{R}")
-        print(f"  {M}▶ MULTIPORT viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_viewer__{R} {DIM}(live CDN table, refreshes every 50 ms){R}")
+        if WEB_CDNVIEWER:
+            print(f"  {M}▶ MULTIPORT viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_viewer__{R} {DIM}(live CDN table, refreshes every 50 ms){R}")
+        else:
+            print(f"  {DIM}▶ MULTIPORT viewer{R} {DIM}disabled (WEB_CDNVIEWER=False){R}")
     elif PROXY_CDN:
         print(f"  {M}▶ CDN{R} {DIM}assets via {_EXT_PREFIX}/ (single port){R}")
+    if WEB_CAPTUREVIEWER and (CAPTURE or CAPTURE_WS):
+        print(f"  {C}▶ capture viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_captures__{R} {DIM}(browse HTTP/WS captures){R}")
     if CAPTURE:
         skip   = "static skipped" if CAPTURE_SKIP_STATIC else "all captured"
         body   = "req body on" if CAPTURE_BODIES else "req body off"
