@@ -19,9 +19,14 @@ if _s2l_sem_filter not in _s2l_existing_warnings:
         (_s2l_existing_warnings + "," if _s2l_existing_warnings else "")
         + _s2l_sem_filter
     )
+# ── stdlib ────────────────────────────────────────────────────────────────────
 import os, sys, re, json, time, socket, queue, zlib, gc
 import hashlib, mimetypes, logging, threading, warnings
+import base64, struct, ssl, shutil, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace as _dc_replace
+from typing import Callable
+from urllib.parse import urljoin, urlparse, urldefrag
 # Defensive belt-and-suspenders: if multiprocessing.resource_tracker is ever
 # imported into THIS process (e.g. via a library), patch its warnings.warn so
 # any future in-process emission of the "leaked semaphore" warning is muted.
@@ -37,13 +42,7 @@ try:
         _s2l_rt._s2l_warn_patched = True
 except Exception:
     pass
-import shutil, subprocess, tempfile, datetime
-from dataclasses import dataclass, field, replace as _dc_replace
-from typing import Callable
-import base64
-import struct
-import ssl
-from urllib.parse import urljoin, urlparse, urldefrag
+# ── third-party ───────────────────────────────────────────────────────────────
 import requests
 import requests.adapters
 import urllib3
@@ -283,8 +282,7 @@ CAPTURE = False                  # record every request+response as JSON
 CAPTURE_CDN = False              # include CDN responses in captures
 CAPTURE_BODIES = False            # include request bodies in captures
 CAPTURE_SKIP_STATIC = True       # skip images/fonts/JS/CSS from captures
-FIREFOX_PROXY = False             # MITM forward proxy for the actual browser (root CA + CONNECT tunnel)
-FIREFOX_PROXY_PORT = 8443         # port to point Firefox's manual proxy config at
+CAPTURE_WS = False                # record every WebSocket message (text+binary) as JSON
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -484,28 +482,97 @@ _STRIP_FWD_EXTRA = frozenset({
 })
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Platform detection
+# Platform / WAF detection (dynamic)
+#
+# Data-driven: each signature is (name, header_test, body_test). The detector
+# runs signatures in priority order and returns the first match, so the most
+# specific / reliable signals are listed first. `body` is optional and lets the
+# detector recognise a WAF from its challenge / block page even when the
+# headers are ambiguous (e.g. a CDN in front of a WAF strips the WAF's own
+# Server header). Callers that only have headers keep working unchanged.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def detect_platform(headers: dict) -> str:
-    h      = {k.lower(): v.lower() for k, v in headers.items()}
-    server = h.get("server", "")
-    via    = h.get("via", "")
-    cf_ray = headers.get("CF-RAY", "")
+# Header-key signatures. `h` is the lower-cased header dict. Each test receives
+# the full lower-cased dict so it can inspect presence, not just value.
+_WAF_HEADER_SIGS: tuple[tuple[str, Callable[[dict], bool]], ...] = (
+    ("Cloudflare",        lambda h: "cf-ray" in h or "cloudflare" in h.get("server", "")
+                                    or "cf-cache-status" in h),
+    ("Akamai",            lambda h: ("akamai" in h.get("server", "") or "akamaized" in h.get("server", "")
+                                    or "akamai" in h.get("via", "") or "x-akamai-transformed" in h
+                                    or "x-akamai-request-id" in h)),
+    ("Sucuri WAF",        lambda h: "sucuri" in h.get("server", "") or "x-sucuri-id" in h
+                                    or "x-sucuri-cache" in h),
+    ("Imperva/Incapsula", lambda h: "incapsula" in h.get("server", "") or "imperva" in h.get("server", "")
+                                    or "x-iinfo" in h or "incap_ses" in str(h.get("set-cookie", ""))),
+    ("AWS CloudFront",    lambda h: "cloudfront" in h.get("server", "") or "cloudfront" in h.get("via", "")
+                                    or any("x-amz-cf" in k for k in h)),
+    ("Fastly",            lambda h: "fastly" in h.get("server", "") or "fastly" in h.get("via", "")
+                                    or "x-served-by" in h and "cache-" in h.get("x-served-by", "")),
+    ("ESF",               lambda h: "esf" in h.get("server", "").lower()
+                                    or any("x-esf" in k for k in h)
+                                    or "x-edge-security-filter" in h),
+    ("Edgecast CDN",      lambda h: "edgecast" in h.get("server", "") or "ecs" in h.get("server", "").lower()),
+    ("Section.io",        lambda h: "section.io" in h.get("via", "") or "x-section-io" in h),
+    ("StackPath",         lambda h: "stackpath" in h.get("server", "") or "x-sp-url" in h),
+    ("Reblaze",           lambda h: "reblaze" in h.get("server", "") or "rbzid" in h),
+    ("Distil",            lambda h: "distil" in h.get("server", "") or "x-distil-cs" in h),
+    ("F5 BIG-IP",         lambda h: "bigip" in h.get("server", "") or "x-f5" in h),
+    ("Citrix Netscaler",  lambda h: "netscaler" in h.get("server", "") or "via" in h and "ns-cache" in h.get("via", "")),
+    ("Oracle Cloud",      lambda h: "oracle" in h.get("server", "") or "x-oracle" in h),
+    ("Azure Front Door",  lambda h: "azure" in h.get("server", "") or "x-azure-ref" in h),
+    ("Varnish",           lambda h: "varnish" in h.get("server", "") or "varnish" in h.get("via", "")
+                                    or "x-varnish" in h),
+    ("Nginx",             lambda h: "nginx" in h.get("server", "")),
+    ("Apache",            lambda h: "apache" in h.get("server", "")),
+    ("LiteSpeed",         lambda h: "litespeed" in h.get("server", "")),
+    ("Microsoft-IIS",     lambda h: "microsoft-iis" in h.get("server", "")),
+)
 
-    if "cloudflare" in server or cf_ray:                                      return "Cloudflare"
-    if "cloudfront" in server or "cloudfront" in via \
-       or any("x-amz-cf" in k for k in h):                                   return "AWS CloudFront"
-    if "akamai" in server or "akamaized" in server or "akamai" in via:       return "Akamai"
-    if "fastly" in server or "fastly" in via:                                 return "Fastly"
-    if "incapsula" in server or "imperva" in server:                          return "Imperva/Incapsula"
-    if "sucuri" in server:                                                    return "Sucuri WAF"
-    if "cf-cache-status" in h:                                                return "Cloudflare (Cache)"
-    if "oracle" in server:                                                    return "Oracle Cloud"
-    if "varnish" in server or "varnish" in via:                               return "Varnish"
-    if "edgecast" in server:                                                   return "EdgeCast CDN"
-    if "nginx"  in server:                                                    return "Nginx"
-    if "apache" in server:                                                    return "Apache"
+# Body signatures: substring markers that appear on a WAF's challenge / block
+# page. Lower-cased byte patterns. Checked only when `body` is supplied.
+_WAF_BODY_SIGS: tuple[tuple[str, bytes], ...] = (
+    ("Cloudflare",        b"cloudflare"),
+    ("Sucuri WAF",        b"sucuri"),
+    ("Akamai",            b"reference #"),  # Akamai reference-block pages
+    ("Imperva/Incapsula", b"incapsula"),
+    ("Edgecast CDN",      b"edgecast"),
+    ("ESF",               b"edge security filter"),
+)
+
+def detect_platform(headers: dict, body: bytes | str | None = None) -> str:
+    """Dynamically detect the upstream platform / WAF.
+
+    Inspects response headers (and optionally the body) against a signature
+    table. Returns the platform name, or "Unknown". The body argument is
+    optional so existing callers that pass only headers keep working; when
+    supplied, a challenge/block page is recognised even when an upstream CDN
+    has stripped the WAF's own Server header.
+    """
+    h = {k.lower(): v.lower() if isinstance(v, str) else str(v).lower()
+         for k, v in headers.items()}
+    # Keep the original-cased CF-RAY lookup too (some servers emit it mixed-case).
+    if "cf-ray" not in h:
+        for k, v in headers.items():
+            if k.lower() == "cf-ray" and v:
+                h["cf-ray"] = str(v).lower()
+                break
+
+    for name, test in _WAF_HEADER_SIGS:
+        try:
+            if test(h):
+                return name
+        except Exception:
+            continue
+
+    if body:
+        if isinstance(body, str):
+            body_b = body.encode("utf-8", "ignore")
+        else:
+            body_b = bytes(body)
+        head = body_b[:8192].lower()
+        for name, marker in _WAF_BODY_SIGS:
+            if marker in head:
+                return name
     return "Unknown"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -777,60 +844,6 @@ def _apply_gui_ws_hooks(direction: str, opcode: int, payload: bytes,
         return new_payload
     return payload
 
-# ── FIREFOX_PROXY request log + hooks ───────────────────────────────────────
-# Mirrors _gui_log_queue above, but fed by the MITM forward proxy's live
-# browser traffic (any site) instead of the reverse proxy's own fetches for
-# MAIN_HOST. Defined at module level (not inside the GUI) because
-# the MITM connection handler runs in background threads regardless of
-# whether the GUI happens to be open.
-_gui_fwd_log_queue: queue.Queue = queue.Queue(maxsize=2000)
-_gui_fwd_req_hooks: list[dict]  = []   # {name, method, pattern, body_bytes, enabled}
-_gui_fwd_req_hooks_lock = threading.Lock()
-
-def _gui_fwd_push(tag: str, method: str, host: str, path: str, status,
-                   req_headers: dict, body: bytes) -> None:
-    if not HOOK_GUI:
-        return
-    try:
-        _gui_fwd_log_queue.put_nowait({
-            "ts":     time.strftime("%H:%M:%S"),
-            "method": method,
-            "path":   f"[{tag}] {host}{path}",
-            "status": status,
-            "ct":     req_headers.get("Content-Type", req_headers.get("content-type", "")),
-            "size":   len(body or b""),
-            "body":   body if body else b"(empty request body)",
-            "req_headers": req_headers,
-        })
-    except queue.Full:
-        pass
-
-def _apply_fwd_req_hooks(method: str, path: str, headers: dict, body: bytes) -> bytes:
-    """Apply the first matching enabled Firefox-Proxy request hook.
-
-    Overrides the body of a REAL, live browser request before it's forwarded
-    upstream (passthru case) — fed by the MITM forward proxy's own traffic
-    (any site), not the reverse proxy's fetches for MAIN_HOST.
-    """
-    with _gui_fwd_req_hooks_lock:
-        hooks = list(_gui_fwd_req_hooks)
-    for h in hooks:
-        if not h["enabled"]:
-            continue
-        mf = h["method"].strip().upper()
-        if mf not in ("", "*") and method.upper() != mf:
-            continue
-        try:
-            if not re.search(h["pattern"], path, re.IGNORECASE):
-                continue
-        except re.error:
-            continue
-        new_body = h["body_bytes"]
-        headers["Content-Length"] = str(len(new_body))
-        log(f"fwd req hook '{h['name']}' matched {method} {path}", "HOOK")
-        return new_body
-    return body
-
 def _gui_push(ctx: HookContext) -> None:
     """Push a proxied request/response to the GUI traffic log with body."""
     if not HOOK_GUI:
@@ -1044,8 +1057,8 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
     """Factory for a hook-list disk-persistence helper.
 
     Shared by every hook editor (response hooks, request-body-override hooks,
-    and the Firefox-Proxy request hooks added below) so the save/delete/load
-    logic exists in exactly one place instead of being copy-pasted per tab.
+    and the WebSocket hooks) so the save/delete/load logic exists in exactly
+    one place instead of being copy-pasted per tab.
 
     Storage layout: body is always stored as `{name}.body`, metadata as
     `{name}.meta.json`. Deletion constructs the exact filenames — no
@@ -1136,6 +1149,48 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
     return save, delete, load_all
 
 
+# Hard cap on how much of a captured body the hook_gui Body Editor will load
+# into its QPlainTextEdit. A QPlainTextEdit document scales O(n) for layout and
+# memory, so loading a 100 MB response into the editor both freezes the UI
+# (multi-second blocking layout pass) and makes the editor's sizeHint explode,
+# which in turn forces the surrounding QSplitter to grow the editor pane until
+# it swallows the Traffic Log. Capping at 512 KB keeps the editor instant and
+# pins the splitter to its configured sizes; the full body is still available
+# on disk via the capture files.
+_EDITOR_MAX_BYTES = 512 * 1024
+
+def _editor_preview(body: bytes, ct: str = "") -> tuple[str, bool]:
+    """Return (text, truncated) for the Body Editor.
+
+    Decodes up to _EDITOR_MAX_BYTES of `body` as UTF-8 (errors replaced) and
+    appends a visible truncation notice when the body was larger than the cap.
+    JSON bodies are pretty-printed first (from the capped slice) so the editor
+    stays readable for typical API responses.
+    """
+    if not body:
+        return "", False
+    truncated = len(body) > _EDITOR_MAX_BYTES
+    if truncated:
+        slice_b = body[:_EDITOR_MAX_BYTES]
+    else:
+        slice_b = body
+    try:
+        txt = slice_b.decode("utf-8", errors="replace")
+    except Exception:
+        txt = slice_b.hex()
+    if "json" in (ct or "").lower():
+        try:
+            txt = json.dumps(json.loads(txt), indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    if truncated:
+        txt += (
+            f"\n\n…[truncated — editor cap {_fmt_size(_EDITOR_MAX_BYTES)} reached; "
+            f"full body { _fmt_size(len(body)) } available in capture files]…"
+        )
+    return txt, truncated
+
+
 def _launch_hook_gui() -> None:
     """
     Launch the PyQt6 GUI. Must be called from the MAIN thread.
@@ -1148,8 +1203,7 @@ def _launch_hook_gui() -> None:
     amber (#fdbc4b) find-highlight tint, muted dark grays for window/button/
     view backgrounds.
 
-    Behavior is identical to the previous Tk version: three tabs
-    (Traffic/Hooks, WebSocket Hooks, Firefox Proxy), live queue polling via
+    Two tabs (Traffic/Hooks, WebSocket Hooks), live queue polling via
     QTimer, the same hook schema on disk, and the same keyboard shortcuts.
     """
     try:
@@ -1625,7 +1679,6 @@ def _launch_hook_gui() -> None:
         name_edit = _entry(row1, width=14); r1.addWidget(name_edit)
         r1.addWidget(_lbl(row1, "Method:", color=_ACC))
         _METHOD_OPTS = ["*", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
-        _RH_METHOD_OPTS = _METHOD_OPTS   # shared by the Firefox-Proxy request-hook tab
         method_combo = QComboBox(row1); method_combo.setEditable(False)
         method_combo.addItems(_METHOD_OPTS); method_combo.setCurrentText("*")
         method_combo.setFont(_mono); method_combo.setMaximumWidth(90)
@@ -1671,15 +1724,7 @@ def _launch_hook_gui() -> None:
                 f"{_info_prefix}{data['method']}  {path_qs}  [{data['status']}]{_info_wt_s}  {data['ct']}")
 
             raw_body = data["body"]
-            try:
-                txt = raw_body.decode("utf-8", errors="replace")
-            except Exception:
-                txt = raw_body.hex()
-            if "json" in data["ct"]:
-                try:
-                    txt = json.dumps(json.loads(txt), indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
+            txt, _trunc = _editor_preview(raw_body, data.get("ct", ""))
             body_box.setPlainText(txt)
 
             method_combo.setCurrentText(data["method"] if data["method"] in _METHOD_OPTS else "*")
@@ -2286,12 +2331,20 @@ def _launch_hook_gui() -> None:
             if not data:
                 return
             payload = data.get("payload") or b""
+            _full_len = len(payload)
+            # Cap the payload used by the editor / matcher so a multi-MB WS
+            # message can't freeze the UI or inflate the WHEN panel. The full
+            # message is still captured to disk when CAPTURE_WS is on.
+            if _full_len > _EDITOR_MAX_BYTES:
+                payload = payload[:_EDITOR_MAX_BYTES]
             _dir_raw = data.get("direction", "?")
             _dir_disp = "[->] IN" if _dir_raw == "in" else ("[<-] OUT" if _dir_raw == "out" else _dir_raw.upper())
             _op_disp = (data.get("op_name") or "?").upper()
+            _trunc_note = (f"  · editor-capped @ {_fmt_size(_EDITOR_MAX_BYTES)}"
+                           if _full_len > _EDITOR_MAX_BYTES else "")
             ws_info_lbl.setText(
                 f"{_dir_disp}  {_op_disp}  {data['ws_url']}  "
-                f"[{_fmt_size(len(payload))}]")
+                f"[{_fmt_size(_full_len)}]{_trunc_note}")
             ws_hex_box.setPlainText(_bytes_to_hexdump(payload))
             _ws_sync_text_from_hex()
             ws_dir_combo.setCurrentText(_dir_raw if _dir_raw in ("in", "out") else "*")
@@ -2338,7 +2391,17 @@ def _launch_hook_gui() -> None:
                 return
             op_map = {"text": 1, "bin": 2}
             opcode = op_map.get(ws_op_combo.currentText(), 0)
+            frozen = ws_freeze_cb.isChecked()
             match_payload = ws_match_payload_holder[0]
+            # PERSISTENCE FIX: the WHEN panel's "Freeze" state is now part of
+            # the hook itself. Previously `frozen` lived only in the checkbox,
+            # so after a restart editing a saved hook left Freeze unchecked —
+            # and the very next message selection silently overwrote the
+            # frozen match_payload, defeating the whole feature. Persisting
+            # `frozen` alongside match_payload keeps the WHEN content stable
+            # across restarts: the freeze guard in _ws_on_select reads this
+            # flag (restored into the checkbox on edit) and refuses to touch
+            # the holder while it's set.
             if match_payload:
                 match_mode = "exact"
             else:
@@ -2354,6 +2417,7 @@ def _launch_hook_gui() -> None:
                 "enabled":       True,
                 "match_mode":    match_mode,
                 "match_payload": match_payload,
+                "frozen":        frozen,
             }
             with _gui_ws_hooks_lock:
                 existing = next((h for h in _gui_ws_hooks if h["name"] == name), None)
@@ -2477,6 +2541,10 @@ def _launch_hook_gui() -> None:
                         # the holder to render the WHEN panel.
                         ws_match_payload_holder[0] = hook_ref.get("match_payload", b"") or b""
                         ws_match_mode[0] = hook_ref.get("match_mode", "any") or "any"
+                        # Restore the Freeze checkbox so the WHEN content stays
+                        # pinned after restart. setChecked fires stateChanged,
+                        # which updates the [FROZEN] label via _on_freeze_toggle.
+                        ws_freeze_cb.setChecked(bool(hook_ref.get("frozen", False)))
                         _ws_update_when_panel()
                         ws_save_status_lbl.setText(f"Editing '{hook_ref['name']}'")
                         ws_save_status_lbl.setStyleSheet(f"color: {_YLW}; background: transparent;")
@@ -2507,14 +2575,16 @@ def _launch_hook_gui() -> None:
                                             "opcode": 0, "pattern": ".*",
                                             "origin_url": "*", "enabled": True,
                                             "match_mode": "any",
-                                            "match_payload": b""}):
+                                            "match_payload": b"",
+                                            "frozen": False}):
                 hook.setdefault("match_mode", "any")
                 hook.setdefault("match_payload", b"")
+                hook.setdefault("frozen", False)
                 with _gui_ws_hooks_lock:
                     if hook["name"] not in [h["name"] for h in _gui_ws_hooks]:
                         _gui_ws_hooks.append(hook)
-                        log(f"Loaded WS hook '{hook['name']}' "
-                            f"(match={hook.get('match_mode', 'any')}) from disk", "HOOK")
+                        _fz = "· FROZEN" if hook.get("frozen") else "match=" + hook.get('match_mode', 'any')
+                        log(f"Loaded WS hook '{hook['name']}' ({_fz}) from disk", "HOOK")
 
         QTimer.singleShot(100, lambda: (_load_ws_hooks_from_disk(), _render_ws_hook_rows()))
 
@@ -2565,255 +2635,6 @@ def _launch_hook_gui() -> None:
         ws_poll_timer = QTimer(ws_bot)
         ws_poll_timer.timeout.connect(_ws_poll)
         ws_poll_timer.start(150)
-
-        # ════════════════════════════════════════════════════════════════════
-        # TAB 3: Firefox Proxy  (only shown when FIREFOX_PROXY is enabled)
-        # ════════════════════════════════════════════════════════════════════
-        if FIREFOX_PROXY:
-            tab_fwd = QWidget()
-            nb.addTab(tab_fwd, "  Firefox Proxy")
-
-            fwd_v = QSplitter(Qt.Orientation.Vertical, tab_fwd); fwd_v.setChildrenCollapsible(False)
-            fwd_top_area = QWidget()
-            fwd_bot_area = QWidget(); fwd_bot_area.setStyleSheet(f"background: {_PNL};")
-            fwd_v.addWidget(fwd_top_area); fwd_v.addWidget(fwd_bot_area)
-            fwd_v.setStretchFactor(0, 5); fwd_v.setStretchFactor(1, 2)
-            fwd_v.setSizes([280, 160])
-            fv_lay = QVBoxLayout(tab_fwd); fv_lay.setContentsMargins(4, 4, 4, 4)
-            fv_lay.addWidget(fwd_v)
-
-            fwd_h = QSplitter(Qt.Orientation.Horizontal, fwd_top_area); fwd_h.setChildrenCollapsible(False)
-            fwd_left  = QWidget(); fwd_left.setStyleSheet(f"background: {_PNL};")
-            fwd_right = QWidget(); fwd_right.setStyleSheet(f"background: {_PNL};")
-            fwd_h.addWidget(fwd_left); fwd_h.addWidget(fwd_right)
-            fwd_h.setStretchFactor(0, 55); fwd_h.setStretchFactor(1, 45)
-            fwd_h.setSizes([460, 340])
-            ft_lay = QVBoxLayout(fwd_top_area); ft_lay.setContentsMargins(0, 0, 0, 0)
-            ft_lay.addWidget(fwd_h)
-
-            fl = QVBoxLayout(fwd_left);  fl.setContentsMargins(4, 4, 4, 4);  fl.setSpacing(2)
-            fr = QVBoxLayout(fwd_right); fr.setContentsMargins(4, 4, 4, 4); fr.setSpacing(2)
-
-            fl.addWidget(_lbl(fwd_left, "Request Log  (live browser traffic via MITM)",
-                               font=_mono_lg, color=_ACC))
-            fwd_tree = QTreeWidget(fwd_left)
-            fwd_tree.setColumnCount(6)
-            fwd_tree.setHeaderLabels(["Time", "Method", "Host + Path", "Status", "Content-Type", "Size"])
-            fwd_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-            fwd_tree.setRootIsDecorated(False)
-            fwd_tree.setFont(_mono)
-            fwd_hdr = fwd_tree.header()
-            for i, w in enumerate([70, 60, 0, 60, 130, 68]):
-                if i == 2:
-                    fwd_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-                else:
-                    fwd_hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
-                    fwd_tree.setColumnWidth(i, w)
-            fl.addWidget(fwd_tree, 1)
-            _fwd_row_data: dict = {}
-            _fwd_row_counter = [0]
-
-            fr.addWidget(_lbl(fwd_right, "Request Body / Headers", font=_mono_lg, color=_ACC))
-            fwd_info_lbl = _lbl(fwd_right, "← Select a request", color=_ACC)
-            fr.addWidget(fwd_info_lbl)
-            fwd_body_box = _text_box(fwd_right, wrap=False)
-            fr.addWidget(fwd_body_box, 1)
-
-            def _fwd_on_select(*_):
-                items = fwd_tree.selectedItems()
-                if not items:
-                    return
-                item = items[0]
-                iid = item.data(0, Qt.ItemDataRole.UserRole)
-                data = _fwd_row_data.get(iid)
-                if not data:
-                    return
-                fwd_info_lbl.setText(f"{data['method']}  {data['path']}  [{data['status']}]")
-                hdrs = data.get("req_headers") or {}
-                hdr_txt = "\n".join(f"{k}: {v}" for k, v in hdrs.items())
-                body_raw = data.get("body") or b""
-                try:
-                    body_txt = body_raw.decode("utf-8", errors="replace")
-                except Exception:
-                    body_txt = body_raw.hex()
-                fwd_body_box.setPlainText(hdr_txt + ("\n\n" if hdr_txt else "") + body_txt)
-                fwd_name_edit.setText("")
-                try:
-                    fwd_pat_edit.setText(re.escape(data["path"].split("] ", 1)[-1]))
-                except Exception:
-                    fwd_pat_edit.setText(r".*")
-                fwd_method_combo.setCurrentText(
-                    data["method"] if data["method"] in _RH_METHOD_OPTS else "*")
-            fwd_tree.itemSelectionChanged.connect(_fwd_on_select)
-
-            fr.addWidget(_lbl(fwd_right,
-                               "New Request Hook (overrides the body of matching live requests):",
-                               font=_mono_sm, color=_ACC))
-            fwd_row1 = QWidget(fwd_right); fr1 = QHBoxLayout(fwd_row1)
-            fr1.setContentsMargins(0, 0, 0, 0); fr1.setSpacing(4)
-            fr.addWidget(fwd_row1)
-            fr1.addWidget(_lbl(fwd_row1, "Name:", color=_ACC))
-            fwd_name_edit = _entry(fwd_row1, width=12); fr1.addWidget(fwd_name_edit)
-            fr1.addWidget(_lbl(fwd_row1, "Method:", color=_ACC))
-            fwd_method_combo = QComboBox(fwd_row1); fwd_method_combo.setEditable(False)
-            fwd_method_combo.addItems(_RH_METHOD_OPTS); fwd_method_combo.setFont(_mono)
-            fwd_method_combo.setMaximumWidth(90); fr1.addWidget(fwd_method_combo)
-            fr1.addStretch(1)
-
-            fwd_row2 = QWidget(fwd_right); fr2 = QHBoxLayout(fwd_row2)
-            fr2.setContentsMargins(0, 0, 0, 0); fr2.setSpacing(4)
-            fr.addWidget(fwd_row2)
-            fr2.addWidget(_lbl(fwd_row2, "Path pattern:", color=_ACC))
-            fwd_pat_edit = _entry(fwd_row2); fwd_pat_edit.setText(r".*")
-            fr2.addWidget(fwd_pat_edit, 1)
-
-            fwd_save_status_lbl = _lbl(fwd_right, "", color=_DIM)
-            fr.addWidget(fwd_save_status_lbl)
-
-            _fwd_hook_save_to_disk, _fwd_hook_delete_from_disk, _fwd_hook_load_all = \
-                _make_hook_store("MyFwdHooks")
-
-            # Active hooks frame (created before _render_fwd_hook_rows is called)
-            fwd_hooks_widget = QWidget(fwd_bot_area)
-            fwd_hooks_widget.setStyleSheet(f"background: {_PNL};")
-            fhw = QVBoxLayout(fwd_hooks_widget); fhw.setContentsMargins(8, 4, 8, 4); fhw.setSpacing(2)
-
-            fhw.addWidget(_lbl(fwd_hooks_widget, "Active Firefox-Proxy Request Hooks",
-                               font=_mono_lg, color=_ACC))
-            fwd_hooks_grid_w = QWidget(fwd_hooks_widget)
-            fwd_hooks_grid_w.setStyleSheet(f"background: {_PNL};")
-            fwd_hooks_grid = QGridLayout(fwd_hooks_grid_w)
-            fwd_hooks_grid.setContentsMargins(0, 0, 0, 0); fwd_hooks_grid.setSpacing(4)
-            fhw.addWidget(fwd_hooks_grid_w, 1)
-            fwd_bot_lay = QVBoxLayout(fwd_bot_area); fwd_bot_lay.setContentsMargins(0, 0, 0, 0)
-            fwd_bot_lay.addWidget(fwd_hooks_widget)
-
-            def _render_fwd_hook_rows():
-                while fwd_hooks_grid.count():
-                    it = fwd_hooks_grid.takeAt(0)
-                    w = it.widget()
-                    if w is not None:
-                        w.deleteLater()
-                for col_idx, col_name in enumerate(("Name", "Method", "Pattern", "On", "")):
-                    fwd_hooks_grid.addWidget(
-                        _lbl(fwd_hooks_grid_w, col_name, font=_mono_sm_b, color=_ACC),
-                        0, col_idx, Qt.AlignmentFlag.AlignLeft)
-                with _gui_fwd_req_hooks_lock:
-                    hooks_copy = list(_gui_fwd_req_hooks)
-                if not hooks_copy:
-                    fwd_hooks_grid.addWidget(
-                        _lbl(fwd_hooks_grid_w, "No hooks saved yet.", color=_DIM),
-                        1, 0, 1, 5, Qt.AlignmentFlag.AlignLeft)
-                    return
-                for row_idx, h in enumerate(hooks_copy, start=1):
-                    fg = _FG if h["enabled"] else _DIM
-                    fwd_hooks_grid.addWidget(
-                        _lbl(fwd_hooks_grid_w, h["name"], color=fg),
-                        row_idx, 0, Qt.AlignmentFlag.AlignLeft)
-                    fwd_hooks_grid.addWidget(
-                        _lbl(fwd_hooks_grid_w, h["method"], color=fg),
-                        row_idx, 1, Qt.AlignmentFlag.AlignLeft)
-                    fwd_hooks_grid.addWidget(
-                        _lbl(fwd_hooks_grid_w, h["pattern"][:36], color=_DIM),
-                        row_idx, 2, Qt.AlignmentFlag.AlignLeft)
-                    cb = QCheckBox(fwd_hooks_grid_w); cb.setChecked(h["enabled"])
-
-                    def _mk_toggle(hook_ref=h, var=cb):
-                        def _t(_checked):
-                            with _gui_fwd_req_hooks_lock:
-                                hook_ref["enabled"] = var.isChecked()
-                            _fwd_hook_save_to_disk(hook_ref)
-                            _render_fwd_hook_rows()
-                        return _t
-                    cb.stateChanged.connect(_mk_toggle())
-                    fwd_hooks_grid.addWidget(cb, row_idx, 3, Qt.AlignmentFlag.AlignCenter)
-
-                    def _mk_del(name=h["name"]):
-                        def _d():
-                            with _gui_fwd_req_hooks_lock:
-                                _gui_fwd_req_hooks[:] = [x for x in _gui_fwd_req_hooks if x["name"] != name]
-                            _fwd_hook_delete_from_disk(name)
-                            _render_fwd_hook_rows()
-                        return _d
-                    _fwd_del = _btn(fwd_hooks_grid_w, "X", _mk_del(), font=_mono_xs)
-                    _fwd_del.setStyleSheet(f"background: {_RED_BG}; color: {_RED}; border: 1px solid #5a2a30;")
-                    fwd_hooks_grid.addWidget(_fwd_del, row_idx, 4, Qt.AlignmentFlag.AlignCenter)
-
-            def _fwd_save_hook():
-                name = fwd_name_edit.text().strip()
-                if not name:
-                    QMessageBox.warning(win, "S2L", "Hook name is required.")
-                    return
-                body_full = fwd_body_box.toPlainText()
-                body_only = body_full.split("\n\n", 1)[-1] if "\n\n" in body_full else body_full
-                pat = fwd_pat_edit.text().strip() or r".*"
-                try:
-                    re.compile(pat)
-                except re.error as e:
-                    QMessageBox.critical(win, "S2L", f"Invalid pattern: {e}")
-                    return
-                hook = {"name": name, "method": fwd_method_combo.currentText(),
-                        "pattern": pat,
-                        "body_bytes": body_only.encode("utf-8"), "enabled": True}
-                with _gui_fwd_req_hooks_lock:
-                    _gui_fwd_req_hooks[:] = [h for h in _gui_fwd_req_hooks if h["name"] != name] + [hook]
-                _fwd_hook_save_to_disk(hook)
-                _render_fwd_hook_rows()
-                fwd_save_status_lbl.setText(f"Saved '{name}'")
-                fwd_save_status_lbl.setStyleSheet(f"color: {_GRN}; background: transparent;")
-                log(f"GUI fwd request hook saved: '{name}' [{hook['method']}] {hook['pattern']}", "HOOK")
-
-            fwd_btn_row = QWidget(fwd_right); fwd_btn_row.setStyleSheet(f"background: {_PNL};")
-            fbr = QHBoxLayout(fwd_btn_row); fbr.setContentsMargins(0, 0, 0, 0); fbr.setSpacing(4)
-            fr.addWidget(fwd_btn_row)
-            fbr.addWidget(_btn(fwd_btn_row, "Save Request Hook", _fwd_save_hook, font=_mono_b), 1)
-
-            def _load_fwd_hooks_from_disk():
-                for hook in _fwd_hook_load_all(
-                        {"name": "?", "method": "*", "pattern": ".*", "enabled": True}):
-                    with _gui_fwd_req_hooks_lock:
-                        if hook["name"] not in [h["name"] for h in _gui_fwd_req_hooks]:
-                            _gui_fwd_req_hooks.append(hook)
-
-            QTimer.singleShot(100, lambda: (_load_fwd_hooks_from_disk(), _render_fwd_hook_rows()))
-
-            def _fwd_poll():
-                # Wrapped in try/except so a slot exception is logged, not
-                # swallowed — same protection as the main _poll() loop.
-                try:
-                    count = 0
-                    while count < 60:
-                        try:
-                            entry = _gui_fwd_log_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        sz = entry["size"]
-                        sz_s = f"{sz/1024:.1f}KB" if sz >= 1024 else (f"{sz}B" if sz else "—")
-                        is_err = isinstance(entry["status"], int) and entry["status"] >= 400
-                        color = QColor(_RED) if is_err else (
-                            QColor(_YLW) if entry["method"] == "POST" else (
-                                QColor(_GRN) if entry["method"] == "GET" else QColor(_FG)))
-                        item = QTreeWidgetItem([entry["ts"], entry["method"], entry["path"],
-                                                 str(entry["status"]), entry["ct"], sz_s])
-                        for c in range(item.columnCount()):
-                            item.setForeground(c, color)
-                        _fwd_row_counter[0] += 1
-                        iid = str(_fwd_row_counter[0])
-                        item.setData(0, Qt.ItemDataRole.UserRole, iid)
-                        fwd_tree.addTopLevelItem(item)
-                        _fwd_row_data[iid] = entry
-                        if fwd_tree.topLevelItemCount() > _MAX_ROWS:
-                            fwd_tree.takeTopLevelItem(0)
-                        fwd_tree.scrollToItem(item)
-                        count += 1
-                except Exception as _e:
-                    import traceback as _tb
-                    log(f"_fwd_poll() raised {_e.__class__.__name__}: {_e}\n"
-                        + "".join(_tb.format_exception(type(_e), _e, _e.__traceback__)),
-                        "ERROR")
-            fwd_poll_timer = QTimer(fwd_bot_area)
-            fwd_poll_timer.timeout.connect(_fwd_poll)
-            fwd_poll_timer.start(150)
 
         # ── Main polling loop for the HTTP traffic log ────────────────────
         _poll_tick = [0]   # debug counter — used for periodic queue diagnostics
@@ -3475,7 +3296,7 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
             if _looks_json_or_text(data):
                 return data   # curl_cffi already decoded it
             if _BROTLI_OK:
-                # FIXED: try the one-shot decompress first; if it fails (some
+                # Try the one-shot decompress first; if it fails (some
                 # servers send brotli streams with trailing junk that confuses
                 # the one-shot API), fall back to the streaming decompressor
                 # which is more tolerant. We saw "Empty body (decompression
@@ -3508,7 +3329,7 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
             if _looks_json_or_text(data):
                 return data
             if _ZSTD_OK:
-                # FIXED: try one-shot first, then streaming. ZstdDecompressor.decompress
+                # Try one-shot first, then streaming. ZstdDecompressor.decompress
                 # requires the frame to declare its size; some servers send
                 # streaming frames without that, causing decompress() to raise
                 # "could not determine content size in frame header". The
@@ -3800,7 +3621,14 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
         out["Access-Control-Allow-Origin"] = _req_origin
         out["Access-Control-Allow-Credentials"] = "true"
         out["Vary"] = (out.get("Vary", "") + ", Origin").lstrip(", ")
-        out["Access-Control-Expose-Headers"] = "*"
+        # Concrete expose list: the wildcard "*" does NOT expose Authorization
+        # (and a few others) for credentialed responses per the CORS spec, so
+        # SPAs that read response headers cross-origin would silently get null.
+        out["Access-Control-Expose-Headers"] = (
+            "Content-Type, Content-Length, Content-Range, Content-Disposition, "
+            "Date, ETag, Last-Modified, Location, Range, Set-Cookie, "
+            "Content-Encoding, Vary, WWW-Authenticate, Authorization"
+        )
     else:
         out["Access-Control-Allow-Origin"]  = "*"
         out["Access-Control-Expose-Headers"] = "*"
@@ -3877,7 +3705,7 @@ def rewrite_origin(fwd: dict, origin_base: str) -> None:
     Without this, CORS preflight checks see Origin: http://localhost:8080 and
     reject it.  Referer is rewritten similarly so hotlink-protection passes.
 
-    v4 HARDENING: Also strips any header value that still contains localhost /
+    Additionally strips any header value that still contains localhost /
     127.0.0.1 / 0.0.0.0 / the proxy port — some sites read these to detect
     proxy/MITM usage and trigger CAPTCHAs ("verify you are human"). We make
     a final sweep AFTER the standard rewrite to catch anything that slipped
@@ -4598,7 +4426,7 @@ def build_base_url(raw: str) -> str | None:
             try:
                 r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
                 if r.status_code < 500:
-                    platform = detect_platform(dict(r.headers))
+                    platform = detect_platform(dict(r.headers), r.content)
                     log(f"Resolved {raw} → {r.url}  [{platform}]  IP: {resolve_ip(urlparse(r.url).netloc)}")
                     return r.url
             except Exception as e:
@@ -4769,9 +4597,8 @@ def _prompt_scan_status_filter() -> None:
     trying to block EVERY known status (which would produce an empty log).
 
     This MUST run in the main thread because it uses input() — running it in
-    the scanner daemon thread would conflict with the MULTIPORT viewer's
-    cbreak mode on stdin. Calling it before the viewer starts sidesteps the
-    issue entirely.
+    the scanner daemon thread would race with concurrent stdin reads. Calling
+    it before the scanner starts sidesteps the issue entirely.
     """
     global _SCAN_BLOCK_STATUSES, _SCAN_ONLY_STATUS
     # Reset to defaults each time (idempotent — if called again, fresh start)
@@ -5268,6 +5095,7 @@ class _Stats:
     """
     __slots__ = ("_lock", "crawled", "saved", "proxied",
                  "conn_errors", "http_errors", "hooks_run", "revealed", "cdn_fetched", "captured",
+                 "ws_captured",
                  "_events")
 
     def __init__(self) -> None:
@@ -5304,7 +5132,145 @@ class _Stats:
                     counts[key] = counts.get(key, 0) + 1
             return counts
 
+    def reset(self) -> None:
+        """Zero every counter + clear the rolling-window event log.
+
+        Used by the viewer's "Reset stats" button so a developer can start a
+        clean benchmark window without restarting the server. Thread-safe.
+        """
+        with self._lock:
+            for s in self.__slots__[1:-1]:   # skip _lock and _events
+                setattr(self, s, 0)
+            self._events.clear()
+
 stats = _Stats()
+
+# Process start time — used by the web viewer to show uptime. Set here so it
+# reflects when the module finished importing (≈ when the server is about to
+# listen), not when main() is entered.
+_START_TS = time.time()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Live WAF/platform + per-CDN-host health registries (for the web viewer)
+#
+# _last_platform: the platform/WAF name returned by the most recent
+#   detect_platform() call on an upstream response. Updated from _do_upstream
+#   so the viewer always shows what the target site is currently fronted by
+#   (Cloudflare / Akamai / Sucuri / ...) without the viewer having to fetch.
+#
+# _cdn_health: per-CDN-host lightweight health record:
+#   {host: {"last_seen": epoch, "requests": int, "errors": int,
+#           "last_status": int, "last_rtt_ms": int}}
+# Updated from the CDN mini-server + ext_asset route on every request so the
+# viewer can show a green/red health dot + last-seen relative time + RTT per
+# host. Bounded: entries are pruned when a host leaves _cdn_host_port.
+# ──────────────────────────────────────────────────────────────────────────────
+_last_platform = {"name": "Unknown", "ts": 0.0}
+_last_platform_lock = threading.Lock()
+
+def set_last_platform(name: str) -> None:
+    """Record the most recently detected upstream platform/WAF (thread-safe)."""
+    with _last_platform_lock:
+        _last_platform["name"] = name or "Unknown"
+        _last_platform["ts"] = time.time()
+
+def get_last_platform() -> dict:
+    with _last_platform_lock:
+        return dict(_last_platform)
+
+_cdn_health: dict[str, dict] = {}
+_cdn_health_lock = threading.Lock()
+
+def record_cdn_health(host: str, status: int, rtt_ms: int,
+                      is_error: bool = False) -> None:
+    """Update the health record for a CDN host (thread-safe, O(1)).
+
+    Keeps a bounded rolling RTT history (`rtt_history`, last 20 samples) so the
+    web viewer can render a mini sparkline per host without the browser having
+    to track history itself. The history is append-only and capped, so memory
+    stays O(hosts × 20) regardless of session length.
+    """
+    if not host:
+        return
+    now = time.time()
+    with _cdn_health_lock:
+        rec = _cdn_health.get(host)
+        if rec is None:
+            rec = {"last_seen": now, "requests": 0, "errors": 0,
+                   "last_status": status, "last_rtt_ms": rtt_ms,
+                   "rtt_history": [],
+                   "first_seen": now}
+            _cdn_health[host] = rec
+        rec["last_seen"] = now
+        rec["requests"] += 1
+        rec["last_status"] = status
+        rec["last_rtt_ms"] = rtt_ms
+        # Append + cap the RTT history (keep last 20 samples for the sparkline).
+        hist = rec.get("rtt_history")
+        if hist is None:
+            hist = rec["rtt_history"] = []
+        hist.append(rtt_ms)
+        if len(hist) > 20:
+            del hist[:len(hist) - 20]
+        if is_error or status >= 500:
+            rec["errors"] += 1
+
+def snapshot_cdn_health() -> dict:
+    """Return a copy of all CDN host health records (thread-safe)."""
+    with _cdn_health_lock:
+        # Only return hosts still in the active registry — stale entries from
+        # hosts that were deregistered are dropped here so the viewer never
+        # shows a health row for a CDN port that no longer exists.
+        active = {h for h, p in _cdn_host_port.items() if p > 0}
+        return {h: dict(r) for h, r in _cdn_health.items() if h in active}
+
+# Max age (seconds) a CDN health record may stay without a fresh request before
+# it's eligible for pruning. Long enough that a quiet-but-valid CDN host isn't
+# dropped, short enough that transient hosts (one-off asset fetches) don't
+# accumulate forever in long-running sessions.
+_CDN_HEALTH_MAX_AGE = 600   # 10 minutes
+
+def prune_cdn_health() -> int:
+    """Drop CDN health records for hosts no longer registered OR idle too long.
+
+    Runs periodically from a background thread (see _start_health_pruner) so the
+    `_cdn_health` dict stays bounded in long-running sessions that register
+    many transient CDN hosts. Returns the number of entries pruned.
+
+    A record is pruned when EITHER:
+      - its host is no longer in _cdn_host_port (the CDN server died / was
+        deregistered), OR
+      - its last_seen is older than _CDN_HEALTH_MAX_AGE (the host is still
+        registered but hasn't seen traffic in a while — keeping its stale
+        RTT/error counts would mislead the viewer).
+    """
+    now = time.time()
+    cutoff = now - _CDN_HEALTH_MAX_AGE
+    with _cdn_health_lock:
+        active = set(_cdn_host_port.keys())
+        victims = [h for h, r in _cdn_health.items()
+                   if h not in active or r.get("last_seen", 0) < cutoff]
+        for h in victims:
+            _cdn_health.pop(h, None)
+        return len(victims)
+
+_health_pruner_started = False
+def _start_health_pruner() -> None:
+    """Start the periodic CDN-health prune daemon (idempotent)."""
+    global _health_pruner_started
+    if _health_pruner_started:
+        return
+    _health_pruner_started = True
+    def _loop():
+        while True:
+            time.sleep(60)   # prune once a minute
+            try:
+                n = prune_cdn_health()
+                if n:
+                    log(f"Pruned {n} stale CDN health record(s)", "DEBUG")
+            except Exception:
+                pass   # never let the pruner die
+    threading.Thread(target=_loop, daemon=True, name="cdn-health-pruner").start()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CDN host registry  (PROXY_CDN)
@@ -5382,14 +5348,18 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
 
         # OPTIONS — fast CORS preflight
         if method == "OPTIONS":
+            _req_origin = flask_request.headers.get("Origin", "")
             r = Response(status=204)
             r.headers.update({
-                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Origin":  _req_origin if _req_origin else "*",
+                "Access-Control-Allow-Credentials": "true" if _req_origin else None,
                 "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
-                "Access-Control-Allow-Headers": flask_request.headers.get(
-                    "Access-Control-Request-Headers", "*"),
+                "Access-Control-Allow-Headers": _cors_allow_headers(),
+                "Access-Control-Expose-Headers": "*",
                 "Access-Control-Max-Age": "86400",
+                "Vary": "Origin",
             })
+            r.headers = {k: v for k, v in r.headers.items() if v is not None}
             return r
 
         # Cache-hit only for GET/HEAD when CACHE_CDN is enabled.
@@ -5529,9 +5499,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             _gui_push_raw(method, f"/{p}", ctx.resp_status, ctx.resp_ct, ctx.resp_body,
                           display_tag=f"[CDN:{port}]", origin=_fmt_host(cdn_host),
                           _skip_log=True)   # line 4702 already logged
+            # Health tracking for the web viewer (per-host dot + RTT + requests).
+            record_cdn_health(cdn_host, ctx.resp_status, int(r.elapsed.total_seconds()*1000))
             return Response(ctx.resp_body, status=ctx.resp_status, headers=ctx.resp_headers, content_type=ctx.resp_ct)
         except Exception as exc:
             log(f"CDN error {cdn_host}/{p}: {_short_exc(exc)}", "WARN")
+            record_cdn_health(cdn_host, 502, 0, is_error=True)
             return Response(str(exc), status=502)
 
     def _run():
@@ -6271,6 +6244,77 @@ def _maybe_capture(ctx: HookContext) -> None:
         resp_status=ctx.resp_status, resp_headers=ctx.resp_headers,
         resp_body=body, resp_ct=ctx.resp_ct,
     ))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket capture system  (CAPTURE_WS)
+#
+# Mirrors the HTTP capture pipeline: a bounded queue + a single writer thread
+# that persists every reassembled TEXT/BINARY frame (in both directions) as a
+# JSON document under site_data/<site>/captures_ws/. Each tunnel gets its own
+# subdirectory keyed by tunnel id so messages from independent sockets don't
+# interleave in one file. Binary payloads are base64-encoded; text payloads
+# are stored as UTF-8 (errors replaced) with an encoding marker, exactly like
+# the HTTP capture body encoder.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _WSCaptureRecord:
+    direction: str            # "in" (browser→srv) | "out" (srv→browser)
+    opcode:    int            # 1=text, 2=binary, 8=close, 9=ping, 10=pong
+    op_name:   str
+    ws_url:    str
+    tunnel_id: int
+    payload:   bytes
+    ts:        str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S")
+                          + f".{int((time.time() % 1) * 1000):03d}")
+
+_ws_capture_queue: queue.Queue = queue.Queue()
+
+def _ws_capture_dir(ws_url: str, tunnel_id: int) -> str:
+    parsed = urlparse(ws_url)
+    host = re.sub(r"[^\w.\-]", "_", parsed.netloc or "tunnel") or "tunnel"
+    return os.path.join(DATA_FOLDER, "captures_ws", host, f"t{tunnel_id}")
+
+def _ws_capture_worker() -> None:
+    while True:
+        try:
+            rec: _WSCaptureRecord = _ws_capture_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            out_dir = _ws_capture_dir(rec.ws_url, rec.tunnel_id)
+            os.makedirs(out_dir, exist_ok=True)
+            body_enc, how = _encode_body(rec.payload)
+            doc = {
+                "s2l": "ws_capture", "ts": rec.ts,
+                "direction": rec.direction,
+                "opcode": rec.opcode, "op_name": rec.op_name,
+                "ws_url": rec.ws_url, "tunnel_id": rec.tunnel_id,
+                "payload": body_enc, "encoding": how, "size": len(rec.payload),
+            }
+            fn = f"{rec.direction}_{rec.opcode}_{int(time.time()*1000)}_{rec.tunnel_id}.json"
+            path = os.path.join(out_dir, fn)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+            stats.inc("ws_captured")
+        except Exception as e:
+            log(f"ws capture write error: {e}", "ERROR")
+        _ws_capture_queue.task_done()
+
+def _maybe_capture_ws(direction: str, opcode: int, payload: bytes,
+                      ws_url: str, tunnel_id: int) -> None:
+    if not CAPTURE_WS:
+        return
+    if not payload and opcode not in (8, 9, 10):
+        return
+    try:
+        _ws_capture_queue.put_nowait(_WSCaptureRecord(
+            direction=direction, opcode=opcode,
+            op_name=_WS_OP_NAMES.get(opcode, f"?{opcode}"),
+            ws_url=ws_url, tunnel_id=tunnel_id, payload=bytes(payload),
+        ))
+    except queue.Full:
+        pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Crawler
@@ -7052,6 +7096,7 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False)
                     _gui_ws_push("in", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 except Exception:
                     pass
+                _maybe_capture_ws("in", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 tunnel.msgs_in  += 1
                 tunnel.bytes_in += len(msg)
                 # Forward to upstream uncompressed (no RSV1) — we did not
@@ -7137,6 +7182,7 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False)
                     _gui_ws_push("out", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 except Exception:
                     pass
+                _maybe_capture_ws("out", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 tunnel.msgs_out  += 1
                 tunnel.bytes_out += len(msg)
                 # Re-compress for the browser leg if it negotiated deflate,
@@ -7208,7 +7254,7 @@ def _recv_exact(sock, n: int) -> bytes | None:
 def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
     """Read a single WebSocket frame.
 
-    FIXED: now returns (fin, rsv1, opcode, payload) — the RSV1 bit is required
+    Returns (fin, rsv1, opcode, payload) — the RSV1 bit is required
     to correctly implement permessage-deflate (RFC 7692 §6.1): only frames
     with RSV1 set on the FIRST frame of a message are compressed. The previous
     3-tuple discarded RSV1, forcing the pump to guess whether a frame was
@@ -7283,7 +7329,7 @@ def _ws_make_frame(opcode: int, payload: bytes, mask: bool = False,
     a complete, standalone message) silently mis-tags every continuation
     frame in a fragmented message as if it were the final one.
 
-    FIXED: `rsv1=True` sets the RSV1 bit (0x40) on the first byte. This is
+    `rsv1=True` sets the RSV1 bit (0x40) on the first byte. This is
     MANDATORY for permessage-deflate (RFC 7692 §6.1): the decompressor on the
     receiving side will not attempt to inflate a message whose first frame
     lacks RSV1. The previous version had no way to set RSV1, so every
@@ -7521,7 +7567,7 @@ class _RawSocketUpstreamWS:
 def _get_session_for_ws():
     """Get a session for the WS connection.
 
-    FIX v3: Try to reuse the client session (which has cf_clearance cookies and
+    Reuses the client session (which has cf_clearance cookies and
     the same TLS fingerprint as the main page). This is critical for
     CF-protected WS endpoints — a fresh session gets 403'd.
 
@@ -7578,7 +7624,7 @@ class _CffiUpstreamWS:
                 if k.lower() not in ("host", "upgrade", "connection",
                                       "sec-websocket-key", "sec-websocket-version",
                                       "sec-websocket-extensions", "accept-encoding")}
-        # FIX v3: Reuse the CLIENT session (which has cf_clearance cookies +
+        # Reuse the CLIENT session (which has cf_clearance cookies +
         # the same TLS fingerprint as the main page) instead of creating a
         # fresh one. This is what fixes CF-protected WS endpoints
         # — a fresh session has no cookies and gets 403'd by Cloudflare.
@@ -7599,13 +7645,12 @@ class _CffiUpstreamWS:
                 try: sess.close()
                 except Exception: pass
                 gc.collect()
-            # FIX v3: Log at WARN so the user can see WHY the WS failed
-            # (was DEBUG — invisible in normal operation).
+            # Log at WARN so the user can see WHY the WS failed.
             log(f"curl_cffi ws_connect failed: {exc}", "WARN")
             raise
         self._sess = sess
         self._should_close = should_close
-        # FIXED: curl_cffi's WebSocket object is NOT thread-safe. Concurrent
+        # curl_cffi's WebSocket object is NOT thread-safe. Concurrent
         # send() (from keepalive thread) and recv() (from relay thread) corrupt
         # internal buffers, producing garbled data that desyncs the browser's
         # application-level decompressor (e.g. zlib-stream: "invalid stored
@@ -8070,14 +8115,51 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
 # requests, that exceeded the OS thread limit ("can't start new thread").
 # The pool caps total concurrent request threads at MAX_HTTP_THREADS; excess
 # requests queue instead of crashing.
-from concurrent.futures import ThreadPoolExecutor
 MAX_HTTP_THREADS = 128
 _http_pool = ThreadPoolExecutor(max_workers=MAX_HTTP_THREADS, thread_name_prefix="http")
 _link_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="link-ext")
 
 class _PooledWSGIServer(ThreadedWSGIServer):
     """ThreadedWSGIServer that uses a bounded thread pool instead of spawning
-    a new thread per request. Prevents 'can't start new thread' under load."""
+    a new thread per request. Prevents 'can't start new thread' under load.
+
+    Also upgrades IPv4-only 0.0.0.0 binds to dual-stack IPv6 (:: with
+    IPV6_V6ONLY=0) so the server is reachable at BOTH 127.0.0.1 and ::1.
+    Many systems (glibc on Linux, macOS) resolve `localhost` to ::1 first;
+    an IPv4-only bind makes the proxy unreachable at http://localhost:PORT,
+    which is the canonical URL advertised in the banner and the web viewer.
+    """
+    def server_bind(self):
+        # Swap the pre-made IPv4 socket for a dual-stack IPv6 one when the
+        # configured bind is 0.0.0.0 (the default). This makes the listener
+        # accept both IPv4-mapped and native IPv6 connections on one socket.
+        try:
+            host = self.server_address[0] if isinstance(self.server_address, tuple) else ""
+            if self.socket.family == socket.AF_INET and host in ("0.0.0.0", ""):
+                try:
+                    self.socket.close()
+                except OSError:
+                    pass
+                v6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                # IPV6_V6ONLY=0 is what turns an IPv6 socket into dual-stack.
+                # On every Linux kernel >= 2.4 this is supported; the try/except
+                # guards exotic platforms where the option is missing.
+                try:
+                    v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except (OSError, AttributeError):
+                    pass
+                try:
+                    v6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                except OSError:
+                    pass
+                self.socket = v6
+                self.address_family = socket.AF_INET6
+                self.server_address = ("::", self.server_address[1])
+        except Exception:
+            # Any failure here falls through to werkzeug's default IPv4 bind.
+            pass
+        super().server_bind()
+
     def process_request(self, request, client_address):
         _http_pool.submit(self.process_request_thread, request, client_address)
     def server_close(self):
@@ -8284,7 +8366,7 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             # we deflate/inflate on our end — corrupting every frame. There is
             # exactly one handshake response; a second one isn't valid HTTP.
             #
-            # FIXED: zlib-stream guard. Some endpoints (notably real-time
+            # zlib-stream guard. Some endpoints (notably real-time
             # gateways via ?compress=zlib-stream) layer their OWN zlib
             # compression at the application level — it is NOT permessage-
             # deflate (RFC 7692), the frames do NOT set RSV1, and the bytes
@@ -8504,6 +8586,51 @@ def _normalize_request_origin():
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ALL_METHODS  = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# Concrete allow-list used for credentialed CORS preflights. The CORS spec
+# forbids the wildcard "*" for Access-Control-Allow-Headers /
+# Access-Control-Expose-Headers when the request carries credentials
+# (cookies / Authorization). Browsers silently reject credentialed preflights
+# that answer with "*", which manifests as opaque "CORS error" failures on
+# cross-origin (MULTIPORT CDN port) fetches with credentials:"include".
+# Echoing the client's Access-Control-Request-Headers is allowed, but some
+# browsers reject unknown tokens — so we merge it with a safe baseline.
+_CORS_BASE_ALLOW_HEADERS = (
+    "Accept, Authorization, Content-Type, X-Requested-With, X-CSRF-Token, "
+    "X-CSRFToken, X-XSRF-Token, Origin, Referer, User-Agent, DNT, "
+    "Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Fetch-User, "
+    "Accept-Language, Accept-Encoding, Range, If-Range, Cache-Control, Pragma"
+)
+
+def _cors_allow_headers() -> str:
+    """Return a concrete Access-Control-Allow-Headers value for a preflight.
+
+    Echoes the browser's Access-Control-Request-Headers (merged with a safe
+    baseline) when present, so credentialed preflights get a real list instead
+    of the spec-forbidden "*". Falls back to "*" only for anonymous requests
+    where the wildcard is legal and shortest.
+    """
+    req_hdrs = ""
+    try:
+        req_hdrs = (flask_request.headers.get("Access-Control-Request-Headers", "")
+                    or "").strip()
+    except RuntimeError:
+        pass  # outside a request context
+    if not req_hdrs:
+        return "*"
+    # Merge (case-insensitive dedup) the requested tokens with the baseline.
+    wanted = {t.strip().lower() for t in req_hdrs.split(",") if t.strip()}
+    base   = {t.strip().lower() for t in _CORS_BASE_ALLOW_HEADERS.split(",") if t.strip()}
+    merged = [t for t in (req_hdrs.split(",") + _CORS_BASE_ALLOW_HEADERS.split(","))
+              if t.strip() and t.strip().lower() in (wanted | base)]
+    # Dedupe preserving first-seen order + original casing.
+    seen, out = set(), []
+    for t in merged:
+        tl = t.strip().lower()
+        if tl and tl not in seen:
+            seen.add(tl)
+            out.append(t.strip())
+    return ", ".join(out) or "*"
 
 def _upstream_url(path: str) -> str:
     origin = f"{urlparse(SITE_URL).scheme}://{MAIN_HOST}"
@@ -8956,6 +9083,1644 @@ def _s2l_hp_endpoint() -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Web viewer  (/__s2l_viewer__)
+#
+# Replaces the old terminal "press 1" MULTIPORT viewer. A self-contained HTML
+# page that polls /__s2l_viewer_data__ every 50 ms (vs the terminal viewer's
+# 2 s) and re-renders the live CDN host→port table with surgical DOM diffs so
+# the page never freezes, even with hundreds of hosts. Polling uses recursive
+# setTimeout (NOT setInterval) so a slow fetch can never stack requests; the
+# next poll is only scheduled after the previous render completes.
+#
+# Both viewer routes handle OPTIONS explicitly so a cross-origin preflight
+# (e.g. an embedding dashboard on a different origin) gets a proper CORS
+# response with the same concrete Allow-Headers list used everywhere else.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_S2L_VIEWER_REFRESH_MS = 50
+
+def _viewer_cors_headers(origin: str) -> dict:
+    """CORS headers shared by all /__s2l_*__ viewer/dashboard routes."""
+    h = {
+        "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
+        "Access-Control-Allow-Headers": _cors_allow_headers(),
+        "Access-Control-Expose-Headers": "*",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
+    }
+    if origin:
+        h["Access-Control-Allow-Origin"] = origin
+        h["Access-Control-Allow-Credentials"] = "true"
+    else:
+        h["Access-Control-Allow-Origin"] = "*"
+    return h
+
+# ── Reset-stats endpoint ─────────────────────────────────────────────────────
+# Zeros every counter + clears the rolling-window event log so a developer
+# can start a clean benchmark window from the viewer's "Reset" button without
+# restarting the server. POST-only (mutating action); OPTIONS for CORS.
+@app.route("/__s2l_reset_stats__", methods=["POST", "OPTIONS"])
+def _s2l_reset_stats_endpoint() -> Response:
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    stats.reset()
+    log("Stats reset via /__s2l_reset_stats__", "INFO")
+    resp = Response(json.dumps({"ok": True, "ts": time.strftime("%H:%M:%S")}),
+                    content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+# ── Capture browser endpoints ────────────────────────────────────────────────
+# Lets the viewer link to /__s2l_captures__ to browse recorded HTTP captures
+# (CAPTURE) and WebSocket captures (CAPTURE_WS) directly in the browser, with
+# per-host grouping + counts + a way to view individual capture JSON files.
+# /__s2l_captures_data__  → JSON listing of capture files (grouped by host)
+# /__s2l_capture_file__   → raw contents of one capture file (by relative path)
+# Both are GET + OPTIONS (CORS-preflightable) so a cross-origin dashboard can
+# embed them.
+
+def _list_captures(root: str, kind: str) -> list:
+    """Walk a capture directory tree, returning one entry per JSON file.
+
+    Each entry: {path (relative), host, size, mtime, kind}. Walks at most
+    2000 files to bound the work on huge capture sets.
+    """
+    out = []
+    if not os.path.isdir(root):
+        return out
+    n = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            rel = os.path.relpath(fp, root)
+            # Host = the first path segment under root (captures/<host>/... or
+            # captures_ws/<host>/t<id>/...).
+            parts = rel.split(os.sep)
+            host = parts[0] if parts else ""
+            out.append({
+                "path": rel.replace(os.sep, "/"),
+                "host": host,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "kind": kind,
+            })
+            n += 1
+            if n >= 2000:
+                return out
+    return out
+
+@app.route("/__s2l_captures_files__", methods=["GET", "OPTIONS"])
+def _s2l_captures_files_endpoint() -> Response:
+    """JSON listing of individual capture files for one host (+ optional kind).
+
+    Query params:
+      ?host=<hostname>   (required) — first path segment under captures[_ws]/
+      ?kind=http|ws      (optional, default http) — which tree to list
+
+    Returns up to 500 files (most-recent first) so the capture browser can show
+    a clickable per-file list. Each entry: {path, kind, size, mtime, url}.
+    The `url` points at /__s2l_capture_file__ so the browser can fetch the raw
+    JSON without constructing the URL itself.
+    """
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    host = (flask_request.args.get("host") or "").strip()
+    kind = (flask_request.args.get("kind") or "http").strip().lower()
+    if not host or kind not in ("http", "ws"):
+        resp = Response(json.dumps({"error": "host and kind required"}),
+                        content_type="application/json", status=400)
+        resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return resp
+    root = os.path.join(DATA_FOLDER, "captures" if kind == "http" else "captures_ws")
+    host_dir = os.path.join(root, host)
+    # Path-traversal guard: host_dir must stay under root.
+    if not os.path.abspath(host_dir).startswith(os.path.abspath(root) + os.sep):
+        resp = Response(json.dumps({"error": "forbidden"}),
+                        content_type="application/json", status=403)
+        resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return resp
+    files = []
+    if os.path.isdir(host_dir):
+        for dirpath, _dirs, fns in os.walk(host_dir):
+            for fn in fns:
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                rel = os.path.relpath(fp, root).replace(os.sep, "/")
+                files.append({
+                    "path": rel,
+                    "kind": kind,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                    "url": f"/__s2l_capture_file__?path={rel}&kind={kind}",
+                })
+                if len(files) >= 500:
+                    break
+            if len(files) >= 500:
+                break
+    # Most-recent first — the user almost always wants the latest capture.
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+    payload = {
+        "host": host, "kind": kind,
+        "total": len(files),
+        "files": files,
+    }
+    resp = Response(json.dumps(payload), content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_captures_data__", methods=["GET", "OPTIONS"])
+def _s2l_captures_data_endpoint() -> Response:
+    """JSON listing of all HTTP + WS capture files, grouped by host."""
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    http_root = os.path.join(DATA_FOLDER, "captures")
+    ws_root   = os.path.join(DATA_FOLDER, "captures_ws")
+    http_files = _list_captures(http_root, "http")
+    ws_files   = _list_captures(ws_root, "ws")
+    # Group by host for the browser.
+    hosts: dict = {}
+    for f in http_files + ws_files:
+        h = f["host"] or "(ungrouped)"
+        hosts.setdefault(h, {"http": 0, "ws": 0, "size": 0, "last": 0})
+        hosts[h][f["kind"]] += 1
+        hosts[h]["size"] += f["size"]
+        if f["mtime"] > hosts[h]["last"]:
+            hosts[h]["last"] = f["mtime"]
+    payload = {
+        "ts": time.strftime("%H:%M:%S"),
+        "http_total": len(http_files),
+        "ws_total": len(ws_files),
+        "http_size": sum(f["size"] for f in http_files),
+        "ws_size": sum(f["size"] for f in ws_files),
+        "hosts": [{"host": h, **d} for h, d in sorted(hosts.items())],
+        "http_root": os.path.relpath(http_root) if os.path.isdir(http_root) else None,
+        "ws_root":   os.path.relpath(ws_root)   if os.path.isdir(ws_root)   else None,
+    }
+    resp = Response(json.dumps(payload), content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_capture_file__", methods=["GET", "OPTIONS"])
+def _s2l_capture_file_endpoint() -> Response:
+    """Return the raw JSON contents of one capture file (by ?path=&kind=)."""
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    rel = (flask_request.args.get("path") or "").strip()
+    kind = (flask_request.args.get("kind") or "http").strip().lower()
+    if not rel or kind not in ("http", "ws"):
+        return Response("Bad request", status=400)
+    root = os.path.join(DATA_FOLDER, "captures" if kind == "http" else "captures_ws")
+    # Resolve + guard against path traversal: the final path must stay under root.
+    # Both sides MUST be absolute for the startswith check — comparing a relative
+    # path against an absolute prefix always fails (the old bug: every capture
+    # file click returned 403 Forbidden because fp was relative but the prefix
+    # was absolute).
+    abs_root = os.path.abspath(root)
+    fp = os.path.abspath(os.path.normpath(os.path.join(root, rel)))
+    if not (fp == abs_root or fp.startswith(abs_root + os.sep)):
+        return Response("Forbidden", status=403)
+    if not os.path.isfile(fp):
+        return Response("Not found", status=404)
+    try:
+        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError as e:
+        return Response(str(e), status=500)
+    resp = Response(data, content_type="application/json; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_captures__", methods=["GET", "OPTIONS"])
+def _s2l_captures_endpoint() -> Response:
+    """Self-contained capture browser page (lists HTTP + WS captures)."""
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    page = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S2L · Captures</title>
+<style>
+  :root{--bg:#0d1117;--pnl:#161b22;--pnl2:#1c2230;--bd:#30363d;--bd2:#21262d;
+    --fg:#c9d1d9;--fg2:#e6edf3;--dim:#7d8590;--acc:#58a6ff;--grn:#3fb950;--ylw:#d29922;--mag:#bc8cff;--red:#f85149}
+  [data-theme="light"]{--bg:#f6f8fa;--pnl:#fff;--pnl2:#eaeef2;--bd:#d0d7de;--bd2:#e1e4e8;
+    --fg:#1f2328;--fg2:#0a0c10;--dim:#59636e;--acc:#0969da;--grn:#1a7f37;--ylw:#9a6700;--mag:#8250df;--red:#cf222e}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px;display:flex;flex-direction:column;min-height:100vh}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:var(--bg)}
+  ::-webkit-scrollbar-thumb{background:var(--bd);border-radius:6px;border:2px solid var(--bg)}
+  ::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+  ::selection{background:var(--acc);color:#fff}
+  header{padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--pnl);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;color:var(--fg2);font-weight:700} h1 .v{color:var(--mag)}
+  a.back{color:var(--acc);text-decoration:none;font-size:12px} a.back:hover{text-decoration:underline}
+  .stats{margin-left:auto;display:flex;gap:14px;font-size:12px;color:var(--dim)}
+  .stats b{color:var(--fg2)}
+  .btn{padding:5px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);font:inherit;font-size:11px;cursor:pointer}
+  .btn:hover{border-color:var(--acc)}
+  .btn.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+  .pulse{width:9px;height:9px;border-radius:50%;background:var(--grn);display:inline-block;animation:p 1.6s infinite}
+  @keyframes p{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  main{flex:1;padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--pnl);border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+  .card-head{padding:10px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--acc);font-weight:600;font-size:12px;user-select:none}
+  .card-head:hover{background:var(--pnl2)}
+  .card-head .n{margin-left:auto;color:var(--dim);font-size:11px}
+  .card-body{padding:0;display:none}
+  .card.open .card-body{display:block}
+  .card.open .caret{transform:rotate(90deg)}
+  .caret{display:inline-block;transition:transform .12s;color:var(--dim);font-size:10px}
+  .host{color:var(--fg2);font-weight:500}
+  .kind-chip{font-size:9px;padding:1px 6px;border-radius:8px;border:1px solid var(--bd);cursor:pointer;font-weight:600}
+  .kind-chip.http{color:var(--acc);border-color:var(--acc)}
+  .kind-chip.ws{color:var(--mag);border-color:var(--mag)}
+  .kind-chip:hover{background:var(--pnl2)}
+  .kind-chip.active{background:var(--acc);color:#fff}
+  .kind-chip.ws.active{background:var(--mag);color:#fff}
+  table.files{width:100%;border-collapse:collapse}
+  table.files td,th{padding:6px 14px;border-bottom:1px solid var(--bd2);text-align:left;font-size:11px}
+  table.files th{color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-size:9px;position:sticky;top:0;background:var(--pnl2)}
+  table.files tr{cursor:pointer}
+  table.files tr:hover td{background:var(--pnl2)}
+  .fpath{color:var(--acc);max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fsize{color:var(--dim);font-variant-numeric:tabular-nums}
+  .ftime{color:var(--dim);font-variant-numeric:tabular-nums}
+  .empty{padding:40px;text-align:center;color:var(--dim)}
+  .empty .big{font-size:24px;color:var(--ylw);margin-bottom:8px;font-weight:700}
+  .loading{padding:14px;color:var(--dim);font-size:11px;text-align:center}
+  .file-filter{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--bd2);
+    position:sticky;top:0;background:var(--pnl);z-index:1}
+  .file-filter .ff-input{flex:1;background:var(--bg);border:1px solid var(--bd);border-radius:5px;
+    padding:5px 10px;color:var(--fg);font:inherit;font-size:11px;outline:0}
+  .file-filter .ff-input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(88,166,255,.15)}
+  .file-filter .ff-count{color:var(--dim);font-size:10px;min-width:50px;text-align:right;font-variant-numeric:tabular-nums}
+  footer{padding:9px 20px;border-top:1px solid var(--bd);background:var(--pnl);color:var(--dim);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  /* Modal viewer */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+  .modal-overlay.open{display:flex}
+  .modal{background:var(--pnl);border:1px solid var(--bd);border-radius:8px;width:100%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal-head{padding:10px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;font-size:12px}
+  .modal-head .title{color:var(--fg2);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .modal-head .close{background:none;border:0;color:var(--dim);font-size:18px;cursor:pointer;padding:0 6px}
+  .modal-head .close:hover{color:var(--red)}
+  .modal-head .nav-btn{background:var(--pnl2);border:1px solid var(--bd);color:var(--fg);font-size:16px;font-weight:700;cursor:pointer;padding:2px 10px;border-radius:5px;line-height:1}
+  .modal-head .nav-btn:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+  .modal-head .nav-btn:disabled{opacity:.3;cursor:not-allowed}
+  .modal-head .pos{color:var(--dim);font-size:10px;font-variant-numeric:tabular-nums;min-width:42px;text-align:center}
+  .modal-head .action-btn{background:var(--pnl2);border:1px solid var(--cy);color:var(--cy);
+    font-size:10px;font-weight:700;cursor:pointer;padding:3px 10px;border-radius:5px;font-family:inherit}
+  .modal-head .action-btn:hover{background:var(--cy);color:#fff}
+  .modal-head .action-btn#modal-copy-body:hover{background:var(--grn);color:#fff}
+  .modal-head .action-btn#modal-download:hover{background:var(--acc);color:#fff}
+  /* Tabs (Full / Request / Response) */
+  .modal-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd2);padding:0 14px}
+  .modal-tabs .tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+    font:inherit;font-size:11px;font-weight:600;padding:8px 14px;cursor:pointer;letter-spacing:.3px}
+  .modal-tabs .tab:hover{color:var(--fg2)}
+  .modal-tabs .tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+  /* Fullscreen expand */
+  .modal.expanded{max-width:100%;max-height:100vh;width:100vw;height:100vh;border-radius:0}
+  .modal-body{padding:14px;overflow:auto;flex:1}
+  .modal-body pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.5;color:var(--fg)}
+  .modal-body pre .k{color:var(--acc)}
+  .modal-body pre .s{color:var(--grn)}
+  .modal-body pre .n{color:var(--ylw)}
+  /* Diff view (line-level add/del/eq highlighting) */
+  .modal-body pre.diff-view{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11px;line-height:1.6}
+  .diff-line{white-space:pre-wrap;word-break:break-word;padding:0 4px}
+  .diff-line.diff-add{background:rgba(63,185,80,.12);color:var(--grn)}
+  .diff-line.diff-del{background:rgba(248,81,73,.10);color:var(--red);text-decoration:line-through;text-decoration-color:rgba(248,81,73,.3)}
+  .diff-line.diff-eq{color:var(--dim)}
+  .diff-prefix{display:inline-block;width:14px;user-select:none;font-weight:700;opacity:.7}
+  .diff-text{display:inline}
+  /* Diff-select checkbox column */
+  .fdiff{width:28px;text-align:center}
+  .fdiff .diff-cb{cursor:pointer;accent-color:var(--mag)}
+  .diff-btn:hover{background:var(--mag)!important;color:#fff!important}
+  .toast{position:fixed;bottom:54px;left:50%;transform:translateX(-50%) translateY(20px);
+    background:var(--grn);color:#fff;padding:8px 18px;border-radius:6px;font-size:12px;font-weight:600;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:200}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style></head><body>
+<header>
+  <span class="pulse"></span>
+  <h1>S2L <span class="v">Captures</span></h1>
+  <a class="back" href="/__s2l_viewer__">← viewer</a>
+  <div class="stats">
+    <span>HTTP: <b id="t-http">0</b> (<b id="t-http-sz">0B</b>)</span>
+    <span>WS: <b id="t-ws">0</b> (<b id="t-ws-sz">0B</b>)</span>
+    <span>hosts: <b id="t-hosts">0</b></span>
+  </div>
+  <button class="btn" id="refresh">Refresh</button>
+  <button class="btn" id="theme-btn" title="toggle theme">Theme</button>
+</header>
+<main><div id="cards"></div>
+<div class="empty" id="empty" style="display:none">
+  <div class="big">No captures yet</div>
+  <div>Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>
+  Recorded HTTP request+response pairs and WebSocket messages will appear here, grouped by host.</div>
+</div>
+</main>
+<footer>
+  <span>capture files under <b id="roots">—</b></span>
+  <span>click a host to expand · click a file to view its JSON · <span class="kind-chip http">HTTP</span>/<span class="kind-chip ws">WS</span> chips toggle kind</span>
+</footer>
+<div class="modal-overlay" id="modal">
+  <div class="modal" id="modal-box">
+    <div class="modal-head">
+      <button class="nav-btn" id="modal-prev" title="previous file (←)">‹</button>
+      <span class="title" id="modal-title">—</span>
+      <span class="fsize" id="modal-meta">—</span>
+      <span class="pos" id="modal-pos">—</span>
+      <button class="nav-btn" id="modal-next" title="next file (→)">›</button>
+      <button class="action-btn" id="modal-curl" title="copy as cURL command (replay this request)" style="display:none">cURL</button>
+      <button class="action-btn" id="modal-copy-body" title="copy the response body to clipboard" style="display:none;border-color:var(--grn);color:var(--grn)">Body</button>
+      <button class="action-btn" id="modal-download" title="download this capture as a JSON file" style="border-color:var(--acc);color:var(--acc)">Save</button>
+      <button class="nav-btn" id="modal-expand" title="toggle full-screen (F)" style="font-size:13px">⤢</button>
+      <button class="close" id="modal-close">&times;</button>
+    </div>
+    <div class="modal-tabs" id="modal-tabs" style="display:none">
+      <button class="tab active" data-tab="full">Full</button>
+      <button class="tab" data-tab="request">Request</button>
+      <button class="tab" data-tab="response">Response</button>
+    </div>
+    <div class="modal-body"><pre id="modal-pre">loading…</pre></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+  function $(id){return document.getElementById(id);}
+  function fmtSize(n){if(n<1024)return n+"B";if(n<1048576)return (n/1024).toFixed(1)+"KB";return (n/1048576).toFixed(1)+"MB";}
+  function fmtTime(t){var d=new Date(t*1000);return d.toTimeString().slice(0,8);}
+  function showToast(msg){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(function(){t.classList.remove("show");},1500);}
+  // Theme persistence (shared with viewer via localStorage key)
+  if(localStorage.getItem("s2l-theme")==="light") document.documentElement.setAttribute("data-theme","light");
+  $("theme-btn").onclick=function(){var cur=document.documentElement.getAttribute("data-theme");var next=cur==="light"?"":"light";if(next)document.documentElement.setAttribute("data-theme",next);else document.documentElement.removeAttribute("data-theme");localStorage.setItem("s2l-theme",next||"dark");};
+
+  var hostKindState = {};  // host -> "http" | "ws"  (which kind is expanded)
+
+  function load(){
+    fetch("/__s2l_captures_data__",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+      $("t-http").textContent=d.http_total;$("t-http-sz").textContent=fmtSize(d.http_size);
+      $("t-ws").textContent=d.ws_total;$("t-ws-sz").textContent=fmtSize(d.ws_size);
+      $("t-hosts").textContent=d.hosts.length;
+      $("roots").textContent=[d.http_root,d.ws_root].filter(Boolean).join(" + ")||"—";
+      var cards=$("cards"); cards.innerHTML="";
+      $("empty").style.display=d.hosts.length?"none":"block";
+      d.hosts.forEach(function(h){
+        var c=document.createElement("div");c.className="card";c.dataset.host=h.host;
+        var head=document.createElement("div");head.className="card-head";
+        var httpChip='<span class="kind-chip http'+(h.http?'':'" style="opacity:.3')+'" data-kind="http">'+h.http+'</span>';
+        var wsChip='<span class="kind-chip ws'+(h.ws?'':'" style="opacity:.3')+'" data-kind="ws">'+h.ws+'</span>';
+        head.innerHTML='<span class="caret">▶</span> <span class="host">'+h.host+'</span> '
+          + httpChip + ' ' + wsChip
+          + '<span class="n">'+fmtSize(h.size)+' · '+fmtTime(h.last)+'</span>';
+        head.onclick=function(ev){
+          var chip=ev.target.closest(".kind-chip");
+          if(chip){ ev.stopPropagation(); openHost(c, h.host, chip.dataset.kind); return; }
+          toggleCard(c, h.host);
+        };
+        c.appendChild(head);
+        var body=document.createElement("div");body.className="card-body";
+        c.appendChild(body);cards.appendChild(c);
+      });
+    }).catch(function(e){$("empty").textContent="Error: "+e;$("empty").style.display="block";});
+  }
+  function toggleCard(card, host){
+    var isOpen=card.classList.contains("open");
+    if(isOpen){ card.classList.remove("open"); return; }
+    // default kind: http if it has http files, else ws
+    var kind = hostKindState[host] || (card.querySelector(".kind-chip.http").textContent!=="0" ? "http" : "ws");
+    openHost(card, host, kind);
+  }
+  function openHost(card, host, kind){
+    hostKindState[host]=kind;
+    card.classList.add("open");
+    // highlight active chip
+    card.querySelectorAll(".kind-chip").forEach(function(ch){ch.classList.toggle("active", ch.dataset.kind===kind);});
+    var body=card.querySelector(".card-body");
+    body.innerHTML='<div class="loading">loading '+kind+' files…</div>';
+    fetch("/__s2l_captures_files__?host="+encodeURIComponent(host)+"&kind="+kind,{cache:"no-store"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.files || !d.files.length){ body.innerHTML='<div class="loading">No '+kind+' capture files for this host.</div>'; return; }
+        // Filter box above the file table — substring search on path/size/time.
+        var fbox=document.createElement("div");fbox.className="file-filter";
+        fbox.innerHTML='<input type="text" class="ff-input" placeholder="filter '+kind+' files…" autocomplete="off"><span class="ff-count"></span>';
+        body.innerHTML=""; body.appendChild(fbox);
+        var t=document.createElement("table");t.className="files";
+        t.innerHTML="<thead><tr><th style='width:28px'></th><th>path</th><th>size</th><th>time</th></tr></thead>";
+        var tb=document.createElement("tbody");
+        var files=d.files;
+        // Diff selection state: track which file indices have their checkbox checked.
+        var diffSel=[];
+        var diffBtn=document.createElement("button"); diffBtn.className="btn diff-btn"; diffBtn.textContent="Diff selected"; diffBtn.style.display="none";
+        diffBtn.style.cssText="position:absolute;right:14px;margin-top:4px;border-color:var(--mag);color:var(--mag)";
+        function updateDiffBtn(){
+          diffSel = diffSel.filter(function(i){ return i>=0 && i<files.length; });
+          if(diffSel.length===2){ diffBtn.style.display=""; diffBtn.textContent="Diff "+diffSel.length+" selected"; }
+          else { diffBtn.style.display="none"; }
+        }
+        diffBtn.onclick=function(){
+          if(diffSel.length!==2) return;
+          // Fetch both captures, then open the diff modal.
+          var a=files[diffSel[0]], b=files[diffSel[1]];
+          Promise.all([
+            fetch(a.url,{cache:"no-store"}).then(function(r){return r.text();}),
+            fetch(b.url,{cache:"no-store"}).then(function(r){return r.text();})
+          ]).then(function(results){
+            openDiff(a, b, results[0], results[1]);
+          }).catch(function(e){ showToast("Diff fetch failed: "+e,"warn"); });
+        };
+        d.files.forEach(function(f, fi){
+          var tr=document.createElement("tr");
+          tr.innerHTML='<td class="fdiff"><input type="checkbox" class="diff-cb" data-fi="'+fi+'" title="select for diff"></td>'
+            +'<td class="fpath" title="'+f.path+'">'+f.path+'</td>'
+            +'<td class="fsize">'+fmtSize(f.size)+'</td>'
+            +'<td class="ftime">'+fmtTime(f.mtime)+'</td>';
+          // Checkbox: toggle diff selection (max 2). Stop propagation so the row click (open) doesn't fire.
+          var cb=tr.querySelector(".diff-cb");
+          cb.onclick=function(ev){ ev.stopPropagation();
+            if(cb.checked){
+              if(diffSel.length>=2){ cb.checked=false; showToast("Select at most 2 files to diff","warn"); return; }
+              diffSel.push(fi);
+            } else {
+              diffSel = diffSel.filter(function(i){return i!==fi;});
+            }
+            updateDiffBtn();
+          };
+          tr.onclick=function(){ openFileFromList(files, fi); };
+          tb.appendChild(tr);
+        });
+        t.appendChild(tb); body.appendChild(t);
+        body.appendChild(diffBtn);
+        var note=document.createElement("div");note.className="loading";
+        note.textContent=d.total+" file(s) · click a row to view · check 2 to diff";
+        body.appendChild(note);
+        // Wire the filter: show only rows whose path/size/time matches the query.
+        var ff=fbox.querySelector(".ff-input"), fc=fbox.querySelector(".ff-count");
+        ff.addEventListener("input", function(){
+          var q=ff.value.toLowerCase().trim();
+          var visible=0;
+          Array.prototype.forEach.call(tb.querySelectorAll("tr"), function(tr, i){
+            var f=files[i]||{};
+            var hay=(f.path+" "+f.size+" "+fmtTime(f.mtime)).toLowerCase();
+            var match = !q || hay.indexOf(q)!==-1;
+            tr.style.display = match ? "" : "none";
+            if(match) visible++;
+          });
+          fc.textContent = q ? visible+"/"+files.length : "";
+          note.textContent = (q?visible:files.length)+" file(s)"+(q?" matched":"")+" · click a row to view";
+        });
+        ff.focus();
+      })
+      .catch(function(e){ body.innerHTML='<div class="loading">Error: '+e+'</div>'; });
+  }
+  function syntaxHighlight(json){
+    // escaped + token-colored JSON for the modal
+    json = json.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function(m){
+      var cls="n";
+      if(/^"/.test(m)){ cls = /:$/.test(m) ? "k" : "s"; }
+      else if(/true|false/.test(m)){ cls="k"; }
+      else if(/null/.test(m)){ cls="dim"; }
+      return '<span class="'+cls+'">'+m+'</span>';
+    });
+  }
+  // Currently-open capture object (parsed) — used by the cURL builder + tabs.
+  var currentCapture=null;
+  var currentTab="full";   // "full" | "request" | "response"
+  var currentFileObj=null; // for the download button
+  function renderCaptureTab(){
+    if(!currentCapture) return;
+    var pre=$("modal-pre");
+    if(currentTab==="full"){
+      pre.innerHTML=syntaxHighlight(JSON.stringify(currentCapture,null,2));
+    } else if(currentTab==="request"){
+      var req=currentCapture.request||{};
+      pre.innerHTML=syntaxHighlight(JSON.stringify(req,null,2));
+    } else if(currentTab==="response"){
+      var resp=currentCapture.response||{};
+      pre.innerHTML=syntaxHighlight(JSON.stringify(resp,null,2));
+    }
+    // Update tab active states.
+    document.querySelectorAll(".modal-tabs .tab").forEach(function(t){
+      t.classList.toggle("active", t.dataset.tab===currentTab);
+    });
+  }
+  // ── Diff view: compare two captures side-by-side with line-level highlighting.
+  // Uses a simple LCS-based line diff (no deps) so it works under file://.
+  function lineDiff(a, b){
+    var al=a.split("\n"), bl=b.split("\n");
+    var n=al.length, m=bl.length;
+    // Build LCS table.
+    var dp=[];
+    for(var i=0;i<=n;i++){ dp.push(new Array(m+1).fill(0)); }
+    for(i=n-1;i>=0;i--){
+      for(var j=m-1;j>=0;j--){
+        dp[i][j] = (al[i]===bl[j]) ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+      }
+    }
+    // Backtrack to produce a unified-style diff.
+    var out=[];
+    i=0; var j=0;
+    while(i<n && j<m){
+      if(al[i]===bl[j]){ out.push({t:"eq", v:al[i]}); i++; j++; }
+      else if(dp[i+1][j] >= dp[i][j+1]){ out.push({t:"del", v:al[i]}); i++; }
+      else { out.push({t:"add", v:bl[j]}); j++; }
+    }
+    while(i<n){ out.push({t:"del", v:al[i]}); i++; }
+    while(j<m){ out.push({t:"add", v:bl[j]}); j++; }
+    return out;
+  }
+  function openDiff(fileA, fileB, txtA, txtB){
+    var modal=$("modal");
+    var pa=txtA, pb=txtB;
+    try { pa=JSON.stringify(JSON.parse(txtA),null,2); } catch(e){}
+    try { pb=JSON.stringify(JSON.parse(txtB),null,2); } catch(e){}
+    var diff=lineDiff(pa, pb);
+    var stats={eq:0, add:0, del:0};
+    diff.forEach(function(d){ stats[d.t]++; });
+    $("modal-title").textContent="diff: "+fileA.path.split("/").pop()+" ↔ "+fileB.path.split("/").pop();
+    $("modal-meta").textContent="+"+stats.add+" / -"+stats.del+" / ="+stats.eq;
+    $("modal-curl").style.display="none";
+    $("modal-copy-body").style.display="none";
+    $("modal-tabs").style.display="none";
+    $("modal-download").style.display="none";
+    currentCapture=null;
+    modal.classList.add("open");
+    // Render diff as colored lines.
+    var html="";
+    diff.forEach(function(d){
+      var cls = d.t==="add"?"diff-add":d.t==="del"?"diff-del":"diff-eq";
+      var prefix = d.t==="add"?"+":d.t==="del"?"-":" ";
+      var line = (d.v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      html += '<div class="diff-line '+cls+'"><span class="diff-prefix">'+prefix+'</span><span class="diff-text">'+line+'</span></div>';
+    });
+    $("modal-pre").className="diff-view";
+    $("modal-pre").innerHTML = html || "(identical)";
+  }
+  function openFile(f){
+    var modal=$("modal");
+    currentFileObj=f;
+    $("modal-title").textContent=f.path;
+    $("modal-meta").textContent=fmtSize(f.size)+" · "+fmtTime(f.mtime);
+    $("modal-pre").innerHTML="loading…";
+    $("modal-pre").className="";   // reset from diff-view
+    $("modal-curl").style.display="none";   // hidden until we confirm it's an HTTP capture
+    $("modal-copy-body").style.display="none"; // hidden unless response has a body
+    $("modal-tabs").style.display="none";   // hidden unless it's a capture with req+resp
+    $("modal-download").style.display="";   // restore (openDiff hides it)
+    currentCapture=null;
+    currentTab="full";
+    modal.classList.add("open");
+    // Update position indicator + prev/next disabled state.
+    var list=currentFileList, idx=currentFileIdx;
+    if(list && idx>=0){
+      $("modal-pos").textContent=(idx+1)+"/"+list.length;
+      $("modal-prev").disabled = idx<=0;
+      $("modal-next").disabled = idx>=list.length-1;
+    } else {
+      $("modal-pos").textContent="—";
+      $("modal-prev").disabled=true; $("modal-next").disabled=true;
+    }
+    fetch(f.url,{cache:"no-store"}).then(function(r){return r.text();}).then(function(txt){
+      var parsed=null;
+      try { parsed=JSON.parse(txt); } catch(e){}
+      if(parsed){
+        currentCapture=parsed;
+        // Show the cURL button only for HTTP captures (have a request.method+url).
+        if(parsed.request && parsed.request.method && parsed.request.url){
+          $("modal-curl").style.display="";
+        }
+        // Show the tabs + copy-body button only for captures with request+response sections.
+        if(parsed.request && parsed.response){
+          $("modal-tabs").style.display="flex";
+          if(parsed.response.body){
+            $("modal-copy-body").style.display="";
+          }
+        }
+        renderCaptureTab();
+      } else {
+        $("modal-pre").textContent=txt;
+      }
+    }).catch(function(e){ $("modal-pre").textContent="Error: "+e; });
+  }
+  // Build a cURL command from the currently-open HTTP capture's request section.
+  // Replays the original method, URL, headers, and body so a developer can
+  // reproduce the exact captured request from a terminal.
+  function captureToCurl(cap){
+    if(!cap || !cap.request) return null;
+    var r=cap.request;
+    var method=(r.method||"GET").toUpperCase();
+    var url=r.url||"";
+    var parts=['curl -sS -D - -X '+method+' "'+url.replace(/"/g,'\\"')+'"'];
+    // Headers (skip Host/Content-Length — curl sets those itself).
+    var hdrs=r.headers||{};
+    for(var k in hdrs){
+      if(!hdrs.hasOwnProperty(k)) continue;
+      var kl=k.toLowerCase();
+      if(kl==="host"||kl==="content-length"||kl==="connection") continue;
+      parts.push('  -H "'+k+': '+String(hdrs[k]).replace(/"/g,'\\"')+'"');
+    }
+    // Body (only for methods that have one, and only if CAPTURE_BODIES was on).
+    if(r.body && method!=="GET" && method!=="HEAD"){
+      parts.push('  --data-raw \''+String(r.body).replace(/'/g,"'\\''")+'\'');
+    }
+    return parts.join(" \\\n");
+  }
+  $("modal-curl").onclick=function(){
+    if(!currentCapture){ showToast("No request to copy","warn"); return; }
+    var cmd=captureToCurl(currentCapture);
+    if(!cmd){ showToast("Capture has no replayable request","warn"); return; }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(cmd).then(function(){
+        showToast("Copied cURL command ("+currentCapture.request.method+" "+(currentCapture.request.url||"").slice(0,40)+"…)");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      var ta=document.createElement("textarea"); ta.value=cmd; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied cURL command");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
+  };
+  // Track the currently-open file list + index for prev/next navigation.
+  var currentFileList=[], currentFileIdx=-1;
+  function openFileFromList(list, idx){
+    currentFileList=list; currentFileIdx=idx;
+    if(idx>=0 && idx<list.length) openFile(list[idx]);
+  }
+  function navFile(delta){
+    if(!currentFileList.length) return;
+    var ni=currentFileIdx+delta;
+    if(ni<0 || ni>=currentFileList.length) return;
+    currentFileIdx=ni;
+    openFile(currentFileList[ni]);
+  }
+  $("modal-prev").onclick=function(){ navFile(-1); };
+  $("modal-next").onclick=function(){ navFile(1); };
+  $("modal-close").onclick=function(){$("modal").classList.remove("open");};
+  $("modal").onclick=function(e){if(e.target===this)$("modal").classList.remove("open");};
+  // Tab switching: Full / Request / Response.
+  document.querySelectorAll(".modal-tabs .tab").forEach(function(tab){
+    tab.onclick=function(){
+      currentTab=tab.dataset.tab;
+      renderCaptureTab();
+    };
+  });
+  // Copy response body to clipboard.
+  $("modal-copy-body").onclick=function(){
+    if(!currentCapture || !currentCapture.response || !currentCapture.response.body){
+      showToast("No response body to copy","warn"); return;
+    }
+    var body=currentCapture.response.body;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(body).then(function(){
+        showToast("Copied response body ("+body.length+" chars)");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      var ta=document.createElement("textarea"); ta.value=body; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied response body");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
+  };
+  // Download the capture JSON as a file.
+  $("modal-download").onclick=function(){
+    if(!currentCapture){ showToast("No data to download","warn"); return; }
+    var txt=JSON.stringify(currentCapture,null,2);
+    var blob=new Blob([txt],{type:"application/json"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a");
+    var fname=(currentFileObj && currentFileObj.path) ? currentFileObj.path.split("/").pop() : "capture.json";
+    a.href=url; a.download=fname;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Downloaded "+fname);
+  };
+  // Full-screen expand toggle.
+  $("modal-expand").onclick=function(){
+    var box=$("modal-box");
+    box.classList.toggle("expanded");
+    this.textContent = box.classList.contains("expanded") ? "⤓" : "⤢";
+    this.title = box.classList.contains("expanded") ? "restore (F)" : "toggle full-screen (F)";
+  };
+  document.addEventListener("keydown",function(e){
+    if(!$("modal").classList.contains("open")) return;
+    if(e.key==="Escape") $("modal").classList.remove("open");
+    else if(e.key==="ArrowLeft") navFile(-1);
+    else if(e.key==="ArrowRight") navFile(1);
+    else if(e.key==="f"||e.key==="F") $("modal-expand").click();
+  });
+  $("refresh").onclick=load;
+  load();
+  setInterval(load, 5000);
+})();
+</script></body></html>"""
+    resp = Response(page, content_type="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+
+# ── Main viewer data + page ──────────────────────────────────────────────────
+
+@app.route("/__s2l_viewer_data__", methods=["GET", "OPTIONS"])
+def _s2l_viewer_data_endpoint() -> Response:
+    """Snapshot of the live CDN host→port table + counts for the web viewer.
+
+    Enriched with: detected upstream WAF/platform (from detect_platform),
+    process uptime, capture-flag status, and a rolling-window request rate
+    (events in the last STATS_WINDOW seconds) so the viewer can show a live
+    throughput sparkline without keeping its own history.
+    """
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+
+    with _cdn_port_lock:
+        snap = sorted(((h, p) for h, p in _cdn_host_port.items() if p > 0),
+                      key=lambda hp: hp[1])
+        pending  = sum(1 for _, p in _cdn_host_port.items() if p < 0)
+        unported = sum(1 for _, p in _cdn_host_port.items() if p == 0)
+    s = stats.snapshot()
+    win = stats.snapshot_window()
+    uptime_s = int(time.time() - _START_TS)
+
+    # Rolling-window totals (events in the last STATS_WINDOW seconds).
+    win_total = sum(win.values())
+    req_per_s = round(win_total / STATS_WINDOW, 1) if STATS_WINDOW > 0 else 0.0
+
+    # Per-CDN-host health snapshot (last_seen, requests, errors, RTT, status).
+    health = snapshot_cdn_health()
+
+    # Most recently detected upstream platform/WAF (Cloudflare, Akamai, ...).
+    plat = get_last_platform()
+    plat_name = plat.get("name", "Unknown")
+    plat_age = int(time.time() - plat.get("ts", 0)) if plat.get("ts") else 0
+
+    payload = {
+        "ts":          time.strftime("%H:%M:%S"),
+        "epoch_ms":    int(time.time() * 1000),
+        "refresh_ms":  _S2L_VIEWER_REFRESH_MS,
+        "target":      MAIN_HOST,
+        "proxy":       f"http://{HOST}:{PORT}",
+        "uptime_s":    uptime_s,
+        "active":      [{"host": h, "port": p, "url": f"http://localhost:{p}",
+                         "health": health.get(h)}
+                        for h, p in snap],
+        "pending":     pending,
+        "shared":      unported,
+        "total":       len(_cdn_host_port),
+        "captured":    s.get("captured", 0),
+        "ws_captured": s.get("ws_captured", 0),
+        "proxied":     s.get("proxied", 0),
+        "cdn_fetched": s.get("cdn_fetched", 0),
+        # Rolling-window rate for the throughput sparkline.
+        "req_per_s":   req_per_s,
+        "win_events":  win_total,
+        "win_window":  STATS_WINDOW,
+        "win_breakdown": {k: v for k, v in win.items()},
+        # Most recently detected upstream platform/WAF, surfaced in the header.
+        "platform":    {"name": plat_name, "age_s": plat_age},
+        # Capture-flag status so the viewer can show what's being recorded.
+        "flags": {
+            "CAPTURE":           CAPTURE,
+            "CAPTURE_WS":        CAPTURE_WS,
+            "CAPTURE_CDN":       CAPTURE_CDN,
+            "CAPTURE_BODIES":    CAPTURE_BODIES,
+            "CAPTURE_SKIP_STATIC": CAPTURE_SKIP_STATIC,
+            "HOOK_GUI":          HOOK_GUI,
+            "MULTIPORT":         MULTIPORT,
+            "PROXY_CDN":         PROXY_CDN,
+            "CACHE_CDN":         CACHE_CDN,
+            "OFFLINE":           OFFLINE,
+            "SSE_PROXY":         SSE_PROXY,
+            "TCP_TUNNEL":        TCP_TUNNEL,
+            "UDP_TUNNEL":        UDP_TUNNEL,
+            "WS_DEFLATE":        WS_DEFLATE,
+            "WS_AUTO_RECONNECT": WS_AUTO_RECONNECT,
+        },
+    }
+    resp = Response(json.dumps(payload), content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_viewer__", methods=["GET", "OPTIONS"])
+def _s2l_viewer_endpoint() -> Response:
+    """Self-contained live CDN viewer page (refreshes every 50 ms)."""
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    page = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S2L · MULTIPORT Viewer</title>
+<style>
+  :root{
+    --bg:#0d1117; --pnl:#161b22; --pnl2:#1c2230; --bd:#30363d; --bd2:#21262d;
+    --fg:#c9d1d9; --fg2:#e6edf3; --dim:#7d8590; --acc:#58a6ff; --grn:#3fb950;
+    --ylw:#d29922; --red:#f85149; --mag:#bc8cff; --cy:#79c0ff;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+  }
+  [data-theme="light"]{
+    --bg:#f6f8fa; --pnl:#ffffff; --pnl2:#eaeef2; --bd:#d0d7de; --bd2:#e1e4e8;
+    --fg:#1f2328; --fg2:#0a0c10; --dim:#59636e; --acc:#0969da; --grn:#1a7f37;
+    --ylw:#9a6700; --red:#cf222e; --mag:#8250df; --cy:#0550ae;
+    --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:13px}
+  body{display:flex;flex-direction:column;min-height:100vh}
+  ::selection{background:var(--acc);color:#fff}
+
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:var(--bg)}
+  ::-webkit-scrollbar-thumb{background:var(--bd);border-radius:6px;border:2px solid var(--bg)}
+  ::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+  ::-webkit-scrollbar-corner{background:var(--bg)}
+
+  /* ── Header ───────────────────────────────────────────────────────── */
+  header{padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--pnl);
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .pulse{width:11px;height:11px;border-radius:50%;background:var(--grn);
+    box-shadow:0 0 0 0 rgba(63,185,80,.5);animation:pulse 1.6s infinite;display:inline-block;flex-shrink:0}
+  .pulse.stale{background:var(--ylw);animation:none}
+  .pulse.dead{background:var(--red);animation:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}70%{box-shadow:0 0 0 9px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  h1{font-size:15px;margin:0;letter-spacing:.5px;color:var(--fg2);font-weight:700;display:flex;align-items:center;gap:8px}
+  h1 .v{color:var(--mag);font-weight:700}
+  .target{color:var(--grn);font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+  .waf-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;
+    font-size:10px;font-weight:700;letter-spacing:.3px;border:1px solid var(--bd);
+    background:var(--pnl2);color:var(--dim)}
+  .waf-badge.known{color:var(--ylw);border-color:var(--ylw);background:rgba(210,153,34,.08)}
+  .waf-badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+  .proxy{color:var(--dim);font-size:12px}
+  .uptime{color:var(--dim);font-size:11px;padding:2px 7px;border:1px solid var(--bd);border-radius:4px}
+  .stats{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  .stat{position:relative;display:flex;flex-direction:column;align-items:center;line-height:1.15;
+    padding:6px 12px;border-radius:6px;background:var(--pnl2);min-width:62px;border:1px solid var(--bd2);cursor:default;
+    transition:transform .12s, border-color .12s}
+  .stat:hover{transform:translateY(-1px);border-color:var(--acc)}
+  .stat .n{font-size:16px;font-weight:700;color:var(--fg2);font-variant-numeric:tabular-nums}
+  .stat .l{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px;margin-top:1px}
+  .stat[data-tip]:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 6px);left:50%;
+    transform:translateX(-50%);background:var(--pnl2);color:var(--fg2);border:1px solid var(--bd);
+    padding:4px 8px;border-radius:4px;font-size:10px;white-space:nowrap;z-index:50;pointer-events:none}
+
+  /* ── Throughput chart (bigger, with axis) ─────────────────────────── */
+  .chart-card{margin:14px 20px 0;background:var(--pnl);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}
+  .chart-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+  .chart-title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+  .chart-legend{display:flex;gap:10px;font-size:10px;color:var(--dim)}
+  .chart-legend .leg{display:inline-flex;align-items:center;gap:4px}
+  .chart-legend .sw{display:inline-block;width:10px;height:3px;border-radius:2px}
+  .chart-legend .sw.cur{background:var(--acc)}
+  .chart-legend .sw.peak{background:var(--grn)}
+  .chart-legend .sw.avg{background:var(--cy)}
+  .chart-vals{margin-left:auto;display:flex;gap:14px;font-size:11px}
+  .chart-vals .kv{display:flex;gap:5px;align-items:baseline}
+  .chart-vals .kv .k{color:var(--dim)}
+  .chart-vals .kv .v{color:var(--fg2);font-weight:700;font-variant-numeric:tabular-nums}
+  .chart-vals .kv.cur .v{color:var(--acc)}
+  .chart-vals .kv.peak .v{color:var(--grn)}
+  .chart-vals .kv.avg .v{color:var(--cy)}
+  .chart-svg{width:100%;height:64px;display:block}
+  /* Per-host stacked bar (request share by host) */
+  .host-bar-wrap{margin-top:10px;padding-top:8px;border-top:1px solid var(--bd2)}
+  .host-bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--bd2);margin-bottom:6px}
+  .host-bar .seg{height:100%;transition:width .3s;cursor:default}
+  .host-bar .seg:hover{opacity:.85}
+  .host-bar-legend{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:10px;color:var(--dim)}
+  .host-bar-legend .lh{display:inline-flex;align-items:center;gap:4px;cursor:default}
+  .host-bar-legend .lh .sw{display:inline-block;width:9px;height:9px;border-radius:2px}
+  .host-bar-legend .lh .pct{color:var(--fg2);font-weight:600;font-variant-numeric:tabular-nums;margin-left:2px}
+  .chart-grid line{stroke:var(--bd2);stroke-width:1}
+  .chart-area{fill:url(#chartgrad);opacity:.5}
+  .chart-line{fill:none;stroke:var(--acc);stroke-width:1.5;stroke-linejoin:round}
+  .chart-peak{fill:var(--grn)}
+  .chart-cur{fill:var(--acc);stroke:var(--pnl);stroke-width:1.5}
+
+  /* ── Toolbar ──────────────────────────────────────────────────────── */
+  .toolbar{display:flex;gap:10px;align-items:center;margin:14px 20px 0;flex-wrap:wrap}
+  .bar-group{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;
+    padding:5px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px}
+  .bar-group .rate{color:var(--acc);font-weight:700}
+  .bar-group .tag{display:inline-block;padding:1px 7px;border-radius:4px;background:var(--pnl2);
+    color:var(--dim);font-size:10px;border:1px solid var(--bd2)}
+  .bar-group .tag.ok{color:var(--grn);border-color:var(--grn)}
+  .bar-group .tag.err{color:var(--red);border-color:var(--red)}
+  .search{flex:1;min-width:180px;display:flex;align-items:center;gap:6px;
+    padding:6px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px}
+  .search:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+  .search svg{width:14px;height:14px;color:var(--dim);flex-shrink:0}
+  .search input{flex:1;background:transparent;border:0;outline:0;color:var(--fg);font:inherit;font-size:12px}
+  .search input::placeholder{color:var(--dim)}
+  .search .count{color:var(--dim);font-size:10px;padding-left:6px;border-left:1px solid var(--bd2);margin-left:4px}
+  .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;background:var(--pnl);
+    border:1px solid var(--bd);border-radius:6px;color:var(--fg);font:inherit;font-size:11px;font-weight:600;
+    cursor:pointer;transition:background .12s,border-color .12s,transform .08s;white-space:nowrap}
+  .btn:hover{background:var(--pnl2);border-color:var(--acc)}
+  .btn:active{transform:translateY(1px)}
+  .btn.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+  .btn svg{width:13px;height:13px}
+  .sel{padding:6px 8px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px;
+    color:var(--fg);font:inherit;font-size:11px;cursor:pointer;outline:0}
+  .sel:focus{border-color:var(--acc)}
+
+  /* ── Table ────────────────────────────────────────────────────────── */
+  main{flex:1;padding:14px 20px;overflow:auto}
+  /* Table wrapper enables horizontal scroll on narrow screens without breaking
+     the page layout. The wrapper is created by render() around the <table>. */
+  .table-wrap{overflow-x:auto;border:1px solid var(--bd);border-radius:8px}
+  table{width:100%;border-collapse:collapse;background:var(--pnl);
+    border:0;overflow:hidden;min-width:560px}
+  thead th{background:var(--pnl2);color:var(--acc);text-align:left;
+    padding:10px 14px;font-size:10px;text-transform:uppercase;letter-spacing:.6px;
+    border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:2;user-select:none}
+  thead th.sortable{cursor:pointer}
+  thead th.sortable:hover{color:var(--fg2);background:var(--bd2)}
+  thead th .caret{display:inline-block;width:0;height:0;margin-left:5px;vertical-align:middle;opacity:.3}
+  thead th.sorted-asc .caret{border-bottom:5px solid var(--acc);opacity:1}
+  thead th.sorted-desc .caret{border-top:5px solid var(--acc);opacity:1}
+  tbody td{padding:9px 14px;border-bottom:1px solid var(--bd2)}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr{transition:background .1s}
+  tbody tr:hover{background:var(--pnl2)}
+  tbody tr.new{animation:flash 1.1s ease-out}
+  tbody tr.copy-flash{animation:copyflash .8s ease-out}
+  @keyframes flash{0%{background:rgba(88,166,255,.20)}100%{background:transparent}}
+  @keyframes copyflash{0%{background:rgba(63,185,80,.30)}100%{background:transparent}}
+  td .host{color:var(--fg2);font-weight:500}
+  td .port{color:var(--ylw);font-weight:700;font-variant-numeric:tabular-nums}
+  td a{color:var(--acc);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px;display:inline-block;vertical-align:bottom}
+  td a:hover{text-decoration:underline}
+  td .copy-btn{opacity:0;transition:opacity .12s;background:none;border:1px solid var(--bd2);
+    color:var(--dim);border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;margin-left:6px}
+  tbody tr:hover .copy-btn{opacity:1}
+  td .copy-btn:hover{color:var(--grn);border-color:var(--grn)}
+  td .copy-btn.curl-btn:hover{color:var(--cy);border-color:var(--cy)}
+  td .idx{color:var(--dim);font-variant-numeric:tabular-nums}
+  /* Health cell: dot + status + RTT + last-seen */
+  .health{display:flex;align-items:center;gap:8px;min-width:170px}
+  .hdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:var(--dim)}
+  .hspark{width:48px;height:18px;flex-shrink:0;display:block}
+  .hdot.ok{background:var(--ok);box-shadow:0 0 5px rgba(63,185,80,.6)}
+  .hdot.warn{background:var(--warn)}
+  .hdot.bad{background:var(--bad);box-shadow:0 0 5px rgba(248,81,73,.6)}
+  .hdot.unknown{background:var(--dim);opacity:.4}
+  .hmeta{display:flex;flex-direction:column;line-height:1.25;font-size:10px;color:var(--dim)}
+  .hmeta .status{font-weight:700;color:var(--fg2);font-size:11px;letter-spacing:.2px}
+  .hmeta .status.bad{color:var(--bad);background:rgba(248,81,73,.12);padding:0 5px;border-radius:3px}
+  .hmeta .status.warn{color:var(--warn);background:rgba(210,153,34,.1);padding:0 5px;border-radius:3px}
+  .hmeta .sub{color:var(--dim)}
+  .errbadge{display:inline-block;font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;
+    margin-left:5px;line-height:14px;vertical-align:middle;border:1px solid;cursor:default}
+  .errbadge.warn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.1)}
+  .errbadge.bad{color:var(--bad);border-color:var(--bad);background:rgba(248,81,73,.12)}
+  .empty{padding:50px;text-align:center;color:var(--dim)}
+  .empty .big{font-size:30px;color:var(--ylw);margin-bottom:10px;font-weight:700}
+  .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
+
+  /* ── Flag chips ───────────────────────────────────────────────────── */
+  .flags{display:flex;gap:5px;flex-wrap:wrap}
+  .chip{font-size:9px;padding:2px 7px;border-radius:10px;border:1px solid var(--bd2);
+    color:var(--dim);text-transform:uppercase;letter-spacing:.4px;cursor:default}
+  .chip.on{color:var(--grn);border-color:var(--grn);background:rgba(63,185,80,.08)}
+
+  /* ── Footer ───────────────────────────────────────────────────────── */
+  footer{padding:9px 20px;border-top:1px solid var(--bd);background:var(--pnl);
+    color:var(--dim);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
+  .err{color:var(--red)}
+  .toast{position:fixed;bottom:54px;left:50%;transform:translateX(-50%) translateY(20px);
+    background:var(--grn);color:#fff;padding:8px 18px;border-radius:6px;font-size:12px;font-weight:600;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:100;box-shadow:0 4px 14px rgba(0,0,0,.3)}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.warn{background:var(--warn)}
+  .kbd{display:inline-block;padding:1px 5px;border:1px solid var(--bd);border-radius:3px;
+    background:var(--pnl2);color:var(--dim);font-size:9px;font-weight:700}
+  /* Help overlay (? key) */
+  .help-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:300;padding:20px}
+  .help-overlay.open{display:flex}
+  .help-card{background:var(--pnl);border:1px solid var(--bd);border-radius:10px;width:100%;max-width:440px;max-height:85vh;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+  .help-head{padding:14px 18px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:700;color:var(--fg2)}
+  .help-close{background:none;border:0;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px}
+  .help-close:hover{color:var(--red)}
+  .help-body{padding:10px 18px;overflow:auto}
+  .help-row{display:flex;align-items:center;gap:12px;padding:7px 0;border-bottom:1px solid var(--bd2)}
+  .help-row:last-child{border-bottom:0}
+  .help-row .kbd{min-width:36px;text-align:center;font-size:10px;padding:2px 6px}
+  .help-row span:last-child{color:var(--fg);font-size:12px}
+  .help-foot{padding:10px 18px;border-top:1px solid var(--bd2);color:var(--dim);font-size:10px}
+</style>
+</head>
+<body>
+<header>
+  <span class="pulse" id="pulse" title="connection health"></span>
+  <h1>S2L <span class="v">MULTIPORT</span> Viewer</h1>
+  <span class="target" id="target-wrap">
+    <span id="target"></span>
+    <span class="waf-badge" id="waf-badge" title="most recently detected upstream WAF/platform"><span class="dot"></span><span id="waf-name">—</span></span>
+  </span>
+  <span class="proxy" id="proxy" title="proxy listen address"></span>
+  <span class="uptime" id="uptime" title="process uptime">—</span>
+  <div class="stats">
+    <div class="stat" data-tip="CDN hosts with a dedicated port"><span class="n" id="s-active">0</span><span class="l">active</span></div>
+    <div class="stat" data-tip="CDN servers still starting up"><span class="n" id="s-pending">0</span><span class="l">pending</span></div>
+    <div class="stat" data-tip="CDN hosts sharing /__s2l_ext__/ (no dedicated port)"><span class="n" id="s-shared">0</span><span class="l">shared</span></div>
+    <div class="stat" data-tip="Total requests proxied through the main server"><span class="n" id="s-proxied">0</span><span class="l">proxied</span></div>
+    <div class="stat" data-tip="CDN assets fetched from upstream"><span class="n" id="s-cdn">0</span><span class="l">cdn</span></div>
+    <div class="stat" data-tip="HTTP request+response pairs written to captures/"><span class="n" id="s-cap">0</span><span class="l">captured</span></div>
+    <div class="stat" data-tip="WebSocket messages written to captures_ws/"><span class="n" id="s-wscap">0</span><span class="l">ws msg</span></div>
+  </div>
+</header>
+
+<!-- Throughput chart (60s rolling window, sampled from req_per_s) -->
+<div class="chart-card">
+  <div class="chart-head">
+    <span class="chart-title">Throughput · last 60 s</span>
+    <span class="chart-legend">
+      <span class="leg"><span class="sw cur"></span>now</span>
+      <span class="leg"><span class="sw peak"></span>peak</span>
+      <span class="leg"><span class="sw avg"></span>avg</span>
+    </span>
+    <div class="chart-vals">
+      <span class="kv cur"><span class="k">now</span><span class="v" id="cv-cur">0.0/s</span></span>
+      <span class="kv peak"><span class="k">peak</span><span class="v" id="cv-peak">0.0/s</span></span>
+      <span class="kv avg"><span class="k">avg</span><span class="v" id="cv-avg">0.0/s</span></span>
+      <span class="kv"><span class="k">total</span><span class="v" id="cv-total">0</span></span>
+    </div>
+  </div>
+  <svg class="chart-svg" id="chart" viewBox="0 0 600 64" preserveAspectRatio="none">
+    <defs><linearGradient id="chartgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--acc)" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="var(--acc)" stop-opacity="0"/>
+    </linearGradient></defs>
+    <g class="chart-grid">
+      <line x1="0" y1="16" x2="600" y2="16"/>
+      <line x1="0" y1="32" x2="600" y2="32"/>
+      <line x1="0" y1="48" x2="600" y2="48"/>
+    </g>
+    <path class="chart-area" id="chart-area" d=""/>
+    <polyline class="chart-line" id="chart-line" points=""/>
+    <circle class="chart-cur" id="chart-cur" cx="0" cy="64" r="3"/>
+  </svg>
+  <!-- Per-host request breakdown: a stacked horizontal bar showing each active
+       CDN host's share of total requests, with a legend. Renders from
+       active[].health.requests. Lets you see at a glance which host dominates
+       traffic without a full multi-series chart. -->
+  <div class="host-bar-wrap" id="host-bar-wrap">
+    <div class="host-bar" id="host-bar"></div>
+    <div class="host-bar-legend" id="host-bar-legend"></div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <div class="bar-group">
+    <span>refresh</span><span class="rate" id="rate">50ms</span>
+    <select class="sel" id="rate-sel" title="change poll interval">
+      <option value="50">50 ms</option>
+      <option value="250">250 ms</option>
+      <option value="1000">1 s</option>
+      <option value="2000">2 s</option>
+      <option value="0">paused</option>
+    </select>
+  </div>
+  <div class="search">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04a.75.75 0 1 1-1.06 1.06l-3.04-3.04Z"/></svg>
+    <input type="text" id="filter" placeholder="filter CDN hosts…" autocomplete="off">
+    <span class="count" id="filter-count"></span>
+  </div>
+  <button class="btn" id="pause-btn" title="pause / resume polling (P)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5v9a.5.5 0 0 0 .8.4l7-4.5a.5.5 0 0 0 0-.8l-7-4.5A.5.5 0 0 0 5 3.5Z"/></svg>
+    <span id="pause-label">Pause</span>
+  </button>
+  <button class="btn" id="open-all-btn" title="open every CDN port in a new tab (O)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2A1.75 1.75 0 0 0 2 3.75v8.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 12.25v-8.5A1.75 1.75 0 0 0 12.25 2h-8.5ZM5 10.75a.75.75 0 0 1 .75-.75h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1-.75-.75Z"/></svg>
+    Open all
+  </button>
+  <button class="btn" id="copy-all-btn" title="copy all CDN URLs to clipboard (Shift+A)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>
+    Copy all
+  </button>
+  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="browse recorded HTTP/WS captures (C)" style="text-decoration:none">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25Z"/><path d="M5 5.75A.75.75 0 0 1 5.75 5h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 5.75Zm0 3A.75.75 0 0 1 5.75 8h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 8.75Zm0 3a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1-.75-.75Z"/></svg>
+    Captures
+  </a>
+  <button class="btn" id="reset-btn" title="reset all counters for a clean benchmark window (R)" style="border-color:var(--warn);color:var(--warn)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 1-4.546 2.914.75.75 0 0 0-1.36-.632A6.5 6.5 0 1 0 8 1.5v-.994a.25.25 0 0 0-.382-.214L4.5 2.5l3.118 1.993A.25.25 0 0 0 8 4.279Z"/></svg>
+    Reset
+  </button>
+  <button class="btn" id="export-btn" title="export as JSON / CSV (E)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14Z"/><path d="M7.25 7.69V1.75a.75.75 0 0 1 1.5 0v5.94l1.97-1.97a.75.75 0 1 1 1.06 1.06L8 11.06 4.22 7.28a.75.75 0 0 1 1.06-1.06l1.97 1.47Z"/></svg>
+    Export
+  </button>
+  <button class="btn" id="theme-btn" title="toggle dark / light theme (T)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6Zm0-4.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3ZM8 0a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V.75A.75.75 0 0 1 8 0Zm0 13a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 13ZM2.34 2.34a.75.75 0 0 1 1.06 0l1.06 1.06A.75.75 0 0 1 3.4 4.46L2.34 3.4a.75.75 0 0 1 0-1.06Zm9.14 9.14a.75.75 0 0 1 1.06 0l1.06 1.06a.75.75 0 1 1-1.06 1.06l-1.06-1.06a.75.75 0 0 1 0-1.06ZM0 8a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 0 8Zm13 0a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 13 8ZM2.34 13.66a.75.75 0 0 1 0-1.06l1.06-1.06a.75.75 0 1 1 1.06 1.06l-1.06 1.06a.75.75 0 0 1-1.06 0Zm9.14-9.14a.75.75 0 0 1 0-1.06l1.06-1.06a.75.75 0 1 1 1.06 1.06l-1.06 1.06a.75.75 0 0 1-1.06 0Z"/></svg>
+    Theme
+  </button>
+</div>
+<main>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th class="sortable" data-sort="idx" style="width:42px">#<span class="caret"></span></th>
+      <th class="sortable" data-sort="host">CDN HOST<span class="caret"></span></th>
+      <th class="sortable" data-sort="port" style="width:80px">PORT<span class="caret"></span></th>
+      <th style="width:170px">HEALTH</th>
+      <th class="sortable" data-sort="url">LOCAL URL<span class="caret"></span></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  </div>
+  <div class="empty" id="empty" style="display:none">
+    <div class="big">No MULTIPORT CDNs yet</div>
+    <div class="sub">They appear here in real time as the proxy registers them.<br>Browse the target site to populate this table.</div>
+  </div>
+</main>
+<footer>
+  <span id="ft-left">S2L web viewer · <span class="tag" id="latency">— ms</span> · <span class="kbd">P</span> pause <span class="kbd">T</span> theme <span class="kbd">E</span> export <span class="kbd">O</span> open-all <span class="kbd">⇧A</span> copy-all <span class="kbd">C</span> captures <span class="kbd">R</span> reset <span class="kbd">/</span> filter <span class="kbd">?</span> help</span>
+  <span class="flags" id="flags"></span>
+  <span id="ft-right">—</span>
+</footer>
+<div class="toast" id="toast"></div>
+<!-- Help overlay (? key) -->
+<div class="help-overlay" id="help-overlay">
+  <div class="help-card">
+    <div class="help-head"><span>S2L Viewer — Keyboard Shortcuts</span><button class="help-close" id="help-close">&times;</button></div>
+    <div class="help-body">
+      <div class="help-row"><span class="kbd">P</span><span>pause / resume polling</span></div>
+      <div class="help-row"><span class="kbd">T</span><span>toggle dark / light theme</span></div>
+      <div class="help-row"><span class="kbd">E</span><span>export as JSON (Shift+E = CSV)</span></div>
+      <div class="help-row"><span class="kbd">O</span><span>open all CDN ports in new tabs</span></div>
+      <div class="help-row"><span class="kbd">⇧A</span><span>copy all CDN URLs to clipboard</span></div>
+      <div class="help-row"><span class="kbd">C</span><span>open the capture browser</span></div>
+      <div class="help-row"><span class="kbd">R</span><span>reset all counters (benchmark window)</span></div>
+      <div class="help-row"><span class="kbd">/</span><span>focus the CDN host filter</span></div>
+      <div class="help-row"><span class="kbd">?</span><span>toggle this help overlay</span></div>
+      <div class="help-row"><span class="kbd">Esc</span><span>close overlay / modal</span></div>
+    </div>
+    <div class="help-foot">click any column header to sort · hover a row for copy/cURL buttons</div>
+  </div>
+</div>
+<script>
+(function(){
+  "use strict";
+  var DEFAULT_REFRESH=50, rowsEl=document.getElementById("rows"), empty=document.getElementById("empty");
+  var rowMap=Object.create(null);
+  var inFlight=false, consecutiveErr=0, paused=false, refreshMs=DEFAULT_REFRESH;
+  var sortKey="idx", sortDir="asc", filterText="";
+  var chartData=[];                 // rolling history of req_per_s (last 120 samples = ~60s at 500ms, but we sample every poll)
+  var CHART_MAX=120;
+  var lastData=null;
+
+  // ── Theme persistence ────────────────────────────────────────────────
+  function applyStoredTheme(){
+    var t = localStorage.getItem("s2l-theme");
+    if(t === "light") document.documentElement.setAttribute("data-theme","light");
+  }
+  applyStoredTheme();
+
+  // ── Deep-linking: ?host=<hostname> pre-filters the CDN table on load.
+  // Lets the capture browser's "back to viewer" link return to a filtered
+  // view, and lets users bookmark/share a focused view of one CDN host.
+  (function(){
+    var m = location.search.match(/[?&]host=([^&]+)/);
+    if(m){
+      filterText = decodeURIComponent(m[1]).trim();
+      // Defer setting the input value until the filter element exists (it's
+      // created below in the same IIFE). We'll apply it after DOM init.
+      setTimeout(function(){
+        var el = document.getElementById("filter");
+        if(el){ el.value = filterText; }
+      }, 0);
+    }
+  })();
+
+  function $(id){return document.getElementById(id);}
+  function setText(el,v){ if(el.textContent!==v) el.textContent=v; }
+  function fmtUptime(s){
+    if(s<60) return s+"s";
+    if(s<3600) return Math.floor(s/60)+"m "+(s%60)+"s";
+    if(s<86400) return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m";
+    return Math.floor(s/86400)+"d "+Math.floor((s%86400)/3600)+"h";
+  }
+  function fmtAgo(s){
+    if(s<2) return "now";
+    if(s<60) return Math.floor(s)+"s ago";
+    if(s<3600) return Math.floor(s/60)+"m ago";
+    return Math.floor(s/3600)+"h ago";
+  }
+  function showToast(msg, kind){
+    var t=$("toast"); t.textContent=msg; t.className="toast"+(kind?" "+kind:""); t.classList.add("show");
+    clearTimeout(t._tid); t._tid=setTimeout(function(){t.classList.remove("show");},1800);
+  }
+  function pulse(state){
+    var p=$("pulse"); p.className="pulse"+(state==="stale"?" stale":state==="dead"?" dead":"");
+  }
+
+  // ── Throughput chart (SVG) ───────────────────────────────────────────
+  function renderChart(rps){
+    chartData.push(rps);
+    if(chartData.length>CHART_MAX) chartData.shift();
+    var n=chartData.length;
+    var peak=0, sum=0;
+    for(var i=0;i<n;i++){ peak=Math.max(peak,chartData[i]); sum+=chartData[i]; }
+    var avg = n? sum/n : 0;
+    setText($("cv-cur"), rps.toFixed(1)+"/s");
+    setText($("cv-peak"), peak.toFixed(1)+"/s");
+    setText($("cv-avg"), avg.toFixed(1)+"/s");
+    setText($("cv-total"), lastData? (lastData.proxied||0) : 0);
+
+    var w=600, h=64, max=Math.max(peak, 0.5);
+    var step = n>1 ? w/(CHART_MAX-1) : 0;
+    var pts=[], areaPts=[];
+    for(var j=0;j<n;j++){
+      var x = j*step;
+      var y = h - 2 - (chartData[j]/max)*(h-6);
+      pts.push(x.toFixed(1)+","+y.toFixed(1));
+    }
+    // Area path: start at bottom-left, trace the line, close at bottom-right.
+    var areaD = "M0,"+h+" L" + pts.join(" L") + " "+((n-1)*step).toFixed(1)+","+h+" Z";
+    $("chart-line").setAttribute("points", pts.join(" "));
+    $("chart-area").setAttribute("d", areaD);
+    if(n){
+      var lx=(n-1)*step, ly=h-2-(chartData[n-1]/max)*(h-6);
+      var cc=$("chart-cur"); cc.setAttribute("cx",lx.toFixed(1)); cc.setAttribute("cy",ly.toFixed(1));
+    }
+  }
+
+  // ── Per-host request-share bar (stacked) ─────────────────────────────
+  // Shows each active CDN host's share of total requests as a colored segment
+  // in a horizontal bar, with a legend. Uses a fixed palette cycled by host
+  // index so each host gets a stable color. Renders from active[].health.requests.
+  var HOST_COLORS = ["#58a6ff","#3fb950","#d29922","#bc8cff","#f85149","#79c0ff","#56d4dd","#ff7b72","#7ee787","#ffa657"];
+  function renderHostBar(active){
+    var bar=$("host-bar"), leg=$("host-bar-legend");
+    if(!active || !active.length){ bar.innerHTML=""; leg.innerHTML=""; return; }
+    // Sum requests across active hosts (skip hosts with no health record).
+    var items=[];
+    var total=0;
+    active.forEach(function(h,i){
+      var reqs = (h.health && h.health.requests) ? h.health.requests : 0;
+      if(reqs>0){ items.push({host:h.host, reqs:reqs, color:HOST_COLORS[i % HOST_COLORS.length]}); total+=reqs; }
+    });
+    if(!total){ bar.innerHTML=""; leg.innerHTML='<span style="color:var(--dim)">no per-host request data yet</span>'; return; }
+    // Build segments (sorted desc so the biggest hosts are on the left).
+    items.sort(function(a,b){return b.reqs-a.reqs;});
+    var segs=[], legs=[];
+    items.forEach(function(it){
+      var pct = (it.reqs/total*100);
+      segs.push('<div class="seg" style="width:'+pct.toFixed(2)+'%;background:'+it.color+'" title="'+it.host+': '+it.reqs+' req ('+pct.toFixed(1)+'%)"></div>');
+      legs.push('<span class="lh"><span class="sw" style="background:'+it.color+'"></span>'+it.host+'<span class="pct">'+pct.toFixed(0)+'%</span></span>');
+    });
+    bar.innerHTML=segs.join("");
+    leg.innerHTML=legs.join("");
+  }
+
+  // ── WAF badge ────────────────────────────────────────────────────────
+  var KNOWN_WAFS = ["Cloudflare","Akamai","Sucuri WAF","Imperva/Incapsula","AWS CloudFront","Fastly","ESF","F5 BIG-IP","Citrix Netscaler","Reblaze","Distil"];
+  function renderWAF(plat){
+    var name = (plat && plat.name) || "Unknown";
+    var age = (plat && plat.age_s) || 0;
+    var badge=$("waf-badge"), nm=$("waf-name");
+    setText(nm, name);
+    var known = KNOWN_WAFS.indexOf(name) !== -1;
+    badge.className = "waf-badge"+(known?" known":"");
+    badge.title = "detected upstream WAF/platform: "+name+(age?(" · "+fmtAgo(age)):"");
+  }
+
+  // ── Health cell per host ─────────────────────────────────────────────
+  function healthHTML(h){
+    if(!h) return '<div class="health"><span class="hdot unknown"></span><span class="hmeta"><span class="sub">no traffic yet</span></span></span></div>';
+    var cls = "ok", statusCls="";
+    var st = h.last_status||0;
+    if(st===0 || st>=500){ cls="bad"; statusCls="bad"; }
+    else if(st>=400 || h.errors>0){ cls="warn"; statusCls="warn"; }
+    var ago = h.last_seen ? fmtAgo(Date.now()/1000 - h.last_seen) : "—";
+    var rtt = (h.last_rtt_ms!=null) ? h.last_rtt_ms+"ms" : "—";
+    var reqs = h.requests||0;
+    var errs = h.errors||0;
+    // Error-rate badge: only shown when the host has errors, so a clean host
+    // stays uncluttered. Color escalates with the error rate (warn < 10%,
+    // bad >= 10% or any 5xx in the last sample).
+    var errBadge = "";
+    if(errs > 0){
+      var rate = reqs>0 ? (errs/reqs*100) : 100;
+      var ecls = (rate>=10 || st>=500) ? "bad" : "warn";
+      errBadge = '<span class="errbadge '+ecls+'" title="'+errs+' error(s) in '+reqs+' request(s) ('+rate.toFixed(1)+'%)">!'+errs+'</span>';
+    }
+    // Mini RTT sparkline from rtt_history (up to 20 samples). Color matches
+    // the health dot so a degrading host's sparkline turns amber/red too.
+    var spark = "";
+    var hist = h.rtt_history || [];
+    if(hist.length >= 2){
+      var w=48, hh=18, n=hist.length, mx=Math.max.apply(null,hist), mn=Math.min.apply(null,hist);
+      var range=(mx-mn)||1, pts=[];
+      for(var i=0;i<n;i++){
+        var x=(i/(n-1))*w;
+        var y=hh-1-((hist[i]-mn)/range)*(hh-2);
+        pts.push(x.toFixed(1)+","+y.toFixed(1));
+      }
+      var lastx=w, lasty=hh-1-((hist[n-1]-mn)/range)*(hh-2);
+      var scol = cls==="ok"?"var(--grn)":cls==="warn"?"var(--warn)":"var(--bad)";
+      spark = '<svg class="hspark" viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" title="RTT trend: '+mn+'–'+mx+'ms">'
+        + '<polyline points="'+pts.join(" ")+'" fill="none" stroke="'+scol+'" stroke-width="1.3" stroke-linejoin="round"/>'
+        + '<circle cx="'+lastx.toFixed(1)+'" cy="'+lasty.toFixed(1)+'" r="1.6" fill="'+scol+'"/>'
+        + '</svg>';
+    }
+    var ariaLabel = "host health: status "+(st||"unknown")+", "+rtt+" RTT, "+reqs+" requests"+(errs?(", "+errs+" errors"):"")+", seen "+ago;
+    return '<div class="health" role="img" aria-label="'+ariaLabel+'"><span class="hdot '+cls+'" aria-hidden="true"></span>'+spark
+      + '<span class="hmeta"><span class="status '+statusCls+'">'+(st||"—")+'</span>'+errBadge
+      + '<span class="sub">'+rtt+' · '+ago+' · '+reqs+' req</span></span></div>';
+  }
+
+  // ── Sorting + filtering ──────────────────────────────────────────────
+  function applySortFilter(active){
+    var f=filterText.toLowerCase();
+    var filtered = !f ? active : active.filter(function(h){
+      return h.host.toLowerCase().indexOf(f)!==-1 || String(h.port).indexOf(f)!==-1 || h.url.toLowerCase().indexOf(f)!==-1;
+    });
+    filtered.sort(function(a,b){
+      var av=a[sortKey], bv=b[sortKey];
+      if(sortKey==="idx"){ av=active.indexOf(a)+1; bv=active.indexOf(b)+1; }
+      if(sortKey==="port"){ av=a.port; bv=b.port; }
+      var r = av<bv?-1:av>bv?1:0;
+      return sortDir==="asc"? r : -r;
+    });
+    return filtered;
+  }
+
+  function renderFlags(flags){
+    var el=$("flags"), order=["CAPTURE","CAPTURE_WS","HOOK_GUI","MULTIPORT","PROXY_CDN","CACHE_CDN",
+                              "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT"];
+    var html=[];
+    for(var i=0;i<order.length;i++){
+      var k=order[i], on=!!flags[k];
+      html.push('<span class="chip '+(on?"on":"")+'" title="'+k+' = '+(on?"on":"off")+'">'+k.replace(/_/g," ")+'</span>');
+    }
+    el.innerHTML=html.join("");
+  }
+
+  function render(d){
+    lastData=d;
+    $("rate").textContent = (d.refresh_ms||DEFAULT_REFRESH)+"ms";
+    setText($("target"), d.target||"");
+    setText($("proxy"), d.proxy||"");
+    setText($("uptime"), "⏱ "+fmtUptime(d.uptime_s||0));
+    setText($("s-active"), String(d.active.length));
+    setText($("s-pending"), String(d.pending||0));
+    setText($("s-shared"), String(d.shared||0));
+    setText($("s-proxied"), String(d.proxied||0));
+    setText($("s-cdn"), String(d.cdn_fetched||0));
+    setText($("s-cap"), String(d.captured||0));
+    setText($("s-wscap"), String(d.ws_captured||0));
+    setText($("latency"), ($("latency")._last||"—")+" ms");
+    if(d.platform) renderWAF(d.platform);
+    if(d.flags) renderFlags(d.flags);
+    renderChart(d.req_per_s||0);
+    renderHostBar(d.active);
+
+    var sorted = applySortFilter(d.active);
+    var seen=Object.create(null), frag=document.createDocumentFragment();
+    for(var i=0;i<sorted.length;i++){
+      var h=sorted[i], key=h.host;
+      seen[key]=true;
+      var r=rowMap[key];
+      if(!r){
+        var tr=document.createElement("tr");
+        var cN=document.createElement("td"), cH=document.createElement("td"),
+            cP=document.createElement("td"), cHl=document.createElement("td"), cU=document.createElement("td");
+        cH.className="host"; cP.className="port";
+        var a=document.createElement("a"); a.href=h.url; a.target="_blank"; a.textContent=h.url; a.title=h.url;
+        var cb=document.createElement("button"); cb.className="copy-btn"; cb.textContent="copy";
+        (function(url,btn){btn.onclick=function(ev){ev.preventDefault();ev.stopPropagation();
+          navigator.clipboard && navigator.clipboard.writeText(url);
+          btn.closest("tr").classList.add("copy-flash");
+          setTimeout(function(){btn.closest("tr").classList.remove("copy-flash");},800);
+          showToast("Copied "+url);};})(h.url,cb);
+        // "cURL" button: copies a ready-to-paste `curl` command for this CDN host
+        // (GET the local URL with a browser-like UA + Accept header) so a
+        // developer can instantly debug a host from the terminal.
+        var curlBtn=document.createElement("button"); curlBtn.className="copy-btn curl-btn"; curlBtn.textContent="cURL";
+        (function(host,url,btn){btn.onclick=function(ev){ev.preventDefault();ev.stopPropagation();
+          var cmd='curl -sS -D - "'+url+'/" \\\n  -H "User-Agent: Mozilla/5.0 (site2local)" \\\n  -H "Accept: */*"';
+          if(navigator.clipboard && navigator.clipboard.writeText){
+            navigator.clipboard.writeText(cmd).then(function(){
+              btn.closest("tr").classList.add("copy-flash");
+              setTimeout(function(){btn.closest("tr").classList.remove("copy-flash");},800);
+              showToast("Copied cURL command for "+host);
+            }, function(){ showToast("Clipboard write failed","warn"); });
+          } else {
+            var ta=document.createElement("textarea"); ta.value=cmd; document.body.appendChild(ta);
+            ta.select(); try{document.execCommand("copy"); showToast("Copied cURL for "+host);}catch(e){showToast("Copy failed","warn");}
+            ta.remove();
+          }
+        };})(h.host,h.url,curlBtn);
+        cU.appendChild(a); cU.appendChild(cb); cU.appendChild(curlBtn);
+        tr.appendChild(cN); tr.appendChild(cH); tr.appendChild(cP); tr.appendChild(cHl); tr.appendChild(cU);
+        tr.className="new";
+        frag.appendChild(tr);
+        rowMap[key]={tr:tr, cN:cN, cH:cH, cP:cP, cHl:cHl, cU:a};
+      } else { frag.appendChild(r.tr); }
+      r=rowMap[key];
+      setText(r.cN, String(i+1));
+      r.cN.className="idx";
+      setText(r.cH, h.host);
+      setText(r.cP, ":"+h.port);
+      r.cHl.innerHTML = healthHTML(h.health);
+      if(r.cU.textContent!==h.url){ r.cU.textContent=h.url; r.cU.href=h.url; r.cU.title=h.url; }
+    }
+    for(var k in rowMap){ if(!seen[k]){ rowMap[k].tr.remove(); delete rowMap[k]; } }
+    rowsEl.appendChild(frag);
+    var visibleCount = Object.keys(rowMap).length;
+    setText($("filter-count"), filterText ? visibleCount+"/"+d.active.length : "");
+    empty.style.display = d.active.length? "none":"block";
+    var ths=document.querySelectorAll("th.sortable");
+    for(var j=0;j<ths.length;j++){
+      var th=ths[j];
+      th.classList.remove("sorted-asc","sorted-desc");
+      if(th.getAttribute("data-sort")===sortKey){
+        th.classList.add(sortDir==="asc"?"sorted-asc":"sorted-desc");
+      }
+    }
+  }
+
+  function poll(){
+    if(inFlight || paused || refreshMs===0){ schedule(); return; }
+    inFlight=true;
+    var t0=performance.now();
+    var p = (window.__qaPoll ? window.__qaPoll() :
+             fetch("/__s2l_viewer_data__",{cache:"no-store"}).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}));
+    p.then(function(d){
+      var lat=Math.round(performance.now()-t0);
+      $("latency")._last=lat; $("latency").textContent=lat+" ms"; $("latency").className="tag ok";
+      render(d); consecutiveErr=0; pulse("ok");
+      $("ft-right").textContent="OK"; $("ft-right").className="";
+    }).catch(function(e){
+      consecutiveErr++;
+      $("ft-right").textContent=String(e); $("ft-right").className="err";
+      if(consecutiveErr>3) pulse("dead"); else pulse("stale");
+    }).then(function(){ inFlight=false; schedule(); });
+  }
+  function schedule(){ if(paused||refreshMs===0) return; setTimeout(poll, refreshMs); }
+
+  // ── Controls ─────────────────────────────────────────────────────────
+  $("rate-sel").addEventListener("change", function(e){
+    var v=parseInt(e.target.value,10);
+    if(v===0){ paused=true; $("pause-label").textContent="Resume"; $("pause-btn").classList.add("active"); refreshMs=DEFAULT_REFRESH; }
+    else { paused=false; refreshMs=v; $("pause-label").textContent="Pause"; $("pause-btn").classList.remove("active"); schedule(); }
+  });
+  $("pause-btn").addEventListener("click", function(){
+    paused=!paused;
+    $("pause-label").textContent=paused?"Resume":"Pause";
+    this.classList.toggle("active",paused);
+    $("rate-sel").value = paused? "0" : String(refreshMs);
+    if(!paused) schedule();
+    showToast(paused?"Polling paused":"Polling resumed");
+  });
+  $("theme-btn").addEventListener("click", function(){
+    var cur=document.documentElement.getAttribute("data-theme");
+    var next = cur==="light" ? "" : "light";
+    if(next) document.documentElement.setAttribute("data-theme",next);
+    else document.documentElement.removeAttribute("data-theme");
+    localStorage.setItem("s2l-theme", next||"dark");
+    showToast((next==="light"?"Light":"Dark")+" theme");
+  });
+  function exportJSON(){
+    if(!lastData){ showToast("No data yet"); return; }
+    var blob=new Blob([JSON.stringify(lastData,null,2)],{type:"application/json"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a"); a.href=url; a.download="s2l_viewer_"+(lastData.ts||"snap").replace(/:/g,"")+".json";
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Exported JSON ("+lastData.active.length+" hosts)");
+  }
+  function exportCSV(){
+    if(!lastData || !lastData.active.length){ showToast("No CDN hosts to export","warn"); return; }
+    var rows=[["host","port","url","last_status","last_rtt_ms","requests","errors","last_seen"]];
+    lastData.active.forEach(function(h){
+      var hl=h.health||{};
+      rows.push([h.host,h.port,h.url,hl.last_status||"",hl.last_rtt_ms||"",hl.requests||"",hl.errors||"",hl.last_seen?new Date(hl.last_seen*1000).toISOString():""]);
+    });
+    var csv=rows.map(function(r){return r.map(function(c){var s=String(c);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}).join(",");}).join("\n");
+    var blob=new Blob([csv],{type:"text/csv"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a"); a.href=url; a.download="s2l_cdn_"+(lastData.ts||"snap").replace(/:/g,"")+".csv";
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Exported CSV ("+lastData.active.length+" hosts)");
+  }
+  // Export button: click = JSON, shift+click = CSV.
+  $("export-btn").addEventListener("click", function(e){
+    if(e.shiftKey) exportCSV(); else exportJSON();
+  });
+  $("open-all-btn").addEventListener("click", function(){
+    if(!lastData || !lastData.active.length){ showToast("No CDN hosts to open","warn"); return; }
+    if(lastData.active.length>5 && !confirm("Open "+lastData.active.length+" CDN URLs in new tabs?")) return;
+    lastData.active.forEach(function(h){
+      window.open(h.url, "_blank", "noopener");
+    });
+    showToast("Opened "+lastData.active.length+" CDN URLs");
+  });
+  // Copy all CDN URLs to clipboard (one per line), for pasting into scripts.
+  $("copy-all-btn").addEventListener("click", function(){
+    if(!lastData || !lastData.active.length){ showToast("No CDN hosts to copy","warn"); return; }
+    var urls = lastData.active.map(function(h){ return h.url; }).join("\n");
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(urls).then(function(){
+        showToast("Copied "+lastData.active.length+" CDN URLs to clipboard");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      // Fallback: select a temp textarea.
+      var ta=document.createElement("textarea"); ta.value=urls; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied "+lastData.active.length+" CDN URLs");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
+  });
+  $("filter").addEventListener("input", function(e){ filterText=e.target.value.trim();
+    if(lastData) render(lastData); });
+  var ths=document.querySelectorAll("th.sortable");
+  for(var i=0;i<ths.length;i++){
+    ths[i].addEventListener("click", function(){
+      var key=this.getAttribute("data-sort");
+      if(sortKey===key){ sortDir = sortDir==="asc"?"desc":"asc"; }
+      else { sortKey=key; sortDir="asc"; }
+      if(lastData) render(lastData);
+    });
+  }
+  // Reset stats: POST to /__s2l_reset_stats__ (zeroes counters + event log).
+  $("reset-btn").addEventListener("click", function(){
+    if(!confirm("Reset all counters to zero? (for a clean benchmark window)")) return;
+    fetch("/__s2l_reset_stats__",{method:"POST",cache:"no-store"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        showToast("Stats reset — counters zeroed");
+        // Force an immediate poll so the UI reflects the reset.
+        if(lastData){ lastData.captured=0; lastData.ws_captured=0; lastData.proxied=0; lastData.cdn_fetched=0; lastData.req_per_s=0; render(lastData); }
+        chartData=[]; renderChart(0);
+      })
+      .catch(function(e){ showToast("Reset failed: "+e,"warn"); });
+  });
+  // Help overlay (? key) — discoverable keyboard shortcut reference.
+  var helpOverlay=document.getElementById("help-overlay");
+  function toggleHelp(){ helpOverlay.classList.toggle("open"); }
+  document.getElementById("help-close").onclick=function(){ helpOverlay.classList.remove("open"); };
+  helpOverlay.addEventListener("click", function(e){ if(e.target===this) helpOverlay.classList.remove("open"); });
+  document.addEventListener("keydown", function(e){
+    if(e.target.tagName==="INPUT") return;
+    if(e.key==="?" || (e.shiftKey && e.key==="/")){ e.preventDefault(); toggleHelp(); return; }
+    if(e.key==="Escape"){ helpOverlay.classList.remove("open"); return; }
+    if(e.key==="p"||e.key==="P"){ $("pause-btn").click(); }
+    else if(e.key==="t"||e.key==="T"){ $("theme-btn").click(); }
+    else if(e.key==="e"||e.key==="E"){ $("export-btn").click(); }
+    else if(e.key==="o"||e.key==="O"){ $("open-all-btn").click(); }
+    else if(e.key==="r"||e.key==="R"){ $("reset-btn").click(); }
+    else if(e.key==="c"||e.key==="C"){ window.open("/__s2l_captures__","_blank"); }
+    else if(e.shiftKey && (e.key==="a"||e.key==="A")){ $("copy-all-btn").click(); }
+    else if(e.key==="/"){ e.preventDefault(); $("filter").focus(); }
+  });
+
+  poll();
+})();
+</script>
+</body>
+</html>"""
+    resp = Response(page, content_type="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
 @app.route(f"{_EXT_PREFIX}/<path:extpath>", methods=_ALL_METHODS)
 def ext_asset(extpath: str) -> Response:
     slash = extpath.find("/")
@@ -9141,441 +10906,6 @@ def udp_ext(_udppath: str) -> Response:
     return Response("This path is a raw UDP tunnel — send Upgrade: websocket",
                     status=426, headers={"Upgrade": "websocket"})
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FIREFOX_PROXY — MITM forward proxy for the actual browser
-#
-# Firefox (like every browser) exempts "localhost"/"127.0.0.1" from whatever
-# proxy is configured in its network settings — there's no way to see traffic
-# the browser sends to our OWN reverse-proxy port by pointing Firefox's proxy
-# at us. The workaround: Firefox does NOT exempt the real target domain, so
-# if the browser tab stays on the real domain, that traffic DOES get routed
-# through this proxy like any other site — and for the one domain actively
-# being cloned (MAIN_HOST, or a registered MULTIPORT CDN host) we
-# transparently redirect it to the local site2local server instead of the
-# real internet. That's the "passthru": the browser never notices, it's just
-# talking to the real domain as far as it's concerned. Every OTHER domain
-# visited while this is on gets relayed to the real upstream untouched,
-# purely for inspection/hooking (the Firefox Proxy tab below).
-#
-# This is a real man-in-the-middle: it terminates TLS using a locally
-# generated root CA (one-time Firefox import — instructions are logged at
-# startup) and a fresh leaf certificate per host, signed by that CA. Nothing
-# here calls out anywhere; the CA only ever needs to be trusted by the one
-# browser pointed at this port, on this machine.
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    from cryptography import x509
-    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    _CRYPTOGRAPHY_OK = True
-except ImportError:
-    _CRYPTOGRAPHY_OK = False
-
-_CA_DIR       = os.path.join("site_data", "_ca")
-_CA_KEY_PATH  = os.path.join(_CA_DIR, "s2l_root_ca.key")
-_CA_CERT_PATH = os.path.join(_CA_DIR, "s2l_root_ca.pem")
-_LEAF_DIR     = os.path.join(_CA_DIR, "leafs")
-
-_ca_lock = threading.Lock()
-_ca_pair = None   # (key, cert) — loaded/generated lazily, only if FIREFOX_PROXY is used
-
-_leaf_cache: dict[str, str] = {}   # host -> path to a combined cert+key PEM
-_leaf_lock  = threading.Lock()
-
-def _ensure_root_ca():
-    """Load the persisted root CA, generating one on first use.
-
-    Cached to disk (not regenerated per run) specifically so the one-time
-    Firefox import stays valid across restarts, regardless of which SITE is
-    currently configured — the CA is shared across every site2local session.
-    """
-    global _ca_pair
-    with _ca_lock:
-        if _ca_pair is not None:
-            return _ca_pair
-        os.makedirs(_CA_DIR, exist_ok=True)
-        if os.path.isfile(_CA_KEY_PATH) and os.path.isfile(_CA_CERT_PATH):
-            try:
-                with open(_CA_KEY_PATH, "rb") as f:
-                    key = serialization.load_pem_private_key(f.read(), password=None)
-                with open(_CA_CERT_PATH, "rb") as f:
-                    cert = x509.load_pem_x509_certificate(f.read())
-                _ca_pair = (key, cert)
-                return _ca_pair
-            except Exception as e:
-                log(f"Existing root CA unreadable ({e}) — generating a new one", "WARN")
-
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = issuer = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, "S2L Local MITM Root CA"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "site2local (local only)"),
-        ])
-        now = datetime.datetime.now(datetime.timezone.utc)
-        cert = (x509.CertificateBuilder()
-                .subject_name(subject).issuer_name(issuer)
-                .public_key(key.public_key())
-                .serial_number(x509.random_serial_number())
-                .not_valid_before(now - datetime.timedelta(days=1))
-                .not_valid_after(now + datetime.timedelta(days=3650))
-                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-                .add_extension(x509.KeyUsage(
-                    digital_signature=True, key_cert_sign=True, crl_sign=True,
-                    content_commitment=False, key_encipherment=False, data_encipherment=False,
-                    key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
-                .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-                .sign(key, hashes.SHA256()))
-        with open(_CA_KEY_PATH, "wb") as f:
-            f.write(key.private_bytes(serialization.Encoding.PEM,
-                                       serialization.PrivateFormat.PKCS8,
-                                       serialization.NoEncryption()))
-        with open(_CA_CERT_PATH, "wb") as f:
-            f.write(cert.public_bytes(serialization.Encoding.PEM))
-        log(f"Generated new root CA → {_CA_CERT_PATH}", "INFO")
-        _ca_pair = (key, cert)
-        return _ca_pair
-
-def _get_leaf_pem(host: str) -> str:
-    """Return a cert+key PEM path for `host`, generating (and disk-caching)
-    one signed by the root CA the first time this host is seen."""
-    with _leaf_lock:
-        cached = _leaf_cache.get(host)
-        if cached and os.path.isfile(cached):
-            return cached
-        os.makedirs(_LEAF_DIR, exist_ok=True)
-        safe = re.sub(r"[^\w\-.]", "_", host)
-        pem_path = os.path.join(_LEAF_DIR, f"{safe}.pem")
-        if os.path.isfile(pem_path):
-            _leaf_cache[host] = pem_path
-            return pem_path
-
-        ca_key, ca_cert = _ensure_root_ca()
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
-        now = datetime.datetime.now(datetime.timezone.utc)
-        cert = (x509.CertificateBuilder()
-                .subject_name(subject).issuer_name(ca_cert.subject)
-                .public_key(key.public_key())
-                .serial_number(x509.random_serial_number())
-                .not_valid_before(now - datetime.timedelta(days=1))
-                .not_valid_after(now + datetime.timedelta(days=825))
-                .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
-                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
-                .sign(ca_key, hashes.SHA256()))
-        with open(pem_path, "wb") as f:
-            f.write(key.private_bytes(serialization.Encoding.PEM,
-                                       serialization.PrivateFormat.PKCS8,
-                                       serialization.NoEncryption()))
-            f.write(cert.public_bytes(serialization.Encoding.PEM))
-        _leaf_cache[host] = pem_path
-        return pem_path
-
-def _mitm_read_headers(rfile) -> tuple[bytes, list] | None:
-    """Read one HTTP start-line + headers from a buffered socket file object."""
-    start_line = rfile.readline(8192)
-    if not start_line or start_line in (b"\r\n", b"\n"):
-        start_line = rfile.readline(8192)   # tolerate a stray leading blank line
-    if not start_line:
-        return None
-    headers = []
-    while True:
-        line = rfile.readline(8192)
-        if line in (b"\r\n", b"\n", b""):
-            break
-        if b":" not in line:
-            continue
-        k, _, v = line.partition(b":")
-        headers.append((k.decode("latin-1").strip(), v.decode("latin-1", "replace").strip()))
-    return start_line.rstrip(b"\r\n"), headers
-
-def _mitm_read_body(rfile, headers: list, cap: int = 64 * 1024 * 1024) -> bytes:
-    """Read a body per Content-Length or chunked Transfer-Encoding. `cap`
-    bounds how much is buffered for logging/hooking on very large bodies."""
-    hmap = {k.lower(): v for k, v in headers}
-    if "chunked" in hmap.get("transfer-encoding", "").lower():
-        body = b""
-        while True:
-            size_line = rfile.readline(64)
-            if not size_line:
-                break
-            try:
-                size = int(size_line.split(b";")[0].strip(), 16)
-            except ValueError:
-                break
-            if size == 0:
-                while True:
-                    t = rfile.readline(8192)
-                    if t in (b"\r\n", b"\n", b""):
-                        break
-                break
-            chunk = rfile.read(size)
-            if len(body) < cap:
-                body += chunk
-            rfile.read(2)
-        return body
-    cl = hmap.get("content-length")
-    if cl is not None:
-        try:
-            n = int(cl)
-        except ValueError:
-            return b""
-        return rfile.read(n) if n > 0 else b""
-    # No Content-Length and no chunked encoding → HTTP/1.0 style: body is
-    # delimited by connection close. Read until EOF (capped) so we don't
-    # silently drop the body and send Content-Length: 0 to the client.
-    body = b""
-    while len(body) < cap:
-        chunk = rfile.read(min(65536, cap - len(body)))
-        if not chunk:
-            break
-        body += chunk
-    return body
-
-def _mitm_upstream_ssl_context():
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    try:
-        ctx.set_alpn_protocols(["http/1.1"])
-    except NotImplementedError:
-        pass
-    return ctx
-
-def _mitm_process_request(parsed_req, rfile, wfile, dest_host: str, dest_port: int,
-                           dest_tls: bool, host_hdr: str, tag: str) -> bool:
-    """Handle exactly one HTTP request already read off `rfile`: forward it to
-    (dest_host, dest_port), relay the response back over `wfile`, log/hook it.
-    Returns False when the connection should close."""
-    # OFFLINE guard: no upstream to dial — fail fast with 503 instead of hanging
-    # for the connect timeout then returning a misleading 502.
-    if OFFLINE:
-        try:
-            wfile.write(b"HTTP/1.1 503 Service Unavailable\r\n"
-                        b"Connection: close\r\n"
-                        b"Content-Length: 0\r\n\r\n")
-            wfile.flush()
-        except Exception:
-            pass
-        return False
-    start_line, headers = parsed_req
-    try:
-        method, target, _proto = start_line.decode("latin-1").split(" ", 2)
-    except ValueError:
-        return False
-    p = urlparse(target)
-    path = target if target.startswith("/") else (p.path or "/") + (f"?{p.query}" if p.query else "")
-    hmap  = dict(headers)
-    body  = _mitm_read_body(rfile, headers)
-    body  = _apply_fwd_req_hooks(method, path, hmap, body)
-    up = None
-    try:
-        raw = socket.create_connection((dest_host, dest_port), timeout=15)
-        up  = _mitm_upstream_ssl_context().wrap_socket(raw, server_hostname=dest_host) if dest_tls else raw
-
-        req_lines = [f"{method} {path} HTTP/1.1", f"Host: {host_hdr}"]
-        for k, v in headers:
-            # Strip hop-by-hop headers. transfer-encoding MUST be stripped —
-            # we already set Content-Length below, and sending both
-            # Transfer-Encoding: chunked AND Content-Length is invalid HTTP
-            # that strict upstreams reject.
-            if k.lower() in ("host", "content-length", "transfer-encoding",
-                             "proxy-connection", "connection", "keep-alive",
-                             "te", "trailers", "upgrade"):
-                continue
-            req_lines.append(f"{k}: {v}")
-        req_lines.append(f"Content-Length: {len(body)}")
-        req_lines.append("Connection: keep-alive")
-        up.sendall(("\r\n".join(req_lines) + "\r\n\r\n").encode("latin-1", "replace") + body)
-
-        up_rfile = up.makefile("rb")
-        resp_parsed = _mitm_read_headers(up_rfile)
-        if resp_parsed is None:
-            return False
-        resp_start, resp_headers = resp_parsed
-        resp_body = _mitm_read_body(up_rfile, resp_headers)
-
-        status_txt = resp_start.decode("latin-1", "replace")
-        try:
-            status_code = int(status_txt.split(" ")[1])
-        except Exception:
-            status_code = 0
-        # Decide ONCE whether this client connection stays open, and use that
-        # same decision both for the header we send and for the return value —
-        # otherwise a client that believed the header would reuse a connection
-        # we'd already torn down, surfacing as a stray connection reset on its
-        # next request.
-        resp_hmap  = {k.lower(): v for k, v in resp_headers}
-        keep_alive = (hmap.get("connection", "").lower() != "close"
-                      and resp_hmap.get("connection", "").lower() != "close")
-        out_lines = [status_txt]
-        for k, v in resp_headers:
-            if k.lower() in ("content-length", "transfer-encoding", "connection"):
-                continue
-            out_lines.append(f"{k}: {v}")
-        out_lines.append(f"Content-Length: {len(resp_body)}")
-        out_lines.append(f"Connection: {'keep-alive' if keep_alive else 'close'}")
-        wfile.write(("\r\n".join(out_lines) + "\r\n\r\n").encode("latin-1", "replace") + resp_body)
-        wfile.flush()
-
-        _gui_fwd_push(tag, method, dest_host if tag == "clone" else urlparse(f"//{host_hdr}").hostname or host_hdr,
-                      path, status_code, hmap, body)
-        log(f"[{tag}] {method} {status_code} {_fmt_host(host_hdr)}{path} {_fmt_size(len(resp_body))}", "CDN")
-        return keep_alive
-    except Exception as e:
-        log(f"MITM {tag} relay error {host_hdr}{path}: {_short_exc(e)}", "WARN")
-        _gui_fwd_push(tag, method, host_hdr, path, 502, hmap, body)
-        return False
-    finally:
-        if up is not None:
-            try: up.close()
-            except Exception: pass
-
-def _mitm_handle_connection(client_sock: socket.socket, _client_addr) -> None:
-    client_sock.settimeout(30)
-    work_sock = client_sock
-    try:
-        rfile0 = client_sock.makefile("rb")
-        parsed = _mitm_read_headers(rfile0)
-        if parsed is None:
-            return
-        start_line, _headers = parsed
-        parts = start_line.decode("latin-1", "replace").split(" ")
-        if len(parts) < 2:
-            return
-        first_method, first_target = parts[0].upper(), parts[1]
-        pending_first = None
-
-        if first_method == "CONNECT":
-            host, _, port_s = first_target.partition(":")
-            port = int(port_s) if port_s.isdigit() else 443
-            # Check _CRYPTOGRAPHY_OK BEFORE sending the 200 — sending the 200
-            # first and then failing the TLS handshake leaves the browser
-            # believing the tunnel is up and surfaces a confusing TLS error.
-            if not _CRYPTOGRAPHY_OK:
-                try:
-                    client_sock.sendall(
-                        b"HTTP/1.1 502 Bad Gateway\r\n"
-                        b"Content-Type: text/plain\r\n"
-                        b"Content-Length: 52\r\n"
-                        b"\r\n"
-                        b"MITM TLS unavailable: 'cryptography' package not installed"
-                    )
-                except Exception:
-                    pass
-                return
-            client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(_get_leaf_pem(host))
-            try:
-                ctx.set_alpn_protocols(["http/1.1"])
-            except NotImplementedError:
-                pass
-            try:
-                work_sock = ctx.wrap_socket(client_sock, server_side=True)
-            except Exception as e:
-                log(f"MITM TLS handshake failed for {host}: {_short_exc(e)}", "WARN")
-                return
-            fixed_route = True   # a CONNECT tunnel belongs to one dest for its whole life
-        else:
-            # Plain-HTTP proxying: absolute-form request line, e.g.
-            # "GET http://example.com/path HTTP/1.1" — no CONNECT involved,
-            # and the request we already read is the first one to relay.
-            p = urlparse(first_target)
-            host, port = p.hostname, (p.port or 80)
-            pending_first = parsed
-            if not host:
-                return
-            fixed_route = False  # a keep-alive plain-HTTP connection can hop hosts per request
-
-        def _route_for(h: str, prt: int, use_tls: bool):
-            is_clone   = (h == MAIN_HOST)
-            clone_port = PORT
-            if not is_clone:
-                with _cdn_port_lock:
-                    cp = _cdn_host_port.get(h, 0)
-                if cp and cp > 0:
-                    is_clone, clone_port = True, cp
-            if is_clone:
-                return "127.0.0.1", clone_port, False, f"localhost:{clone_port}", "clone"
-            return h, prt, use_tls, h, "passthru"
-
-        dest_host, dest_port, dest_tls, host_hdr, tag = _route_for(host, port, first_method == "CONNECT")
-
-        rfile = work_sock.makefile("rb")
-        wfile = work_sock.makefile("wb")
-        while True:
-            if pending_first is not None:
-                parsed_req, pending_first = pending_first, None
-            else:
-                parsed_req = _mitm_read_headers(rfile)
-                if parsed_req is None:
-                    break
-                if not fixed_route:
-                    # Browsers reuse one keep-alive connection to a plain-HTTP
-                    # forward proxy across requests for DIFFERENT destination
-                    # hosts. Re-resolving routing only for the very first
-                    # request (as before) silently sent every later request
-                    # on this connection to that first host too — re-derive
-                    # it per request instead.
-                    try:
-                        _sl, _ = parsed_req
-                        _m, _t, _ = _sl.decode("latin-1").split(" ", 2)
-                        _pp = urlparse(_t)
-                        if _pp.hostname:
-                            host, port = _pp.hostname, (_pp.port or 80)
-                            dest_host, dest_port, dest_tls, host_hdr, tag = _route_for(host, port, False)
-                    except Exception:
-                        pass   # malformed/relative request line — keep previous routing
-            if not _mitm_process_request(parsed_req, rfile, wfile, dest_host, dest_port,
-                                          dest_tls, host_hdr, tag):
-                break
-    except (ConnectionError, OSError, socket.timeout):
-        pass
-    except ssl.SSLError as e:
-        log(f"MITM TLS error: {_short_exc(e)}", "DEBUG")
-    except Exception as e:
-        log(f"MITM connection error: {_short_exc(e)}", "WARN")
-    finally:
-        try: work_sock.close()
-        except Exception: pass
-        if work_sock is not client_sock:
-            try: client_sock.close()
-            except Exception: pass
-
-def _start_firefox_proxy() -> None:
-    if not _CRYPTOGRAPHY_OK:
-        log("FIREFOX_PROXY needs the 'cryptography' package "
-            "(pip install cryptography --break-system-packages) — staying disabled", "ERROR")
-        return
-    _ensure_root_ca()
-    log(f"Root CA ready → {_CA_CERT_PATH}", "INFO")
-    log("One-time step: import that .pem in Firefox → Settings → Privacy & "
-        "Security → Certificates → View Certificates → Authorities → Import "
-        "→ check 'Trust this CA to identify websites'. Then set Firefox's "
-        f"manual proxy (HTTP + HTTPS/SSL) to 127.0.0.1 : {FIREFOX_PROXY_PORT}.", "INFO")
-
-    def _serve() -> None:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind((HOST, FIREFOX_PROXY_PORT))
-        except OSError as e:
-            log(f"FIREFOX_PROXY bind failed on {FIREFOX_PROXY_PORT}: {e}", "ERROR")
-            return
-        srv.listen(128)
-        log(f"FIREFOX_PROXY listening on {HOST}:{FIREFOX_PROXY_PORT}", "INFO")
-        while True:
-            try:
-                client_sock, addr = srv.accept()
-            except OSError:
-                break
-            threading.Thread(target=_mitm_handle_connection, args=(client_sock, addr),
-                              daemon=True, name=f"mitm-{addr[0]}:{addr[1]}").start()
-
-    threading.Thread(target=_serve, daemon=True, name="firefox-proxy-listener").start()
-
 # ── Main proxy ────────────────────────────────────────────────────────────────
 
 @app.route("/", defaults={"path": ""}, methods=_ALL_METHODS)
@@ -9630,9 +10960,11 @@ def proxy(path: str) -> Response:
             "Access-Control-Allow-Origin":  _req_origin if _req_origin else "*",
             "Access-Control-Allow-Credentials": "true" if _req_origin else None,
             "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
-            "Access-Control-Allow-Headers": flask_request.headers.get(
-                                            "Access-Control-Request-Headers", "*"),
+            # Concrete list (never bare "*") so credentialed preflights pass.
+            "Access-Control-Allow-Headers": _cors_allow_headers(),
+            "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
+            "Vary": "Origin",
         })
         # Remove None values (Credential header when no Origin)
         r.headers = {k: v for k, v in r.headers.items() if v is not None}
@@ -10010,9 +11342,8 @@ def proxy(path: str) -> Response:
 
     # Case B: JSON API endpoint, empty body, chunked (no Content-Length), status 200
     # Only for GET/HEAD — POST/DELETE intentionally return empty 200.
-    # FIXED: was triggering on 4xx/5xx too because the original check was
-    # `status_code == 200`. But rate-limited APIs return 429 with an empty JSON body
-    # when rate-limited, and 404 with an empty body for non-existent resources
+    # Triggering on 4xx/5xx too would be wrong: rate-limited APIs return 429
+    # with an empty JSON body when rate-limited, and 404 with an empty body
     # — re-fetching those just burns the rate-limit budget faster. Now we
     # explicitly require 200 (or 206 for partial content) AND Content-Type
     # starts with application/json.
@@ -10122,7 +11453,8 @@ def proxy(path: str) -> Response:
                                     is_top_level_html="text/html" in _resp_ct_raw)
     ctx.resp_body    = body
     ctx.resp_ct      = upstream_r.headers.get("Content-Type", "application/octet-stream")
-    platform         = detect_platform(dict(upstream_r.headers))
+    platform         = detect_platform(dict(upstream_r.headers), body)
+    set_last_platform(platform)   # surface in the web viewer header
 
     # Detect RSC wire format — re-fetch with stronger HTML signal
     if _is_wire_payload(body) and method == "GET":
@@ -10353,8 +11685,8 @@ def _banner() -> None:
     if SHOW_HIDDEN:   flags.append(f"{G}show-hidden{R}")
     if SCAN_PATHS:    flags.append(f"{Style.BRIGHT+Fore.RED}scan:{SCAN_PATHS}{R}")
     if CAPTURE:       flags.append(f"{Style.BRIGHT+Fore.RED}capture{R}")
+    if CAPTURE_WS:    flags.append(f"{Style.BRIGHT+Fore.RED}capture-ws{R}")
     if HOOK_GUI:      flags.append(f"{Y}hook-gui{R}")
-    if FIREFOX_PROXY: flags.append(f"{Style.BRIGHT+Fore.CYAN}firefox-proxy:{FIREFOX_PROXY_PORT}{R}")
     if WS_PING_INTERVAL > 0:  flags.append(f"{G}ws-keepalive:{WS_PING_INTERVAL}s{R}")
     if WS_DEFLATE:            flags.append(f"{G}ws-deflate{R}")
     if WS_AUTO_RECONNECT:     flags.append(f"{G}ws-reconnect{R}")
@@ -10426,8 +11758,7 @@ def _banner() -> None:
 
     if PROXY_CDN and MULTIPORT:
         print(f"  {M}▶ MULTIPORT{R} {DIM}CDN hosts get a dedicated port starting at {PORT+1}{R}")
-        if sys.stdin.isatty():
-            print(f"  {M}▶ MULTIPORT viewer{R} {DIM}press {Y}'1'{R}{DIM} in the terminal to open the live CDN table ({Y}ESC{R}{DIM} to close){R}")
+        print(f"  {M}▶ MULTIPORT viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_viewer__{R} {DIM}(live CDN table, refreshes every 50 ms){R}")
     elif PROXY_CDN:
         print(f"  {M}▶ CDN{R} {DIM}assets via {_EXT_PREFIX}/ (single port){R}")
     if CAPTURE:
@@ -10435,6 +11766,8 @@ def _banner() -> None:
         body   = "req body on" if CAPTURE_BODIES else "req body off"
         others = " · CDN included" if CAPTURE_CDN else ""
         print(f"  {Style.BRIGHT+Fore.RED}▶ CAPTURE{R} {DIM}({skip} · {body}{others}) → {DATA_FOLDER}/captures/{R}")
+    if CAPTURE_WS:
+        print(f"  {Style.BRIGHT+Fore.RED}▶ CAPTURE_WS{R} {DIM}every WebSocket message (text+binary, both directions) → {DATA_FOLDER}/captures_ws/{R}")
     if SHOW_HIDDEN:
         print(f"  {G}▶ SHOW_HIDDEN{R} {DIM}hidden elements revealed in every HTML page{R}")
     if SCAN_PATHS:
@@ -10455,291 +11788,6 @@ def _banner() -> None:
             print(f"  {DIM}  resp [{','.join(sorted(mset))}] {pat.pattern} → {fn.__name__}{R}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MULTIPORT CDN Viewer  (CLI, hotkey '1' to open, ESC to close)
-#
-# A pure-terminal live inspector for every CDN host that has been promoted to
-# its own dedicated port by MULTIPORT. Runs in a background daemon thread and
-# watches stdin in cbreak mode for the '1' key. When pressed, it switches to
-# the terminal's ALTERNATE screen buffer (xterm `\x1b[?1049h`), renders the
-# CDN table, and refreshes every 2 seconds — newly-registered hosts appear
-# without leaving the viewer.
-#
-# Why the alternate screen buffer? Because it preserves the main screen's
-# scrollback entirely. The user explicitly demanded that exiting the viewer
-# NOT clear logging — ESC switches back (`\x1b[?1049l`) and the entire log
-# history reappears untouched, exactly as if the viewer had never opened.
-#
-# GUI mode caveat: when HOOK_GUI=True, PyQt6 owns the main thread and the
-# terminal is just a passive log sink — that's fine, the viewer still works
-# because it reads stdin directly, not through the Qt event loop.
-#
-# Safety:
-#   - Only starts if MULTIPORT is True AND stdin is a TTY (so piped input /
-#     non-interactive runs are unaffected).
-#   - Restores original termios state on every exit path.
-#   - Never raises into the main thread — every step is wrapped.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _render_multiport_viewer() -> str:
-    """Build the alternate-screen CDN table as a single string.
-
-    Pulled out of the viewer loop so it can be unit-tested without a TTY.
-    """
-    with _cdn_port_lock:
-        # Snapshot under the lock so the dict doesn't mutate mid-render.
-        # Filter out sentinels: port < 0 means "server is starting" (not
-        # ready yet), port == 0 means "registered but no dedicated port"
-        # (single-port /__s2l_ext__/ mode). Only positive ports are real
-        # MULTIPORT listeners — those are what the user wants to see.
-        snap = sorted(
-            ((h, p) for h, p in _cdn_host_port.items() if p > 0),
-            key=lambda hp: hp[1],
-        )
-        pending = sum(1 for _, p in _cdn_host_port.items() if p < 0)
-        unported = sum(1 for _, p in _cdn_host_port.items() if p == 0)
-
-    W = Style.BRIGHT + Fore.WHITE
-    C = Style.BRIGHT + Fore.CYAN
-    G = Style.BRIGHT + Fore.GREEN
-    Y = Style.BRIGHT + Fore.YELLOW
-    M = Style.BRIGHT + Fore.MAGENTA
-    D = Style.DIM
-    R = Style.RESET_ALL
-
-    lines: list[str] = []
-    # Title bar — centered-ish, eye-catching
-    lines.append(f"{M}╔══════════════════════════════════════════════════════════════════════╗{R}")
-    lines.append(f"{M}║{W}   S2L · MULTIPORT CDN Viewer                                          {M}║{R}")
-    lines.append(f"{M}╠══════════════════════════════════════════════════════════════════════╣{R}")
-    lines.append(f"{M}║{D}   Press {R}{Y}ESC{R}{D} to return — logging continues unaffected in the       {M}║{R}")
-    lines.append(f"{M}║{D}   background. Refreshes every 2 s.                                  {M}║{R}")
-    lines.append(f"{M}╠══════════════════════════════════════════════════════════════════════╣{R}")
-    # Column header
-    lines.append(f"{M}║{R} {C}#{R}  {C}CDN HOST{' ' * 38}{R} {C}PORT{' ' * 4}{R} {C}LOCAL URL{' ' * 22}{M}║{R}")
-    lines.append(f"{M}╠══════════════════════════════════════════════════════════════════════╣{R}")
-    if not snap:
-        lines.append(f"{M}║{R}{D}   (no MULTIPORT CDNs registered yet — they appear here as the    {M}║{R}")
-        lines.append(f"{M}║{R}{D}    proxy registers them on first hit)                            {M}║{R}")
-        lines.append(f"{M}║{R}                                                                  {M}║{R}")
-        lines.append(f"{M}║{R}{D}    Tip: browse the target site in your browser — every external   {M}║{R}")
-        lines.append(f"{M}║{R}{D}    asset host will get its own row here in real time.             {M}║{R}")
-    else:
-        for i, (host, port) in enumerate(snap, start=1):
-            url = f"http://localhost:{port}"
-            # Truncate host if too long
-            host_disp = host if len(host) <= 42 else host[:39] + "..."
-            # Pad to align columns
-            host_padded = host_disp.ljust(42)
-            port_str = f":{port}".ljust(8)
-            url_padded = url.ljust(30)
-            row_color = G if i % 2 == 1 else W
-            lines.append(
-                f"{M}║{R} {row_color}{i:>2}{R} {host_padded} {Y}{port_str}{R} {D}{url_padded}{M}║{R}"
-            )
-    # Footer / status summary
-    lines.append(f"{M}╠══════════════════════════════════════════════════════════════════════╣{R}")
-    summary_parts = [f"{G}{len(snap)}{R}{D} active MULTIPORT host(s){R}"]
-    if pending:
-        summary_parts.append(f"{Y}{pending}{R}{D} starting…{R}")
-    if unported:
-        summary_parts.append(f"{D}{unported} shared-port{R}")
-    summary = "  ·  ".join(summary_parts)
-    # Truncate footer if too wide
-    lines.append(f"{M}║{R} {summary}{' ' * max(0, 67 - len(_ANSI_ESC.sub('', summary)))}{M}║{R}")
-    lines.append(f"{M}╚══════════════════════════════════════════════════════════════════════╝{R}")
-    return "\n".join(lines)
-
-# Cross-platform keypress detection. On Unix we use termios + tty + select;
-# on Windows we'd use msvcrt. We only need this for the MULTIPORT viewer —
-# everywhere else the script just reads no stdin.
-def _multiport_viewer_loop() -> None:
-    """Background thread: watches stdin for '1' → opens viewer; ESC → closes.
-
-    Never raises into the main thread. Returns silently on any setup failure
-    (no TTY, termios unsupported, etc.) so the rest of the app keeps running.
-    """
-    if not MULTIPORT:
-        return
-    # Don't run in OFFLINE-only / no-TTY contexts (e.g. piped input, IDE
-    # consoles without a real terminal). The viewer is interactive — without
-    # a real TTY it can neither capture individual keypresses nor switch to
-    # the alternate screen buffer, so it would just sit there spinning.
-    try:
-        if not sys.stdin.isatty():
-            return
-    except Exception:
-        return
-
-    try:
-        import termios
-        import tty
-        import select as _select
-    except ImportError:
-        # Windows: termios/tty don't exist. Supporting msvcrt adds complexity
-        # for a feature whose main use case is the Linux dev terminal — skip
-        # silently rather than half-implementing.
-        return
-
-    try:
-        fd = sys.stdin.fileno()
-    except Exception:
-        return
-
-    # Save the original terminal state ONCE. We restore it on every exit
-    # path, but we only capture it here at thread start so a buggy restore
-    # can't clobber a state we never captured. Also publish to module level
-    # so the SIGINT handler can restore termios before os._exit().
-    global _terminal_fd, _terminal_original_terms
-    try:
-        original_terms = termios.tcgetattr(fd)
-    except (termios.error, OSError):
-        return
-    _terminal_fd = fd
-    _terminal_original_terms = original_terms
-
-    # Switch stdin to cbreak mode: characters are available immediately
-    # without Enter, no echo, signals (Ctrl+C) still work.
-    try:
-        tty.setcbreak(fd)
-    except (termios.error, OSError):
-        return
-
-    # Tracks whether we're currently inside the alternate-screen viewer.
-    # We MUST know this so the restore-on-exit path knows whether to emit
-    # the leave-alt-screen sequence.
-    in_viewer = [False]
-    # We refresh the viewer on this cadence so newly-registered CDNs appear.
-    REFRESH_S = 2.0
-
-    def _leave_viewer():
-        if not in_viewer[0]:
-            return
-        sys.stdout.write("\x1b[?1049l")  # leave alternate screen buffer
-        sys.stdout.flush()
-        in_viewer[0] = False
-
-    def _enter_viewer():
-        if in_viewer[0]:
-            return
-        sys.stdout.write("\x1b[?1049h")  # enter alternate screen buffer
-        sys.stdout.flush()
-        in_viewer[0] = True
-
-    def _redraw_viewer():
-        """Render one frame inside the alternate screen."""
-        # \x1b[H = move cursor to top-left; \x1b[2J = clear screen.
-        sys.stdout.write("\x1b[H\x1b[2J")
-        sys.stdout.write(_render_multiport_viewer())
-        sys.stdout.write(f"\n\n  {Style.DIM}(refreshing every {int(REFRESH_S)}s — "
-                         f"press {Fore.YELLOW}ESC{Style.RESET_ALL}{Style.DIM} to return){Style.RESET_ALL}\n")
-        sys.stdout.flush()
-
-    try:
-        while True:
-            try:
-                # Poll stdin with a short timeout so we can refresh the
-                # viewer if active, and so SIGINT still gets handled.
-                r, _, _ = _select.select([sys.stdin], [], [], REFRESH_S if in_viewer[0] else 0.5)
-            except (OSError, ValueError):
-                break
-            if r:
-                try:
-                    ch = sys.stdin.read(1)
-                except Exception:
-                    ch = ""
-                if ch == "1" and not in_viewer[0]:
-                    _enter_viewer()
-                    _redraw_viewer()
-                    # Announce the viewer entry on the MAIN screen too —
-                    # since alt-screen hides everything, a one-line hint
-                    # left on the main screen after ESC reminds the user
-                    # what just happened (without polluting logs).
-                    # We do this by writing to stderr AFTER leaving alt
-                    # screen — see _leave_viewer exit path.
-                    continue
-                if in_viewer[0]:
-                    # ESC = \x1b. Also accept 'q' as a fallback for terminals
-                    # where ESC sequences collide with arrow keys etc.
-                    if ch == "\x1b" or ch == "q":
-                        _leave_viewer()
-                        # Print a single info line on the main screen so the
-                        # user has a breadcrumb that the viewer was open.
-                        # This is NOT a log entry — it's a one-shot echo so
-                        # they know "ESC was pressed, viewer closed".
-                        # Critically: we do NOT clear logging — the entire
-                        # scrollback is intact because alt-screen preserved
-                        # the main screen's contents.
-                        print(f"{Fore.CYAN}[MULTIPORT viewer closed — "
-                              f"logging was preserved]{Style.RESET_ALL}")
-                        continue
-                    # Any other key inside the viewer → ignore (the user is
-                    # just looking, not typing). Refresh will happen on the
-                    # next select timeout.
-            # Time-driven refresh while inside the viewer.
-            if in_viewer[0]:
-                try:
-                    _redraw_viewer()
-                except Exception as _e:
-                    # Rendering must NEVER kill the viewer thread — log to
-                    # stderr and bail out of the viewer cleanly.
-                    try:
-                        sys.stderr.write(f"[MULTIPORT viewer render error: {_e}]\n")
-                    except Exception:
-                        pass
-                    _leave_viewer()
-    except Exception:
-        # Catch-all: never propagate viewer errors into the main app.
-        pass
-    finally:
-        # Always leave alt-screen and restore termios on thread exit.
-        try:
-            _leave_viewer()
-        except Exception:
-            pass
-        _restore_terminal()
-
-# Module-level handles so any exit path (SIGINT/SIGTERM handler, normal thread
-# teardown, even os._exit) can restore termios state. The viewer thread puts
-# stdin in cbreak mode (no echo), so if we exit without restoring, the user's
-# terminal stays in no-echo mode — they can still type and commands run, but
-# nothing appears on screen as they type. _restore_terminal() is idempotent
-# and safe to call from any thread.
-_MULTIPORT_VIEWER_STARTED = False
-_terminal_fd: int | None = None
-_terminal_original_terms = None
-_terminal_restore_lock = threading.Lock()
-
-def _restore_terminal() -> None:
-    """Restore the terminal to its original termios state (idempotent).
-
-    Called from:
-      • the viewer thread's finally block (normal exit)
-      • the SIGINT/SIGTERM handler (before os._exit)
-      • atexit (covers normal Python shutdown)
-    Without this, Ctrl+C while the viewer is running leaves the terminal in
-    cbreak mode (no echo) — the user can type and commands still run, but
-    nothing appears as they type.
-    """
-    global _terminal_original_terms
-    with _terminal_restore_lock:
-        if _terminal_original_terms is None or _terminal_fd is None:
-            return
-        try:
-            import termios
-            termios.tcsetattr(_terminal_fd, termios.TCSADRAIN, _terminal_original_terms)
-        except Exception:
-            pass
-
-def _start_multiport_viewer() -> None:
-    """Start the MULTIPORT CDN viewer thread (idempotent, daemon)."""
-    global _MULTIPORT_VIEWER_STARTED
-    if _MULTIPORT_VIEWER_STARTED:
-        return
-    _MULTIPORT_VIEWER_STARTED = True
-    threading.Thread(target=_multiport_viewer_loop, daemon=True,
-                     name="multiport-viewer").start()
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -10752,14 +11800,6 @@ if __name__ == "__main__":
         CACHE_CDN = False
     if not PROXY_CDN and MULTIPORT:
         log("MULTIPORT=True has no effect without PROXY_CDN=True", "WARN")
-    if FIREFOX_PROXY and not _CRYPTOGRAPHY_OK:
-        log("FIREFOX_PROXY=True needs the 'cryptography' package "
-            "(pip install cryptography --break-system-packages) — disabling", "ERROR")
-        FIREFOX_PROXY = False
-    if FIREFOX_PROXY and not HOOK_GUI:
-        log("FIREFOX_PROXY works without HOOK_GUI too (passthru/passthrough "
-            "still runs), but the Firefox Proxy request log/hook tab needs "
-            "HOOK_GUI=True to be visible.", "WARN")
     def _sigint_handler(_sig, _frame):
         # Clear the ^C that the terminal echoes on Ctrl+C — write \r + spaces
         # to overwrite it, then move cursor to start of line.
@@ -10780,15 +11820,14 @@ if __name__ == "__main__":
                 _capture_queue.join()
             except Exception:
                 pass
+            try:
+                if CAPTURE_WS:
+                    log("Draining WS capture queue...", "INFO")
+                    _ws_capture_queue.join()
+            except Exception:
+                pass
             log("Drain complete.", "INFO")
         print(f"{Fore.YELLOW}{Style.BRIGHT}Script finished by user command{Style.RESET_ALL}")
-        # Restore the terminal BEFORE os._exit — the MULTIPORT viewer thread
-        # puts stdin in cbreak mode (no echo), and os._exit kills daemon
-        # threads immediately without running atexit handlers. Without this
-        # restore, the user's terminal stays in no-echo mode after shutdown:
-        # they can still type and commands run, but nothing appears on screen
-        # as they type.
-        _restore_terminal()
         # Use os._exit instead of sys.exit to avoid the "[1]+ Killed" shell
         # message that sys.exit produces when called from a signal handler.
         # os._exit kills all daemon threads immediately without running
@@ -10798,13 +11837,6 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT,  _sigint_handler)
     signal.signal(signal.SIGTERM, _sigint_handler)
-
-    # atexit safety net for the normal-exit paths (GUI close, main thread
-    # return). os._exit bypasses atexit, so the SIGINT handler above calls
-    # _restore_terminal() explicitly. This atexit hook covers the case where
-    # Python shuts down normally (e.g. _launch_hook_gui() returns).
-    import atexit
-    atexit.register(_restore_terminal)
 
     # Silence werkzeug — including TLS 400s from browser HTTPS-on-HTTP probes
     wz_log = logging.getLogger("werkzeug")
@@ -10825,6 +11857,10 @@ if __name__ == "__main__":
     if CAPTURE:
         os.makedirs(os.path.join(DATA_FOLDER, "captures"), exist_ok=True)
         threading.Thread(target=_capture_worker, daemon=True, name="capture-worker").start()
+
+    if CAPTURE_WS:
+        os.makedirs(os.path.join(DATA_FOLDER, "captures_ws"), exist_ok=True)
+        threading.Thread(target=_ws_capture_worker, daemon=True, name="ws-capture-worker").start()
 
     _banner()
 
@@ -10866,11 +11902,8 @@ if __name__ == "__main__":
 
     if SCAN_PATHS and not OFFLINE:
         # Run the interactive status-filter prompt in the MAIN thread BEFORE
-        # starting the scanner daemon — input() can't safely run inside the
-        # daemon because the MULTIPORT viewer thread (started below) puts
-        # stdin in cbreak mode, which would make input() read single chars
-        # instead of lines. Doing it here, synchronously, also guarantees
-        # the filter is set before any scan happens.
+        # starting the scanner daemon so input() reads whole lines (not single
+        # chars) and the filter is set before any scan happens.
         try:
             if sys.stdin.isatty():
                 _prompt_scan_status_filter()
@@ -10882,9 +11915,6 @@ if __name__ == "__main__":
         threading.Thread(target=_run_path_scanner, daemon=True, name="path-scanner").start()
     elif SCAN_PATHS and OFFLINE:
         log("SCAN_PATHS ignored in OFFLINE mode — no upstream available", "WARN")
-
-    if FIREFOX_PROXY:
-        _start_firefox_proxy()
 
     # OFFLINE: pre-register CDN hosts from disk so MULTIPORT servers start
     # and URL rewrites point at live destinations instead of dead ports.
@@ -10910,6 +11940,7 @@ if __name__ == "__main__":
                 cdn_map = dict(_cdn_host_port)
             log(f"Crawl done — {s['crawled']} fetched · {s['saved']} cached · "
                 f"{s['cdn_fetched']} cdn · {s['captured']} captured · "
+                f"{s['ws_captured']} ws-captured · "
                 f"{s['revealed']} revealed · {s['conn_errors']} unreachable · "
                 f"{s['http_errors']} HTTP errors")
             for host, port in cdn_map.items():
@@ -10932,17 +11963,13 @@ if __name__ == "__main__":
     if not OFFLINE:
         _start_ext_asset_workers()
 
-    # MULTIPORT CDN viewer — press '1' in the terminal to open a live table
-    # of every CDN host that has been promoted to its own port. ESC returns
-    # to the main screen with logs untouched (alt-screen buffer preserves
-    # the scrollback). No-op when MULTIPORT is off or stdin isn't a TTY.
-    if MULTIPORT:
-        _start_multiport_viewer()
-        if sys.stdin.isatty():
-            log("MULTIPORT viewer ready — press '1' in the terminal to open the CDN table",
-                "INFO")
+    # Periodic prune of stale CDN health records (keeps _cdn_health bounded).
+    _start_health_pruner()
 
     log(f"Listening on http://{HOST}:{PORT}")
+    if PROXY_CDN and MULTIPORT:
+        log(f"MULTIPORT web viewer → http://localhost:{PORT}/__s2l_viewer__ (50 ms live refresh)", "INFO")
+        log(f"Capture browser    → http://localhost:{PORT}/__s2l_captures__", "INFO")
 
     if HOOK_GUI:
         # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
