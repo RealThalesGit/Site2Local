@@ -1,9 +1,12 @@
 # Site2Local
-> **Screw telemetry, screw detectors, be free, have full control.**
+> **Screw telemetry, screw detectors, be free, have full control, archive.**
 
  A **Vibe-coded** python project which makes a existent website running on localhost known as 127.0.0.1!
 
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
+
+## History
+Soon.
 
 ## What i can change on it?
 You can change if you want or don't want to use the "dump all" (only avaliable in 7.0-8.0), you can enable or disable crawling (if you have already crawled the site, or you want something like that i call "procedural crawling"), and change headers to mobile, tablet, desktop, macintosh, ie11, iphone, ipad, symbian, and bot, optional thing is that also you can enable rainbow logs (inspired on lolcat, actually it will use lolcat if your system even has it, but if lolcat is not found, it just proceeds to native one), and some more others
