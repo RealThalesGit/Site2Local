@@ -254,14 +254,14 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = 256 * 1024        # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = False                   # crawl at startup; False = proxy-on-demand only
+CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = True                # PyQt6 traffic inspector + live hook editor (KDE Breeze Dark theme)
+HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (KDE Breeze Dark theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
