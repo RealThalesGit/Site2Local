@@ -27,4 +27,7 @@ If some page fail to start (eg, game content isn't downloading) refresh the page
 ## Optional Things
 Don't forget to share, fork it and contribute to it!
 
+## Things to know
+Since i am the only one upgrading it, when it isn't updated in a while, it is because i am busy with other stuff or i just ran out of ideas for a moment, i am sorry if some updates take days, weeks or months.
+
 License: Apache 2.0
