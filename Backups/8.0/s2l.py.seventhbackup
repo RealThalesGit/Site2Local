@@ -3490,29 +3490,6 @@ def _needs_isolation(body: bytes) -> bool:
     return (has_sab or has_atomics
             or (has_worker and (has_wasm or has_sab)))
 
-def _cors_origin_pair() -> tuple[str, str | None]:
-    """Return (Access-Control-Allow-Origin value, Access-Control-Allow-Credentials value or None).
-
-    A browser fetch() using credentials:"include" is rejected outright if
-    Access-Control-Allow-Origin is the literal wildcard "*" — the spec requires
-    the exact origin to be echoed back whenever the request carries credentials
-    (cookies, HTTP auth, or client certs). We can't know in advance whether a
-    given request used credentials:"include", so the safe universal rule is:
-    whenever the browser sent an Origin header, echo it back verbatim paired
-    with Access-Control-Allow-Credentials: true. Only fall back to "*" when
-    there's no Origin header to echo (non-CORS requests, direct navigation).
-    This is the same rule filter_resp() already applies — every OTHER place
-    in this file that sets Access-Control-Allow-Origin should call this
-    instead of hardcoding "*", or it silently undoes filter_resp()'s work.
-    """
-    try:
-        origin = flask_request.headers.get("Origin", "") if flask_request else ""
-    except RuntimeError:
-        origin = ""
-    if origin:
-        return origin, "true"
-    return "*", None
-
 def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
     # Strip security headers that block our local proxy, plus hop-by-hop headers.
     # NOTE: Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy are
@@ -5311,10 +5288,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 log(f"CDN {method} HIT {_fmt_host(cdn_host)}/{p} {_fmt_size(len(data))}", "CDN")
                 resp = Response(data, content_type=ct)
                 resp.headers["Cache-Control"] = "public, max-age=86400"
-                _aco, _acc = _cors_origin_pair()
-                resp.headers["Access-Control-Allow-Origin"] = _aco
-                if _acc:
-                    resp.headers["Access-Control-Allow-Credentials"] = _acc
+                resp.headers["Access-Control-Allow-Origin"] = "*"
                 resp.headers["Access-Control-Expose-Headers"] = "*"
                 resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                 return resp
@@ -5403,10 +5377,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 save_queue.put((cdn_url, body, ct))
                 stats.inc("cdn_fetched")
             out_headers = filter_resp(_resp_headers_dict(r))
-            _aco, _acc = _cors_origin_pair()
-            out_headers["Access-Control-Allow-Origin"]  = _aco
-            if _acc:
-                out_headers["Access-Control-Allow-Credentials"] = _acc
+            out_headers["Access-Control-Allow-Origin"]  = "*"
             out_headers["Access-Control-Expose-Headers"] = "*"
             out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
             if method in _SAFE_METHODS:
@@ -6578,10 +6549,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     sc    = upstream_r.status_code
     enc   = (upstream_r.headers.get("Content-Encoding", "") or "").lower().strip()
     out_h = filter_resp(_resp_headers_dict(upstream_r))
-    _aco, _acc = _cors_origin_pair()
-    out_h["Access-Control-Allow-Origin"]   = _aco
-    if _acc:
-        out_h["Access-Control-Allow-Credentials"] = _acc
+    out_h["Access-Control-Allow-Origin"]   = "*"
     out_h["Access-Control-Expose-Headers"] = "*"
     out_h["Cache-Control"] = "public, max-age=86400"
     # We decompress before yielding (see _gen below), so strip the header.
@@ -8796,10 +8764,7 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
 
     resp = Response(body, status=ctx.resp_status,
                     headers=clean_headers, content_type=ctx.resp_ct)
-    _aco, _acc = _cors_origin_pair()
-    resp.headers["Access-Control-Allow-Origin"] = _aco
-    if _acc:
-        resp.headers["Access-Control-Allow-Credentials"] = _acc
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     # Always set here (not just on the live-fetch path) so a cache-hit refresh
     # never silently drops these — that mismatch is what makes cross-origin-
     # isolated apps (SharedArrayBuffer/WASM threads) report missing headers
@@ -8964,10 +8929,7 @@ def _s2l_hp_endpoint() -> Response:
         hp = {h: p for h, p in _cdn_host_port.items() if p > 0}
     resp = Response(json.dumps(hp), content_type="application/json")
     resp.headers["Cache-Control"]               = "no-store"
-    _aco, _acc = _cors_origin_pair()
-    resp.headers["Access-Control-Allow-Origin"] = _aco
-    if _acc:
-        resp.headers["Access-Control-Allow-Credentials"] = _acc
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -10780,17 +10742,14 @@ def ext_asset(extpath: str) -> Response:
         real_url += f"?{qs}"
 
     if method == "OPTIONS":
-        _aco, _acc = _cors_origin_pair()
         r = Response(status=204)
         r.headers.update({
-            "Access-Control-Allow-Origin":  _aco,
-            "Access-Control-Allow-Credentials": _acc,
+            "Access-Control-Allow-Origin":  "*",
             "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
             "Access-Control-Allow-Headers": flask_request.headers.get(
                 "Access-Control-Request-Headers", "*"),
             "Access-Control-Max-Age": "86400",
         })
-        r.headers = {k: v for k, v in r.headers.items() if v is not None}
         return r
 
     lp = local_path(real_url)
@@ -10803,10 +10762,7 @@ def ext_asset(extpath: str) -> Response:
                           display_tag="[CDN]", origin=ext_host)
             resp = Response(data, content_type=ct)
             resp.headers["Cache-Control"] = "public, max-age=86400"
-            _aco, _acc = _cors_origin_pair()
-            resp.headers["Access-Control-Allow-Origin"] = _aco
-            if _acc:
-                resp.headers["Access-Control-Allow-Credentials"] = _acc
+            resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Expose-Headers"] = "*"
             return resp
     if OFFLINE:
@@ -10872,10 +10828,7 @@ def ext_asset(extpath: str) -> Response:
             # CACHE_CDN=False: still register host so URL rewriting works next time
             _register_cdn_host(ext_host)
         out_headers = filter_resp(_resp_headers_dict(r))
-        _aco, _acc = _cors_origin_pair()
-        out_headers["Access-Control-Allow-Origin"]  = _aco
-        if _acc:
-            out_headers["Access-Control-Allow-Credentials"] = _acc
+        out_headers["Access-Control-Allow-Origin"]  = "*"
         out_headers["Access-Control-Expose-Headers"] = "*"
         out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         if method in _SAFE_METHODS:
@@ -11045,10 +10998,7 @@ def proxy(path: str) -> Response:
                             _rng_resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
                             _rng_resp.headers["Accept-Ranges"] = "bytes"
                             _rng_resp.headers["Content-Length"] = str(len(_slice))
-                            _aco, _acc = _cors_origin_pair()
-                            _rng_resp.headers["Access-Control-Allow-Origin"] = _aco
-                            if _acc:
-                                _rng_resp.headers["Access-Control-Allow-Credentials"] = _acc
+                            _rng_resp.headers["Access-Control-Allow-Origin"] = "*"
                             _rng_resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                             log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
                             _gui_push_raw(method, req_path, 206, ct_off, _slice,
@@ -11188,10 +11138,7 @@ def proxy(path: str) -> Response:
         log(f"{method} {urlparse(target).path} — {_short_exc(exc)}", "ERROR")
         stats.inc("conn_errors")
         _r502 = Response(f"Upstream error: {_short_exc(exc)}", status=502)
-        _aco, _acc = _cors_origin_pair()
-        _r502.headers["Access-Control-Allow-Origin"] = _aco
-        if _acc:
-            _r502.headers["Access-Control-Allow-Credentials"] = _acc
+        _r502.headers["Access-Control-Allow-Origin"] = "*"
         return _r502
     if hasattr(upstream_r, 'history') and upstream_r.history:
         for hist_resp in upstream_r.history:
@@ -11480,10 +11427,7 @@ def proxy(path: str) -> Response:
                 else:
                     log(f"CDN hit {_fmt_host(cdn_host)}{req_path_cdn}", "CDN")
                     resp = Response(cdn_data, content_type=resolve_mime(cdn_lp))
-                    _aco, _acc = _cors_origin_pair()
-                    resp.headers["Access-Control-Allow-Origin"]  = _aco
-                    if _acc:
-                        resp.headers["Access-Control-Allow-Credentials"] = _acc
+                    resp.headers["Access-Control-Allow-Origin"]  = "*"
                     resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                     resp.headers["Cache-Control"] = "public, max-age=86400"
                     return resp
@@ -11496,10 +11440,7 @@ def proxy(path: str) -> Response:
                     stats.inc("cdn_fetched")
                     log(f"CDN fallback {_fmt_host(cdn_host)}{req_path_cdn} {cdn_r.status_code}", "CDN")
                     out = filter_resp(_resp_headers_dict(cdn_r))
-                    _aco, _acc = _cors_origin_pair()
-                    out["Access-Control-Allow-Origin"]  = _aco
-                    if _acc:
-                        out["Access-Control-Allow-Credentials"] = _acc
+                    out["Access-Control-Allow-Origin"]  = "*"
                     out["Cross-Origin-Resource-Policy"]  = "cross-origin"
                     return Response(cdn_body, status=cdn_r.status_code, headers=out, content_type=ct)
             except Exception as exc:
