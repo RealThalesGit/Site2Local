@@ -20,26 +20,9 @@ if _s2l_sem_filter not in _s2l_existing_warnings:
         + _s2l_sem_filter
     )
 # ── STDLIB ────────────────────────────────────────────────────────────────────
-import os
-import sys
-import re
-import json
-import time
-import socket
-import queue
-import zlib
-import gc
-import hashlib
-import mimetypes
-import logging
-import threading
-import warnings
-import base64
-import struct
-import ssl
-import shutil
-import subprocess
-import tempfile
+import os, sys, re, json, time, socket, queue, zlib, gc
+import hashlib, mimetypes, logging, threading, warnings
+import base64, struct, ssl, shutil, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable
@@ -9338,7 +9321,7 @@ def _s2l_captures_endpoint() -> Response:
   .fsize{color:var(--dim);font-variant-numeric:tabular-nums}
   .ftime{color:var(--dim);font-variant-numeric:tabular-nums}
   .empty{padding:40px;text-align:center;color:var(--dim)}
-  .empty .big{font-size:24px;color:var(--cy);margin-bottom:8px;font-weight:700}
+  .empty .big{font-size:24px;color:var(--ylw);margin-bottom:8px;font-weight:700}
   .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
   .empty-clear{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
     background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);
@@ -10273,7 +10256,7 @@ def _s2l_viewer_endpoint() -> Response:
   .target{color:var(--grn);font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
   .proxy{color:var(--dim);font-size:12px}
   .uptime{color:var(--dim);font-size:11px;padding:2px 7px;border:1px solid var(--bd);border-radius:4px}
-  .stats{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+  .stats{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
   .stat{position:relative;display:flex;flex-direction:column;align-items:center;line-height:1.15;
     padding:6px 12px;border-radius:6px;background:var(--pnl2);min-width:62px;border:1px solid var(--bd2);cursor:default;
     transition:transform .12s, border-color .12s}
@@ -10402,7 +10385,7 @@ def _s2l_viewer_endpoint() -> Response:
   .errbadge.warn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.1)}
   .errbadge.bad{color:var(--bad);border-color:var(--bad);background:rgba(248,81,73,.12)}
   .empty{padding:50px;text-align:center;color:var(--dim)}
-  .empty .big{font-size:30px;color:var(--cy);margin-bottom:10px;font-weight:700}
+  .empty .big{font-size:30px;color:var(--ylw);margin-bottom:10px;font-weight:700}
   .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
   /* "Clear filter" button inside the empty state — the recovery path when a
      filter narrows the table to 0 rows. Styled to match the toolbar buttons
@@ -10459,6 +10442,17 @@ def _s2l_viewer_endpoint() -> Response:
   </span>
   <span class="proxy" id="proxy" title="proxy listen address"></span>
   <span class="uptime" id="uptime" title="process uptime">—</span>
+  <div class="stats">
+    <div class="stat" data-tip="CDN hosts with a dedicated port"><span class="n" id="s-active">0</span><span class="l">active</span></div>
+    <div class="stat" data-tip="CDN servers still starting up"><span class="n" id="s-pending">0</span><span class="l">pending</span></div>
+    <div class="stat" data-tip="CDN hosts sharing /__s2l_ext__/ (no dedicated port)"><span class="n" id="s-shared">0</span><span class="l">shared</span></div>
+    <div class="stat" data-tip="Total requests proxied through the main server"><span class="n" id="s-proxied">0</span><span class="l">proxied</span></div>
+    <div class="stat" data-tip="CDN assets fetched from upstream"><span class="n" id="s-cdn">0</span><span class="l">cdn</span></div>
+    <div class="stat" data-tip="HTTP request+response pairs written to captures/"><span class="n" id="s-cap">0</span><span class="l">captured</span></div>
+    <div class="stat" data-tip="WebSocket messages written to captures_ws/"><span class="n" id="s-wscap">0</span><span class="l">ws msg</span></div>
+    <div class="stat stat-broken" data-tip="CDN hosts with 4xx/5xx status or errors (click to filter)"><span class="n" id="s-broken">0</span><span class="l">broken</span></div>
+    <div class="stat stat-selected" data-tip="rows selected for bulk action (Shift+click for range)" style="display:none"><span class="n" id="s-selected">0</span><span class="l">sel</span></div>
+  </div>
 </header>
 
 <div class="toolbar">
@@ -10504,7 +10498,7 @@ def _s2l_viewer_endpoint() -> Response:
     <span id="copy-sel-label">Copy 0</span>
   </button>
   <span class="tb-sep" aria-hidden="true"></span>
-  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="Browse Recorded HTTP/WS Captures" style="text-decoration:none">
+  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="Browse Recorded HTTP/WS Captures (C)" style="text-decoration:none">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25Z"/><path d="M5 5.75A.75.75 0 0 1 5.75 5h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 5.75Zm0 3A.75.75 0 0 1 5.75 8h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 8.75Zm0 3a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1-.75-.75Z"/></svg>
     Captures
   </a>
@@ -10538,17 +10532,6 @@ def _s2l_viewer_endpoint() -> Response:
 </main>
 <footer>
   <span id="ft-left"><span class="tag" id="latency">— ms</span> · <span class="ft-updated" id="ft-updated" title="Time Since the Last Successful Poll">Updated —</span> · <span class="kbd">P</span> Pause <span class="kbd">/</span> Filter <span class="kbd">?</span> Help</span>
-  <div class="stats">
-    <div class="stat" data-tip="CDN hosts with a dedicated port"><span class="n" id="s-active">0</span><span class="l">active</span></div>
-    <div class="stat" data-tip="CDN servers still starting up"><span class="n" id="s-pending">0</span><span class="l">pending</span></div>
-    <div class="stat" data-tip="CDN hosts sharing /__s2l_ext__/ (no dedicated port)"><span class="n" id="s-shared">0</span><span class="l">shared</span></div>
-    <div class="stat" data-tip="Total requests proxied through the main server"><span class="n" id="s-proxied">0</span><span class="l">proxied</span></div>
-    <div class="stat" data-tip="CDN assets fetched from upstream"><span class="n" id="s-cdn">0</span><span class="l">cdn</span></div>
-    <div class="stat" data-tip="HTTP request+response pairs written to captures/"><span class="n" id="s-cap">0</span><span class="l">captured</span></div>
-    <div class="stat" data-tip="WebSocket messages written to captures_ws/"><span class="n" id="s-wscap">0</span><span class="l">ws msg</span></div>
-    <div class="stat stat-broken" data-tip="CDN hosts with 4xx/5xx status or errors (click to filter)"><span class="n" id="s-broken">0</span><span class="l">broken</span></div>
-    <div class="stat stat-selected" data-tip="rows selected for bulk action (Shift+click for range)" style="display:none"><span class="n" id="s-selected">0</span><span class="l">sel</span></div>
-  </div>
   <span class="flags" id="flags"></span>
   <span id="ft-right">—</span>
 </footer>
@@ -10562,7 +10545,7 @@ def _s2l_viewer_endpoint() -> Response:
       <div class="help-row"><span class="kbd">T</span><span>Toggle Dark / Light Theme</span></div>
       <div class="help-row"><span class="kbd">O</span><span>Open All CDN Ports in New Tabs</span></div>
       <div class="help-row"><span class="kbd">⇧A</span><span>Copy All CDN URLs to Clipboard</span></div>
-      <div class="help-row" id="help-cap" style="display:none"></div>
+      <div class="help-row" id="help-cap"><span class="kbd">C</span><span>Open the Capture Browser</span></div>
       <div class="help-row"><span class="kbd">R</span><span>Reset All Counters (Benchmark Window)</span></div>
       <div class="help-row"><span class="kbd">/</span><span>Focus the CDN Host Filter</span></div>
       <div class="help-row"><span class="kbd">H</span><span>Sort by Health (Broken CDNs First)</span></div>
@@ -11255,6 +11238,7 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
       // silently — pressing S by accident shouldn't toast a warning.
       if(selectedHosts.size) $("copy-sel-btn").click();
     }
+    else if(S2L_CFG.captures && (e.key==="c"||e.key==="C")){ window.open("/__s2l_captures__","_blank"); }
     else if(e.shiftKey && (e.key==="a"||e.key==="A")){ $("copy-all-btn").click(); }
     else if(e.shiftKey && (e.key==="o"||e.key==="O")){
       // Shift+O = open selected (mirrors O = open all). No-op if nothing
@@ -11274,34 +11258,6 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
   // accurate even while polling is paused (then it drifts to red — useful
   // signal that the live view is frozen). Cheap: only touches one span.
   setInterval(renderUpdated, 1000);
-  // ── Auto-pause on text selection ───────────────────────────────────
-  // When the user selects text in the table (or anywhere in the page),
-  // pause polling so the selection doesn't get blown away by the 50 ms
-  // refresh. Resume when the selection is cleared. Uses the
-  // 'selectionchange' event which fires on any selection change.
-  var _selectionPauseTimer = null;
-  document.addEventListener("selectionchange", function(){
-    var sel = window.getSelection ? window.getSelection().toString() : "";
-    if(sel && sel.length > 0){
-      // User has an active text selection — pause if not already paused.
-      if(!paused && !selWasPaused && !selPausedPolling){
-        selPausedPolling = true;
-        doPause(true, "selection");
-      }
-      // Reset the resume timer — keep paused while selection is active.
-      clearTimeout(_selectionPauseTimer);
-    } else {
-      // Selection cleared — resume after a short delay (so a quick
-      // click-drag-release doesn't cause a flicker).
-      clearTimeout(_selectionPauseTimer);
-      _selectionPauseTimer = setTimeout(function(){
-        if(selPausedPolling && !selWasPaused){
-          selPausedPolling = false;
-          doPause(false, "");
-        }
-      }, 400);
-    }
-  });
 })();
 </script>
 </body>
@@ -12380,8 +12336,8 @@ def _banner() -> None:
             print(f"  {DIM}▶ MULTIPORT viewer{R} {DIM}disabled (WEB_CDNVIEWER=False){R}")
     elif PROXY_CDN:
         print(f"  {M}▶ CDN{R} {DIM}assets via {_EXT_PREFIX}/ (single port){R}")
-    if WEB_CAPTUREVIEWER:
-        print(f"  {C}▶ Capture Viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_captures__{R} {DIM}(browse HTTP/WS captures){R}")
+    if WEB_CAPTUREVIEWER and (CAPTURE or CAPTURE_WS):
+        print(f"  {C}▶ capture viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_captures__{R} {DIM}(browse HTTP/WS captures){R}")
     if CAPTURE:
         skip   = "static skipped" if CAPTURE_SKIP_STATIC else "all captured"
         body   = "req body on" if CAPTURE_BODIES else "req body off"
