@@ -9230,12 +9230,12 @@ def _s2l_captures_endpoint() -> Response:
     page = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Capture Viewer</title>
+<title>S2L · Captures</title>
 <style>
-  :root{--bg:#000000;--pnl:#000000;--pnl2:#141414;--bd:#ffffff;--bd2:rgba(255,255,255,.18);
-    --fg:#ffffff;--fg2:#ffffff;--dim:#9d9d9d;--acc:#ffffff;--grn:#4ade80;--ylw:#fbbf24;--mag:#c084fc;--red:#f87171;--cy:#7dd3fc}
-  [data-theme="light"]{--bg:#ffffff;--pnl:#ffffff;--pnl2:#f0f0f0;--bd:#000000;--bd2:rgba(0,0,0,.18);
-    --fg:#000000;--fg2:#000000;--dim:#595959;--acc:#000000;--grn:#16a34a;--ylw:#d97706;--mag:#9333ea;--red:#dc2626;--cy:#0284c7}
+  :root{--bg:#0d1117;--pnl:#161b22;--pnl2:#1c2230;--bd:#30363d;--bd2:#21262d;
+    --fg:#c9d1d9;--fg2:#e6edf3;--dim:#7d8590;--acc:#58a6ff;--grn:#3fb950;--ylw:#d29922;--mag:#bc8cff;--red:#f85149}
+  [data-theme="light"]{--bg:#f6f8fa;--pnl:#fff;--pnl2:#eaeef2;--bd:#d0d7de;--bd2:#e1e4e8;
+    --fg:#1f2328;--fg2:#0a0c10;--dim:#59636e;--acc:#0969da;--grn:#1a7f37;--ylw:#9a6700;--mag:#8250df;--red:#cf222e}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
     font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px;display:flex;flex-direction:column;min-height:100vh}
@@ -9243,7 +9243,7 @@ def _s2l_captures_endpoint() -> Response:
   ::-webkit-scrollbar-track{background:var(--bg)}
   ::-webkit-scrollbar-thumb{background:var(--bd);border-radius:6px;border:2px solid var(--bg)}
   ::-webkit-scrollbar-thumb:hover{background:var(--dim)}
-  ::selection{background:var(--acc);color:var(--bg)}
+  ::selection{background:var(--acc);color:#fff}
   header{padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--pnl);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   h1{font-size:15px;margin:0;color:var(--fg2);font-weight:700} h1 .v{color:var(--mag)}
   a.back{color:var(--acc);text-decoration:none;font-size:12px} a.back:hover{text-decoration:underline}
@@ -9251,36 +9251,18 @@ def _s2l_captures_endpoint() -> Response:
   .stats b{color:var(--fg2)}
   .btn{padding:5px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);font:inherit;font-size:11px;cursor:pointer}
   .btn:hover{border-color:var(--acc)}
-  .btn.active{background:var(--acc);color:var(--bg);border-color:var(--acc)}
-  /* Global host filter — mirrors the CDN viewer's search bar styling so the
-     two viewers feel consistent. Faint border by default, accent on focus. */
-  .search{display:flex;align-items:center;gap:6px;min-width:160px;flex:1;max-width:280px;
-    padding:5px 10px;background:var(--pnl);border:1px solid var(--bd2);border-radius:6px}
-  .search:focus-within{border-color:var(--acc);box-shadow:0 0 0 2px rgba(255,255,255,.15)}
-  .search svg{width:13px;height:13px;color:var(--dim);flex-shrink:0}
-  .search input{flex:1;background:transparent;border:0;outline:0;color:var(--fg);font:inherit;font-size:12px}
-  .search input::placeholder{color:var(--dim)}
-  .search .count{color:var(--dim);font-size:10px;padding-left:6px;border-left:1px solid var(--bd2);margin-left:4px}
+  .btn.active{background:var(--acc);color:#fff;border-color:var(--acc)}
   .pulse{width:9px;height:9px;border-radius:50%;background:var(--grn);display:inline-block;animation:p 1.6s infinite}
   @keyframes p{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
   main{flex:1;padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:14px}
-  /* Card borders use the faint --bd2 (not full white) so stacked cards don't
-     form a heavy double-white grid against the outer container. The outer
-     page chrome (header/footer) keeps the full --bd white outline. */
-  .card{background:var(--pnl2);border:1px solid var(--bd2);border-radius:8px;overflow:hidden}
-  .card.open{border-color:var(--bd)}
-  .card-head{padding:11px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--acc);font-weight:600;font-size:12px;user-select:none}
-  .card-head:hover{background:rgba(255,255,255,.04)}
+  .card{background:var(--pnl);border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+  .card-head{padding:10px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--acc);font-weight:600;font-size:12px;user-select:none}
+  .card-head:hover{background:var(--pnl2)}
   .card-head .n{margin-left:auto;color:var(--dim);font-size:11px}
   .card-body{padding:0;display:none}
   .card.open .card-body{display:block}
   .card.open .caret{transform:rotate(90deg)}
-  /* Card caret: CSS-based triangle (no emoji/character). Rotates 90deg
-     when the card is open, pointing down instead of right. */
-  .caret{display:inline-block;width:0;height:0;border-left:4px solid var(--dim);
-    border-top:4px solid transparent;border-bottom:4px solid transparent;
-    transition:transform .12s;margin-right:4px}
-  .card.open .caret{transform:rotate(90deg)}
+  .caret{display:inline-block;transition:transform .12s;color:var(--dim);font-size:10px}
   .host{color:var(--fg2);font-weight:500}
   /* Global Main/WS view tabs (header). Switching re-filters the host cards
      to the selected capture kind so HTTP and WebSocket captures can be
@@ -9291,7 +9273,7 @@ def _s2l_captures_endpoint() -> Response:
     font-weight:700;letter-spacing:.4px;padding:4px 14px;border-radius:5px;cursor:pointer;
     text-transform:uppercase;transition:background .12s,color .12s}
   .kind-tabs .ktab:hover{color:var(--fg2)}
-  .kind-tabs .ktab.active{background:var(--acc);color:var(--bg)}
+  .kind-tabs .ktab.active{background:var(--acc);color:#fff}
   .kind-tabs .ktab.active[data-kind="ws"]{background:var(--mag)}
   .kind-tabs .ktab .badge{font-size:9px;opacity:.7;margin-left:5px;font-variant-numeric:tabular-nums}
   /* Per-card count badge for the active kind (replaces the old http/ws chips
@@ -9302,37 +9284,21 @@ def _s2l_captures_endpoint() -> Response:
   .card.open .kcount{color:var(--acc);border-color:var(--acc)}
   .card.open[data-kind="ws"] .kcount{color:var(--mag);border-color:var(--mag)}
   table.files{width:100%;border-collapse:collapse}
-  table.files td,th{padding:7px 14px;border-bottom:1px solid var(--bd2);text-align:left;font-size:11px}
-  table.files th{color:var(--fg2);text-transform:uppercase;letter-spacing:.5px;font-size:9px;font-weight:700;position:sticky;top:0;background:var(--pnl2)}
-  /* Sortable file headers — mirrors the CDN viewer's caret discoverability. */
-  table.files th.sortable{cursor:pointer;user-select:none}
-  table.files th.sortable:hover{color:var(--acc);background:rgba(255,255,255,.05)}
-  table.files th .caret{display:inline-block;width:0;height:0;margin-left:4px;vertical-align:middle;opacity:0;transition:opacity .12s}
-  table.files th.sortable:not(.sorted-asc):not(.sorted-desc) .caret{border-left:3px solid transparent;border-right:3px solid transparent;border-top:4px solid var(--dim)}
-  table.files th.sortable:hover .caret{opacity:.6}
-  table.files th.sorted-asc .caret{border-left:0;border-right:0;border-top:0;border-bottom:4px solid var(--acc);opacity:1}
-  table.files th.sorted-desc .caret{border-left:0;border-right:0;border-bottom:0;border-top:4px solid var(--acc);opacity:1}
+  table.files td,th{padding:6px 14px;border-bottom:1px solid var(--bd2);text-align:left;font-size:11px}
+  table.files th{color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-size:9px;position:sticky;top:0;background:var(--pnl2)}
   table.files tr{cursor:pointer}
-  /* Subtle zebra striping for scannability on black, without adding row
-     borders. Hover is a stronger lift so the pointed row is obvious. */
-  table.files tbody tr:nth-child(even) td{background:rgba(255,255,255,.025)}
-  table.files tbody tr:hover td{background:rgba(255,255,255,.08)}
+  table.files tr:hover td{background:var(--pnl2)}
   .fpath{color:var(--acc);max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .fsize{color:var(--dim);font-variant-numeric:tabular-nums}
   .ftime{color:var(--dim);font-variant-numeric:tabular-nums}
   .empty{padding:40px;text-align:center;color:var(--dim)}
   .empty .big{font-size:24px;color:var(--ylw);margin-bottom:8px;font-weight:700}
-  .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
-  .empty-clear{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
-    background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);
-    font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:background .12s,border-color .12s}
-  .empty-clear:hover{background:var(--pnl2);border-color:var(--acc)}
   .loading{padding:14px;color:var(--dim);font-size:11px;text-align:center}
-  .file-filter{display:flex;align-items:center;gap:8px;padding:7px 14px;border-bottom:1px solid var(--bd2);
+  .file-filter{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--bd2);
     position:sticky;top:0;background:var(--pnl);z-index:1}
-  .file-filter .ff-input{flex:1;background:var(--bg);border:1px solid var(--bd2);border-radius:5px;
+  .file-filter .ff-input{flex:1;background:var(--bg);border:1px solid var(--bd);border-radius:5px;
     padding:5px 10px;color:var(--fg);font:inherit;font-size:11px;outline:0}
-  .file-filter .ff-input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(255,255,255,.15)}
+  .file-filter .ff-input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(88,166,255,.15)}
   .file-filter .ff-count{color:var(--dim);font-size:10px;min-width:50px;text-align:right;font-variant-numeric:tabular-nums}
   footer{padding:9px 20px;border-top:1px solid var(--bd);background:var(--pnl);color:var(--dim);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
   /* Modal viewer */
@@ -9351,7 +9317,7 @@ def _s2l_captures_endpoint() -> Response:
     font-size:10px;font-weight:700;cursor:pointer;padding:3px 10px;border-radius:5px;font-family:inherit}
   .modal-head .action-btn:hover{background:var(--cy);color:#fff}
   .modal-head .action-btn#modal-copy-body:hover{background:var(--grn);color:#fff}
-  .modal-head .action-btn#modal-download:hover{background:var(--acc);color:var(--bg)}
+  .modal-head .action-btn#modal-download:hover{background:var(--acc);color:#fff}
   /* Tabs (Full / Request / Response) */
   .modal-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd2);padding:0 14px}
   .modal-tabs .tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
@@ -9381,24 +9347,10 @@ def _s2l_captures_endpoint() -> Response:
     background:var(--grn);color:#fff;padding:8px 18px;border-radius:6px;font-size:12px;font-weight:600;
     opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:200}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-  /* Help overlay (? key) — mirrors the CDN viewer's so the two viewers feel
-     consistent. Lists the keyboard shortcuts available in this viewer. */
-  .help-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:300;padding:20px}
-  .help-overlay.open{display:flex}
-  .help-card{background:var(--pnl);border:1px solid var(--bd);border-radius:10px;width:100%;max-width:420px;max-height:85vh;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)}
-  .help-head{padding:14px 18px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:700;color:var(--fg2)}
-  .help-close{background:none;border:0;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px}
-  .help-close:hover{color:var(--red)}
-  .help-body{padding:10px 18px;overflow:auto}
-  .help-row{display:flex;align-items:center;gap:12px;padding:7px 0;border-bottom:1px solid var(--bd2)}
-  .help-row:last-child{border-bottom:0}
-  .help-row .kbd{min-width:36px;text-align:center;font-size:10px;padding:2px 6px;border:1px solid var(--bd2);border-radius:3px;background:var(--pnl2);color:var(--dim);font-weight:700}
-  .help-row span:last-child{color:var(--fg);font-size:12px}
-  .help-foot{padding:10px 18px;border-top:1px solid var(--bd2);color:var(--dim);font-size:10px}
 </style></head><body>
 <header>
   <span class="pulse"></span>
-  <h1>Capture Viewer</h1>
+  <h1>S2L <span class="v">Captures</span></h1>
   <a class="back" id="s2l-back" href="/__s2l_viewer__">← viewer</a>
   <div class="kind-tabs" id="kind-tabs" title="switch between HTTP (Main) and WebSocket captures">
     <button class="ktab active" data-kind="http">Main <span class="badge" id="ktab-http">0</span></button>
@@ -9409,39 +9361,32 @@ def _s2l_captures_endpoint() -> Response:
     <span>WS: <b id="t-ws">0</b> (<b id="t-ws-sz">0B</b>)</span>
     <span>hosts: <b id="t-hosts">0</b></span>
   </div>
-  <div class="search" id="cap-host-filter-wrap">
-    <input type="text" id="cap-host-filter" placeholder="Filter Hosts…" autocomplete="off" title="Filter Host Cards by Name (/ to Focus)">
-    <span class="count" id="cap-host-filter-count"></span>
-  </div>
-  <button class="btn" id="expand-all-btn" title="Expand All Host Cards">Expand All</button>
-  <button class="btn" id="collapse-all-btn" title="Collapse All Host Cards">Collapse All</button>
   <button class="btn" id="refresh">Refresh</button>
-  <button class="btn" id="theme-btn" title="Toggle Theme">Theme</button>
+  <button class="btn" id="theme-btn" title="toggle theme">Theme</button>
 </header>
 <main><div id="cards"></div>
 <div class="empty" id="empty" style="display:none">
-  <div class="big" id="empty-big">No captures yet</div>
-  <div class="sub" id="empty-sub">Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>
+  <div class="big">No captures yet</div>
+  <div>Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>
   Recorded HTTP request+response pairs and WebSocket messages will appear here, grouped by host.</div>
-  <button class="btn empty-clear" id="empty-clear" style="display:none;margin-top:14px">Clear Filter</button>
 </div>
 </main>
 <footer>
-  <span>Capture files under <b id="roots">—</b></span>
-  <span>Click a host to expand · Click a file to view · Auto-refreshes every 5 s (paused while a file is open)</span>
+  <span>capture files under <b id="roots">—</b></span>
+  <span>use the <b>Main</b> / <b>WS</b> tabs to switch kind · click a host to expand · click a file to view its JSON · the list auto-refreshes every 5 s (paused while a file is open)</span>
 </footer>
 <div class="modal-overlay" id="modal">
   <div class="modal" id="modal-box">
     <div class="modal-head">
-      <button class="nav-btn" id="modal-prev" title="Previous File (←)">‹</button>
+      <button class="nav-btn" id="modal-prev" title="previous file (←)">‹</button>
       <span class="title" id="modal-title">—</span>
       <span class="fsize" id="modal-meta">—</span>
       <span class="pos" id="modal-pos">—</span>
-      <button class="nav-btn" id="modal-next" title="Next File (→)">›</button>
-      <button class="action-btn" id="modal-curl" title="Copy as cURL Command (Replay This Request)" style="display:none">cURL</button>
-      <button class="action-btn" id="modal-copy-body" title="Copy the Response Body to Clipboard" style="display:none;border-color:var(--grn);color:var(--grn)">Body</button>
-      <button class="action-btn" id="modal-download" title="Download This Capture as a JSON File" style="border-color:var(--acc);color:var(--acc)">Save</button>
-      <button class="nav-btn" id="modal-expand" title="Toggle Full Screen (F)" style="font-size:13px">Expand</button>
+      <button class="nav-btn" id="modal-next" title="next file (→)">›</button>
+      <button class="action-btn" id="modal-curl" title="copy as cURL command (replay this request)" style="display:none">cURL</button>
+      <button class="action-btn" id="modal-copy-body" title="copy the response body to clipboard" style="display:none;border-color:var(--grn);color:var(--grn)">Body</button>
+      <button class="action-btn" id="modal-download" title="download this capture as a JSON file" style="border-color:var(--acc);color:var(--acc)">Save</button>
+      <button class="nav-btn" id="modal-expand" title="toggle full-screen (F)" style="font-size:13px">⤢</button>
       <button class="close" id="modal-close">&times;</button>
     </div>
     <div class="modal-tabs" id="modal-tabs" style="display:none">
@@ -9453,24 +9398,9 @@ def _s2l_captures_endpoint() -> Response:
   </div>
 </div>
 <div class="toast" id="toast"></div>
-<!-- Help overlay (? key) -->
-<div class="help-overlay" id="help-overlay">
-  <div class="help-card">
-    <div class="help-head"><span>S2L Captures — Keyboard Shortcuts</span><button class="help-close" id="help-close">&times;</button></div>
-    <div class="help-body">
-      <div class="help-row"><span class="kbd">/</span><span>Focus the Host Filter</span></div>
-      <div class="help-row"><span class="kbd">Esc</span><span>Clear Host Filter / Close Modal</span></div>
-      <div class="help-row"><span class="kbd">←</span><span>Previous Capture File (in Modal)</span></div>
-      <div class="help-row"><span class="kbd">→</span><span>Next Capture File (in Modal)</span></div>
-      <div class="help-row"><span class="kbd">F</span><span>Toggle Full-Screen Modal</span></div>
-      <div class="help-row"><span class="kbd">?</span><span>Toggle This Help Overlay</span></div>
-    </div>
-    <div class="help-foot">Click a host card to expand · Click a file to view its JSON · Click a column header to sort files · Check 2 files to diff</div>
-  </div>
-</div>
 <script>
-/* Server-injected config: lets the page hide the "← viewer" back-link when
-   the CDN viewer has been disabled server-side (WEB_CDNVIEWER). The sentinel
+/* Server-injected config: hides the "← viewer" cross-link when the CDN
+   viewer has been disabled server-side (WEB_CDNVIEWER). The sentinel
    __S2L_CDN__ is replaced with true/false below. */
 var S2L_CFG = { viewer: __S2L_CDN__ };
 (function(){
@@ -9490,14 +9420,6 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
   var openHosts = new Set();               // hosts whose card-body is currently expanded
   var cardEls  = Object.create(null);       // host -> {card, head, kcount, n}
   var lastData = null;
-  var hostFilterText = "";                  // global host filter (header search input)
-  // Restore the persisted host filter from the previous session (so the
-  // user doesn't have to re-type it after a refresh). The input element is
-  // synced in the load() handler below (it doesn't exist at IIFE start).
-  (function restoreHostFilter(){
-    var saved = localStorage.getItem("s2l-cap-host-filter");
-    if(saved){ hostFilterText = saved; }
-  })();
 
   // Main/WS tabs: switching kind re-filters the host list to that kind and
   // re-opens any host that was already expanded (loading the new kind's files).
@@ -9526,19 +9448,7 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
       $("roots").textContent=[d.http_root,d.ws_root].filter(Boolean).join(" + ")||"—";
       renderCards(d, activeKindRendered!==activeKind);
       activeKindRendered=activeKind;
-    }).catch(function(e){
-      // Preserve the friendly "No captures yet" empty state instead of
-      // clobbering it with a raw JS exception string (which happened when the
-      // endpoint 404'd — e.g. viewer just turned off, or transient network).
-      // Show a short toast so a real failure is still surfaced, and keep the
-      // empty state's original structure intact for the next successful load.
-      if(!lastData){
-        // First load failed: show the empty state (it still has its original
-        // "No captures yet" HTML — we never overwrote it).
-        $("empty").style.display="block";
-      }
-      showToast("capture data unavailable — retrying…");
-    });
+    }).catch(function(e){$("empty").textContent="Error: "+e;$("empty").style.display="block";});
   }
 
   // Smart-merge render: preserves already-open cards AND their loaded file
@@ -9550,16 +9460,8 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
   function renderCards(d, fullRebuild){
     var cards=$("cards");
     // Hosts visible in the active tab = hosts that have at least one capture
-    // of the active kind AND match the global host filter (if any).
-    var f = hostFilterText.toLowerCase();
-    var visible = d.hosts.filter(function(h){
-      if((h[activeKind]||0) === 0) return false;
-      if(f && h.host.toLowerCase().indexOf(f) === -1) return false;
-      return true;
-    });
-    // Update the filter count badge in the header.
-    var fc=$("cap-host-filter-count");
-    if(fc) fc.textContent = f ? visible.length+"/"+d.hosts.length : "";
+    // of the active kind. Hosts with only the *other* kind are hidden.
+    var visible = d.hosts.filter(function(h){ return (h[activeKind]||0) > 0; });
     if(fullRebuild){
       cards.innerHTML=""; cardEls=Object.create(null);
     }
@@ -9579,7 +9481,7 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
       var head=document.createElement("div");head.className="card-head";
       var kcount=document.createElement("span");kcount.className="kcount";kcount.textContent=h[activeKind]||0;
       var n=document.createElement("span");n.className="n";n.textContent=fmtSize(h.size)+' · '+fmtTime(h.last);
-      head.innerHTML='<span class="caret"></span> <span class="host"></span> ';
+      head.innerHTML='<span class="caret">▶</span> <span class="host"></span> ';
       head.querySelector(".host").textContent=h.host;
       head.appendChild(kcount); head.appendChild(n);
       head.onclick=function(ev){ toggleCard(c, h.host); };
@@ -9606,23 +9508,7 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
       toReopen.forEach(function(host){ var e=cardEls[host]; if(e) openHost(e.card, host, activeKind); });
     }
     var visCount=Object.keys(cardEls).length;
-    // Filter-aware empty state (mirrors the CDN viewer): when the host filter
-    // narrows to 0 cards, show a "no match" message + Clear Filter button
-    // instead of the default "No captures yet" (which is misleading).
-    var hasData = d.hosts.length > 0;
-    var filteredEmpty = hasData && visCount === 0 && !!hostFilterText;
-    var showEmpty = !hasData || filteredEmpty;
-    $("empty").style.display = showEmpty ? "block" : "none";
-    var ebig=$("empty-big"), esub=$("empty-sub"), eclear=$("empty-clear");
-    if(filteredEmpty){
-      if(ebig) ebig.textContent = "No hosts match \""+hostFilterText+"\"";
-      if(esub) esub.innerHTML = "The filter returned 0 of "+d.hosts.length+" hosts on the "+activeKind.toUpperCase()+" tab.<br>Try a different search term, or clear the filter.";
-      if(eclear) eclear.style.display = "";
-    } else {
-      if(ebig) ebig.textContent = "No captures yet";
-      if(esub) esub.innerHTML = "Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>Recorded HTTP request+response pairs and WebSocket messages will appear here, grouped by host.";
-      if(eclear) eclear.style.display = "none";
-    }
+    $("empty").style.display=visCount?"none":"block";
   }
 
   function toggleCard(card, host){
@@ -9646,62 +9532,12 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
         if(!d.files || !d.files.length){ body.innerHTML='<div class="loading">No '+kind+' capture files for this host.</div>'; return; }
         // Filter box above the file table — substring search on path/size/time.
         var fbox=document.createElement("div");fbox.className="file-filter";
-        fbox.innerHTML='<input type="text" class="ff-input" placeholder="Filter '+kind+' files…" autocomplete="off"><span class="ff-count"></span>';
+        fbox.innerHTML='<input type="text" class="ff-input" placeholder="filter '+kind+' files…" autocomplete="off"><span class="ff-count"></span>';
         body.innerHTML=""; body.appendChild(fbox);
         var t=document.createElement("table");t.className="files";
-        // Sortable file headers (path, size, time). Clicking toggles asc/desc.
-        // Default: server order (most-recent-first), matching the old behavior.
-        t.innerHTML="<thead><tr><th style='width:28px'></th>"
-          +"<th class='sortable' data-sort='path'>path<span class='caret'></span></th>"
-          +"<th class='sortable' data-sort='size' style='width:70px'>size<span class='caret'></span></th>"
-          +"<th class='sortable' data-sort='time' style='width:70px'>time<span class='caret'></span></th>"
-          +"</tr></thead>";
+        t.innerHTML="<thead><tr><th style='width:28px'></th><th>path</th><th>size</th><th>time</th></tr></thead>";
         var tb=document.createElement("tbody");
         var files=d.files;
-        // Per-card file sort state (default: no sort = server order).
-        var fileSortKey=null, fileSortDir="asc";
-        function renderFileRows(){
-          // Re-append rows in sorted order. Since the rows were created with
-          // data-fi attributes, we can sort the array of <tr> by the file's
-          // sort field and re-append them in order.
-          var rowsArr = Array.prototype.slice.call(tb.querySelectorAll("tr"));
-          if(fileSortKey){
-            rowsArr.sort(function(a,b){
-              var fa=files[parseInt(a.getAttribute("data-fi"),10)]||{};
-              var fb=files[parseInt(b.getAttribute("data-fi"),10)]||{};
-              var av, bv;
-              if(fileSortKey==="path"){ av=fa.path||""; bv=fb.path||""; }
-              else if(fileSortKey==="size"){ av=fa.size||0; bv=fb.size||0; }
-              else if(fileSortKey==="time"){ av=fa.mtime||0; bv=fb.mtime||0; }
-              var r = av<bv?-1:av>bv?1:0;
-              return fileSortDir==="asc"? r : -r;
-            });
-          }
-          var frag=document.createDocumentFragment();
-          rowsArr.forEach(function(tr){ frag.appendChild(tr); });
-          tb.innerHTML=""; tb.appendChild(frag);
-          // Update header caret classes.
-          var ths=t.querySelectorAll("th.sortable");
-          for(var i=0;i<ths.length;i++){
-            ths[i].classList.remove("sorted-asc","sorted-desc");
-            if(ths[i].getAttribute("data-sort")===fileSortKey){
-              ths[i].classList.add(fileSortDir==="asc"?"sorted-asc":"sorted-desc");
-            }
-          }
-        }
-        // Wire sortable header clicks.
-        (function(){
-          var ths=t.querySelectorAll("th.sortable");
-          for(var i=0;i<ths.length;i++){
-            ths[i].addEventListener("click", function(ev){
-              ev.stopPropagation();
-              var key=this.getAttribute("data-sort");
-              if(fileSortKey===key){ fileSortDir = fileSortDir==="asc"?"desc":"asc"; }
-              else { fileSortKey=key; fileSortDir="asc"; }
-              renderFileRows();
-            });
-          }
-        })();
         // Diff selection state: track which file indices have their checkbox checked.
         var diffSel=[];
         var diffBtn=document.createElement("button"); diffBtn.className="btn diff-btn"; diffBtn.textContent="Diff selected"; diffBtn.style.display="none";
@@ -9724,7 +9560,6 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
         };
         d.files.forEach(function(f, fi){
           var tr=document.createElement("tr");
-          tr.setAttribute("data-fi", String(fi));
           tr.innerHTML='<td class="fdiff"><input type="checkbox" class="diff-cb" data-fi="'+fi+'" title="select for diff"></td>'
             +'<td class="fpath" title="'+f.path+'">'+f.path+'</td>'
             +'<td class="fsize">'+fmtSize(f.size)+'</td>'
@@ -9744,30 +9579,17 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
           tb.appendChild(tr);
         });
         t.appendChild(tb); body.appendChild(t);
-        // Footer row: note text on the left, Diff button on the right.
-        // Uses flexbox so the button stays anchored to the right edge of the
-        // table (VLM noted the old position:absolute made it "float awkwardly").
-        var footer=document.createElement("div");
-        footer.style.cssText="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;gap:10px";
+        body.appendChild(diffBtn);
         var note=document.createElement("div");note.className="loading";
-        note.style.cssText="padding:0;text-align:left";
         note.textContent=d.total+" file(s) · click a row to view · check 2 to diff";
-        footer.appendChild(note);
-        diffBtn.style.cssText="border-color:var(--mag);color:var(--mag);position:static;margin:0";
-        footer.appendChild(diffBtn);
-        body.appendChild(footer);
+        body.appendChild(note);
         // Wire the filter: show only rows whose path/size/time matches the query.
         var ff=fbox.querySelector(".ff-input"), fc=fbox.querySelector(".ff-count");
         ff.addEventListener("input", function(){
           var q=ff.value.toLowerCase().trim();
           var visible=0;
-          Array.prototype.forEach.call(tb.querySelectorAll("tr"), function(tr){
-            // Use data-fi to get the correct file for this row — after
-            // sorting, the row's DOM position no longer matches its index
-            // in the files array (the old `files[i]` bug matched the wrong
-            // file's path/size/time when the table was sorted).
-            var fi=parseInt(tr.getAttribute("data-fi"),10);
-            var f=files[fi]||{};
+          Array.prototype.forEach.call(tb.querySelectorAll("tr"), function(tr, i){
+            var f=files[i]||{};
             var hay=(f.path+" "+f.size+" "+fmtTime(f.mtime)).toLowerCase();
             var match = !q || hay.indexOf(q)!==-1;
             tr.style.display = match ? "" : "none";
@@ -9845,7 +9667,7 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
     var diff=lineDiff(pa, pb);
     var stats={eq:0, add:0, del:0};
     diff.forEach(function(d){ stats[d.t]++; });
-    $("modal-title").textContent="Diff: "+fileA.path.split("/").pop()+" vs "+fileB.path.split("/").pop();
+    $("modal-title").textContent="diff: "+fileA.path.split("/").pop()+" ↔ "+fileB.path.split("/").pop();
     $("modal-meta").textContent="+"+stats.add+" / -"+stats.del+" / ="+stats.eq;
     $("modal-curl").style.display="none";
     $("modal-copy-body").style.display="none";
@@ -10003,8 +9825,8 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
   $("modal-expand").onclick=function(){
     var box=$("modal-box");
     box.classList.toggle("expanded");
-    this.textContent = box.classList.contains("expanded") ? "Restore" : "Expand";
-    this.title = box.classList.contains("expanded") ? "Restore (F)" : "Toggle Full Screen (F)";
+    this.textContent = box.classList.contains("expanded") ? "⤓" : "⤢";
+    this.title = box.classList.contains("expanded") ? "restore (F)" : "toggle full-screen (F)";
   };
   document.addEventListener("keydown",function(e){
     if(!$("modal").classList.contains("open")) return;
@@ -10013,85 +9835,7 @@ var S2L_CFG = { viewer: __S2L_CDN__ };
     else if(e.key==="ArrowRight") navFile(1);
     else if(e.key==="f"||e.key==="F") $("modal-expand").click();
   });
-  // Global keyboard shortcuts (only when the modal is NOT open — the modal
-  // has its own handler above). Mirrors the CDN viewer's shortcuts:
-  //   /  → focus the global host filter
-  //   Esc → clear the host filter (if active) or just defocus the input
-  document.addEventListener("keydown",function(e){
-    if($("modal").classList.contains("open")) return;
-    var helpOverlay=$("help-overlay");
-    // ? toggles the help overlay (Shift+/ also works for keyboards where ? is shifted).
-    if(e.key==="?" || (e.shiftKey && e.key==="/")){ e.preventDefault(); helpOverlay.classList.toggle("open"); return; }
-    // Esc closes the help overlay first, then clears the host filter.
-    if(e.key==="Escape" && helpOverlay.classList.contains("open")){ helpOverlay.classList.remove("open"); return; }
-    // Allow Escape through even when an input is focused (so Esc can clear
-    // the host filter while the cursor is in it). Block other shortcuts.
-    if(e.key!=="Escape" && (e.target.tagName==="INPUT" || e.target.tagName==="TEXTAREA")) return;
-    if(e.key==="/"){ e.preventDefault(); $("cap-host-filter").focus(); }
-    else if(e.key==="Escape"){
-      if(hostFilterText){
-        hostFilterText=""; $("cap-host-filter").value=""; $("cap-host-filter").blur();
-        localStorage.removeItem("s2l-cap-host-filter");
-        if(lastData) renderCards(lastData, true);
-        showToast("Host filter cleared");
-      }
-    }
-  });
-  // Help overlay close button + click-outside-to-close.
-  var helpOverlayEl=$("help-overlay");
-  if(helpOverlayEl){
-    $("help-close").onclick=function(){ helpOverlayEl.classList.remove("open"); };
-    helpOverlayEl.addEventListener("click", function(e){ if(e.target===this) helpOverlayEl.classList.remove("open"); });
-  }
   $("refresh").onclick=load;
-  // Global host filter: filters the host cards by name (substring match).
-  // Re-renders on every keystroke (cheap — smart-merge preserves open cards).
-  // Persists to localStorage so it survives a page refresh.
-  var hfEl = $("cap-host-filter");
-  if(hfEl && hostFilterText){ hfEl.value = hostFilterText; }   // sync input from restored state
-  $("cap-host-filter").addEventListener("input", function(e){
-    hostFilterText = e.target.value.trim();
-    localStorage.setItem("s2l-cap-host-filter", hostFilterText);
-    if(lastData) renderCards(lastData, true);
-  });
-  // "Clear filter" button in the empty state — the recovery path when the
-  // host filter narrows to 0 cards. Mirrors the CDN viewer's empty-clear.
-  var capEmptyClear=$("empty-clear");
-  if(capEmptyClear) capEmptyClear.onclick=function(){
-    hostFilterText=""; $("cap-host-filter").value=""; $("cap-host-filter").blur();
-    localStorage.removeItem("s2l-cap-host-filter");
-    if(lastData) renderCards(lastData, true);
-    showToast("Host filter cleared");
-  };
-  // Expand-all / collapse-all: iterate the visible card elements and
-  // open/close each one. Uses the same openHost() / toggleCard() functions
-  // the user's individual clicks use, so the file-loading behavior is
-  // identical (expand loads files for the active kind).
-  $("expand-all-btn").onclick=function(){
-    if(!lastData) return;
-    var f = hostFilterText.toLowerCase();
-    var toExpand = lastData.hosts.filter(function(h){
-      if((h[activeKind]||0) === 0) return false;
-      if(f && h.host.toLowerCase().indexOf(f) === -1) return false;
-      return true;
-    });
-    toExpand.forEach(function(h){
-      if(!openHosts.has(h.host)){
-        var e=cardEls[h.host];
-        if(e) openHost(e.card, h.host, activeKind);
-      }
-    });
-    if(toExpand.length) showToast("Expanded "+toExpand.length+" card"+(toExpand.length===1?"":"s"));
-  };
-  $("collapse-all-btn").onclick=function(){
-    if(!openHosts.size){ return; }
-    var n=openHosts.size;
-    openHosts.forEach(function(host){
-      var e=cardEls[host]; if(e) e.card.classList.remove("open");
-    });
-    openHosts.clear();
-    showToast("Collapsed "+n+" card"+(n===1?"":"s"));
-  };
   load();
   // Auto-refresh every 5 s, but PAUSE while the file-detail modal is open so
   // the user can click around (Response tab, copy-body, prev/next, diff)
@@ -10217,25 +9961,25 @@ def _s2l_viewer_endpoint() -> Response:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CDN Viewer</title>
+<title>S2L · MULTIPORT Viewer</title>
 <style>
   :root{
-    --bg:#000000; --pnl:#000000; --pnl2:#141414; --bd:#ffffff; --bd2:rgba(255,255,255,.18);
-    --fg:#ffffff; --fg2:#ffffff; --dim:#9d9d9d; --acc:#ffffff; --grn:#4ade80;
-    --ylw:#fbbf24; --red:#f87171; --mag:#c084fc; --cy:#7dd3fc;
-    --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+    --bg:#0d1117; --pnl:#161b22; --pnl2:#1c2230; --bd:#30363d; --bd2:#21262d;
+    --fg:#c9d1d9; --fg2:#e6edf3; --dim:#7d8590; --acc:#58a6ff; --grn:#3fb950;
+    --ylw:#d29922; --red:#f85149; --mag:#bc8cff; --cy:#79c0ff;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
   }
   [data-theme="light"]{
-    --bg:#ffffff; --pnl:#ffffff; --pnl2:#f0f0f0; --bd:#000000; --bd2:rgba(0,0,0,.18);
-    --fg:#000000; --fg2:#000000; --dim:#595959; --acc:#000000; --grn:#16a34a;
-    --ylw:#d97706; --red:#dc2626; --mag:#9333ea; --cy:#0284c7;
-    --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
+    --bg:#f6f8fa; --pnl:#ffffff; --pnl2:#eaeef2; --bd:#d0d7de; --bd2:#e1e4e8;
+    --fg:#1f2328; --fg2:#0a0c10; --dim:#59636e; --acc:#0969da; --grn:#1a7f37;
+    --ylw:#9a6700; --red:#cf222e; --mag:#8250df; --cy:#0550ae;
+    --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
     font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:13px}
   body{display:flex;flex-direction:column;min-height:100vh}
-  ::selection{background:var(--acc);color:var(--bg)}
+  ::selection{background:var(--acc);color:#fff}
 
   ::-webkit-scrollbar{width:10px;height:10px}
   ::-webkit-scrollbar-track{background:var(--bg)}
@@ -10254,6 +9998,11 @@ def _s2l_viewer_endpoint() -> Response:
   h1{font-size:15px;margin:0;letter-spacing:.5px;color:var(--fg2);font-weight:700;display:flex;align-items:center;gap:8px}
   h1 .v{color:var(--mag);font-weight:700}
   .target{color:var(--grn);font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+  .waf-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;
+    font-size:10px;font-weight:700;letter-spacing:.3px;border:1px solid var(--bd);
+    background:var(--pnl2);color:var(--dim)}
+  .waf-badge.known{color:var(--ylw);border-color:var(--ylw);background:rgba(210,153,34,.08)}
+  .waf-badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
   .proxy{color:var(--dim);font-size:12px}
   .uptime{color:var(--dim);font-size:11px;padding:2px 7px;border:1px solid var(--bd);border-radius:4px}
   .stats{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
@@ -10266,24 +10015,42 @@ def _s2l_viewer_endpoint() -> Response:
   .stat[data-tip]:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 6px);left:50%;
     transform:translateX(-50%);background:var(--pnl2);color:var(--fg2);border:1px solid var(--bd);
     padding:4px 8px;border-radius:4px;font-size:10px;white-space:nowrap;z-index:50;pointer-events:none}
-  /* Broken stat: red-tinted when >0 (clickable shortcut to the Broken filter).
-     Selected stat: accent-tinted, only visible while a selection exists. */
-  .stat-broken{cursor:pointer}
-  .stat-broken .n{color:var(--dim)}
-  .stat-broken.has-broken .n{color:var(--bad)}
-  .stat-broken.has-broken:hover{border-color:var(--bad)}
-  .stat-broken.has-broken.active{background:rgba(248,81,73,.15);border-color:var(--bad)}
-  .stat-selected .n{color:var(--acc)}
-  .stat-selected:hover{border-color:var(--acc)}
 
+  /* ── Throughput chart (bigger, with axis) ─────────────────────────── */
+  .chart-card{margin:14px 20px 0;background:var(--pnl);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}
+  .chart-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+  .chart-title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+  .chart-legend{display:flex;gap:10px;font-size:10px;color:var(--dim)}
+  .chart-legend .leg{display:inline-flex;align-items:center;gap:4px}
+  .chart-legend .sw{display:inline-block;width:10px;height:3px;border-radius:2px}
+  .chart-legend .sw.cur{background:var(--acc)}
+  .chart-legend .sw.peak{background:var(--grn)}
+  .chart-legend .sw.avg{background:var(--cy)}
+  .chart-vals{margin-left:auto;display:flex;gap:14px;font-size:11px}
+  .chart-vals .kv{display:flex;gap:5px;align-items:baseline}
+  .chart-vals .kv .k{color:var(--dim)}
+  .chart-vals .kv .v{color:var(--fg2);font-weight:700;font-variant-numeric:tabular-nums}
+  .chart-vals .kv.cur .v{color:var(--acc)}
+  .chart-vals .kv.peak .v{color:var(--grn)}
+  .chart-vals .kv.avg .v{color:var(--cy)}
+  .chart-svg{width:100%;height:64px;display:block}
+  /* Per-host stacked bar (request share by host) */
+  .host-bar-wrap{margin-top:10px;padding-top:8px;border-top:1px solid var(--bd2)}
+  .host-bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--bd2);margin-bottom:6px}
+  .host-bar .seg{height:100%;transition:width .3s;cursor:default}
+  .host-bar .seg:hover{opacity:.85}
+  .host-bar-legend{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:10px;color:var(--dim)}
+  .host-bar-legend .lh{display:inline-flex;align-items:center;gap:4px;cursor:default}
+  .host-bar-legend .lh .sw{display:inline-block;width:9px;height:9px;border-radius:2px}
+  .host-bar-legend .lh .pct{color:var(--fg2);font-weight:600;font-variant-numeric:tabular-nums;margin-left:2px}
+  .chart-grid line{stroke:var(--bd2);stroke-width:1}
+  .chart-area{fill:url(#chartgrad);opacity:.5}
+  .chart-line{fill:none;stroke:var(--acc);stroke-width:1.5;stroke-linejoin:round}
+  .chart-peak{fill:var(--grn)}
+  .chart-cur{fill:var(--acc);stroke:var(--pnl);stroke-width:1.5}
 
   /* ── Toolbar ──────────────────────────────────────────────────────── */
   .toolbar{display:flex;gap:10px;align-items:center;margin:14px 20px 0;flex-wrap:wrap}
-  /* Toolbar group dividers — thin vertical separators that break the toolbar
-     into logical groups (refresh | filter | pause | bulk-actions | selection |
-     utilities) so 10+ controls don't read as an undifferentiated band. Faint
-     by default, invisible when the selection group is hidden. */
-  .tb-sep{width:1px;height:22px;background:var(--bd2);flex-shrink:0;opacity:.6}
   .bar-group{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;
     padding:5px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px}
   .bar-group .rate{color:var(--acc);font-weight:700}
@@ -10293,7 +10060,7 @@ def _s2l_viewer_endpoint() -> Response:
   .bar-group .tag.err{color:var(--red);border-color:var(--red)}
   .search{flex:1;min-width:180px;display:flex;align-items:center;gap:6px;
     padding:6px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px}
-  .search:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px rgba(255,255,255,.15)}
+  .search:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
   .search svg{width:14px;height:14px;color:var(--dim);flex-shrink:0}
   .search input{flex:1;background:transparent;border:0;outline:0;color:var(--fg);font:inherit;font-size:12px}
   .search input::placeholder{color:var(--dim)}
@@ -10303,7 +10070,7 @@ def _s2l_viewer_endpoint() -> Response:
     cursor:pointer;transition:background .12s,border-color .12s,transform .08s;white-space:nowrap}
   .btn:hover{background:var(--pnl2);border-color:var(--acc)}
   .btn:active{transform:translateY(1px)}
-  .btn.active{background:var(--acc);color:var(--bg);border-color:var(--acc)}
+  .btn.active{background:var(--acc);color:#fff;border-color:var(--acc)}
   .btn svg{width:13px;height:13px}
   .sel{padding:6px 8px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px;
     color:var(--fg);font:inherit;font-size:11px;cursor:pointer;outline:0}
@@ -10320,38 +10087,17 @@ def _s2l_viewer_endpoint() -> Response:
     padding:10px 14px;font-size:10px;text-transform:uppercase;letter-spacing:.6px;
     border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:2;user-select:none}
   thead th.sortable{cursor:pointer}
-  thead th.sortable:hover{color:var(--fg2);background:rgba(255,255,255,.07)}
-  /* Caret discoverability: a non-sorted sortable header shows a faint
-     hint on hover (CSS-only, no JS) so the user can tell it's clickable —
-     otherwise the caret is invisible until first click (the round-3 VLM
-     note). Once a column is active the caret is full-opacity and points
-     the right way. */
-  thead th .caret{display:inline-block;width:0;height:0;margin-left:5px;vertical-align:middle;opacity:0;transition:opacity .12s}
-  /* Default hint on hover for a sortable-but-not-yet-sorted header: a
-     subtle up-down indicator. Achieved with two stacked triangles via
-     border tricks on a 0-size box is messy, so instead we show a faint
-     down-triangle (the most common initial sort direction). */
-  thead th.sortable:not(.sorted-asc):not(.sorted-desc) .caret{border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--dim)}
-  thead th.sortable:hover .caret{opacity:.7}
-  thead th.sorted-asc .caret{border-left:0;border-right:0;border-top:0;border-bottom:5px solid var(--acc);opacity:1}
-  thead th.sorted-desc .caret{border-left:0;border-right:0;border-bottom:0;border-top:5px solid var(--acc);opacity:1}
+  thead th.sortable:hover{color:var(--fg2);background:var(--bd2)}
+  thead th .caret{display:inline-block;width:0;height:0;margin-left:5px;vertical-align:middle;opacity:.3}
+  thead th.sorted-asc .caret{border-bottom:5px solid var(--acc);opacity:1}
+  thead th.sorted-desc .caret{border-top:5px solid var(--acc);opacity:1}
   tbody td{padding:9px 14px;border-bottom:1px solid var(--bd2)}
   tbody tr:last-child td{border-bottom:none}
   tbody tr{transition:background .1s}
-  /* Zebra striping on the main CDN table — subtle alternating lift so the
-     eye can track a row across wide lines without per-row borders doing
-     all the work (reduces the "border fatigue" of a pure black+white grid).
-     Hover is a stronger lift so the pointed row is still obvious. */
-  tbody tr:nth-child(even){background:rgba(255,255,255,.025)}
-  tbody tr:hover{background:rgba(255,255,255,.08)}
-  /* Selected rows (bulk-action mode): accent-tinted background + left accent
-     bar so the selection set is scannable at a glance. Survives the 50 ms
-     refresh because the .selected class lives on the stable <tr> node. */
-  tbody tr.selected{background:rgba(255,255,255,.12);box-shadow:inset 3px 0 0 var(--acc)}
-  tbody tr.selected:hover{background:rgba(255,255,255,.18)}
+  tbody tr:hover{background:var(--pnl2)}
   tbody tr.new{animation:flash 1.1s ease-out}
   tbody tr.copy-flash{animation:copyflash .8s ease-out}
-  @keyframes flash{0%{background:rgba(255,255,255,.20)}100%{background:transparent}}
+  @keyframes flash{0%{background:rgba(88,166,255,.20)}100%{background:transparent}}
   @keyframes copyflash{0%{background:rgba(63,185,80,.30)}100%{background:transparent}}
   td .host{color:var(--fg2);font-weight:500}
   td .port{color:var(--ylw);font-weight:700;font-variant-numeric:tabular-nums}
@@ -10366,19 +10112,15 @@ def _s2l_viewer_endpoint() -> Response:
   /* Health cell: dot + status + RTT + last-seen */
   .health{display:flex;align-items:center;gap:8px;min-width:170px}
   .hdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:var(--dim)}
+  .hspark{width:48px;height:18px;flex-shrink:0;display:block}
   .hdot.ok{background:var(--ok);box-shadow:0 0 5px rgba(63,185,80,.6)}
   .hdot.warn{background:var(--warn)}
   .hdot.bad{background:var(--bad);box-shadow:0 0 5px rgba(248,81,73,.6)}
   .hdot.unknown{background:var(--dim);opacity:.4}
   .hmeta{display:flex;flex-direction:column;line-height:1.25;font-size:10px;color:var(--dim)}
-  /* Status text stays white+bold in ALL cases — the dot carries the color
-     signal (ok/warn/bad). The old version tinted the status text red/amber
-     on a faint colored background, which read as a low-contrast "alert
-     badge" on black and was hard to scan. Now it's clean white with the dot
-     as the only color cue — easier to read and to scan down the column. */
   .hmeta .status{font-weight:700;color:var(--fg2);font-size:11px;letter-spacing:.2px}
-  .hmeta .status.bad{color:var(--bad)}
-  .hmeta .status.warn{color:var(--warn)}
+  .hmeta .status.bad{color:var(--bad);background:rgba(248,81,73,.12);padding:0 5px;border-radius:3px}
+  .hmeta .status.warn{color:var(--warn);background:rgba(210,153,34,.1);padding:0 5px;border-radius:3px}
   .hmeta .sub{color:var(--dim)}
   .errbadge{display:inline-block;font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;
     margin-left:5px;line-height:14px;vertical-align:middle;border:1px solid;cursor:default}
@@ -10387,29 +10129,16 @@ def _s2l_viewer_endpoint() -> Response:
   .empty{padding:50px;text-align:center;color:var(--dim)}
   .empty .big{font-size:30px;color:var(--ylw);margin-bottom:10px;font-weight:700}
   .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
-  /* "Clear filter" button inside the empty state — the recovery path when a
-     filter narrows the table to 0 rows. Styled to match the toolbar buttons
-     but slightly larger + centered. */
-  .empty-clear{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
-    background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);
-    font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:background .12s,border-color .12s}
-  .empty-clear:hover{background:var(--pnl2);border-color:var(--acc)}
 
   /* ── Flag chips ───────────────────────────────────────────────────── */
-  /* Smaller + tighter so 14 chips don't dominate the footer. OFF chips are
-     very faint (they're just inventory); ON chips get the green accent so
-     the active config is scannable at a glance. */
-  .flags{display:flex;gap:3px;flex-wrap:wrap;max-width:60%}
-  .chip{font-size:8px;padding:1px 5px;border-radius:8px;border:1px solid var(--bd2);
-    color:var(--dim);text-transform:uppercase;letter-spacing:.3px;cursor:default;opacity:.5}
-  .chip.on{color:var(--grn);border-color:var(--grn);background:rgba(63,185,80,.08);opacity:1}
+  .flags{display:flex;gap:5px;flex-wrap:wrap}
+  .chip{font-size:9px;padding:2px 7px;border-radius:10px;border:1px solid var(--bd2);
+    color:var(--dim);text-transform:uppercase;letter-spacing:.4px;cursor:default}
+  .chip.on{color:var(--grn);border-color:var(--grn);background:rgba(63,185,80,.08)}
 
   /* ── Footer ───────────────────────────────────────────────────────── */
   footer{padding:9px 20px;border-top:1px solid var(--bd);background:var(--pnl);
     color:var(--dim);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
-  .ft-updated{color:var(--grn)}
-  .ft-updated.stale{color:var(--ylw)}
-  .ft-updated.dead{color:var(--red)}
   .err{color:var(--red)}
   .toast{position:fixed;bottom:54px;left:50%;transform:translateX(-50%) translateY(20px);
     background:var(--grn);color:#fff;padding:8px 18px;border-radius:6px;font-size:12px;font-weight:600;
@@ -10436,9 +10165,10 @@ def _s2l_viewer_endpoint() -> Response:
 <body>
 <header>
   <span class="pulse" id="pulse" title="connection health"></span>
-  <h1>CDN Viewer</h1>
+  <h1>S2L <span class="v">MULTIPORT</span> Viewer</h1>
   <span class="target" id="target-wrap">
     <span id="target"></span>
+    <span class="waf-badge" id="waf-badge" title="most recently detected upstream WAF/platform"><span class="dot"></span><span id="waf-name">—</span></span>
   </span>
   <span class="proxy" id="proxy" title="proxy listen address"></span>
   <span class="uptime" id="uptime" title="process uptime">—</span>
@@ -10450,15 +10180,53 @@ def _s2l_viewer_endpoint() -> Response:
     <div class="stat" data-tip="CDN assets fetched from upstream"><span class="n" id="s-cdn">0</span><span class="l">cdn</span></div>
     <div class="stat" data-tip="HTTP request+response pairs written to captures/"><span class="n" id="s-cap">0</span><span class="l">captured</span></div>
     <div class="stat" data-tip="WebSocket messages written to captures_ws/"><span class="n" id="s-wscap">0</span><span class="l">ws msg</span></div>
-    <div class="stat stat-broken" data-tip="CDN hosts with 4xx/5xx status or errors (click to filter)"><span class="n" id="s-broken">0</span><span class="l">broken</span></div>
-    <div class="stat stat-selected" data-tip="rows selected for bulk action (Shift+click for range)" style="display:none"><span class="n" id="s-selected">0</span><span class="l">sel</span></div>
   </div>
 </header>
 
+<!-- Throughput chart (60s rolling window, sampled from req_per_s) -->
+<div class="chart-card">
+  <div class="chart-head">
+    <span class="chart-title">Throughput · last 60 s</span>
+    <span class="chart-legend">
+      <span class="leg"><span class="sw cur"></span>now</span>
+      <span class="leg"><span class="sw peak"></span>peak</span>
+      <span class="leg"><span class="sw avg"></span>avg</span>
+    </span>
+    <div class="chart-vals">
+      <span class="kv cur"><span class="k">now</span><span class="v" id="cv-cur">0.0/s</span></span>
+      <span class="kv peak"><span class="k">peak</span><span class="v" id="cv-peak">0.0/s</span></span>
+      <span class="kv avg"><span class="k">avg</span><span class="v" id="cv-avg">0.0/s</span></span>
+      <span class="kv"><span class="k">total</span><span class="v" id="cv-total">0</span></span>
+    </div>
+  </div>
+  <svg class="chart-svg" id="chart" viewBox="0 0 600 64" preserveAspectRatio="none">
+    <defs><linearGradient id="chartgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--acc)" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="var(--acc)" stop-opacity="0"/>
+    </linearGradient></defs>
+    <g class="chart-grid">
+      <line x1="0" y1="16" x2="600" y2="16"/>
+      <line x1="0" y1="32" x2="600" y2="32"/>
+      <line x1="0" y1="48" x2="600" y2="48"/>
+    </g>
+    <path class="chart-area" id="chart-area" d=""/>
+    <polyline class="chart-line" id="chart-line" points=""/>
+    <circle class="chart-cur" id="chart-cur" cx="0" cy="64" r="3"/>
+  </svg>
+  <!-- Per-host request breakdown: a stacked horizontal bar showing each active
+       CDN host's share of total requests, with a legend. Renders from
+       active[].health.requests. Lets you see at a glance which host dominates
+       traffic without a full multi-series chart. -->
+  <div class="host-bar-wrap" id="host-bar-wrap">
+    <div class="host-bar" id="host-bar"></div>
+    <div class="host-bar-legend" id="host-bar-legend"></div>
+  </div>
+</div>
+
 <div class="toolbar">
   <div class="bar-group">
-    <span>Refresh</span><span class="rate" id="rate">50ms</span>
-    <select class="sel" id="rate-sel" title="Change Poll Interval">
+    <span>refresh</span><span class="rate" id="rate">50ms</span>
+    <select class="sel" id="rate-sel" title="change poll interval">
       <option value="50">50 ms</option>
       <option value="250">250 ms</option>
       <option value="1000">1 s</option>
@@ -10467,46 +10235,35 @@ def _s2l_viewer_endpoint() -> Response:
     </select>
   </div>
   <div class="search">
-    <input type="text" id="filter" placeholder="Filter CDN Hosts…" autocomplete="off">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04a.75.75 0 1 1-1.06 1.06l-3.04-3.04Z"/></svg>
+    <input type="text" id="filter" placeholder="filter CDN hosts…" autocomplete="off">
     <span class="count" id="filter-count"></span>
   </div>
-  <span class="tb-sep" aria-hidden="true"></span>
-  <button class="btn" id="pause-btn" title="Pause / Resume Polling (P)">
+  <button class="btn" id="pause-btn" title="pause / resume polling (P)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5v9a.5.5 0 0 0 .8.4l7-4.5a.5.5 0 0 0 0-.8l-7-4.5A.5.5 0 0 0 5 3.5Z"/></svg>
     <span id="pause-label">Pause</span>
   </button>
-  <span class="tb-sep" aria-hidden="true"></span>
-  <button class="btn" id="open-all-btn" title="Open Every CDN Port in a New Tab (O)">
+  <button class="btn" id="open-all-btn" title="open every CDN port in a new tab (O)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2A1.75 1.75 0 0 0 2 3.75v8.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 12.25v-8.5A1.75 1.75 0 0 0 12.25 2h-8.5ZM5 10.75a.75.75 0 0 1 .75-.75h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1-.75-.75Z"/></svg>
-    Open All
+    Open all
   </button>
-  <button class="btn" id="broken-btn" title="Select Broken CDNs (5xx/4xx) — Filters the Table to Hosts With Errors (B)" style="border-color:var(--bad);color:var(--bad)">
-    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM5.5 4.75a.75.75 0 0 0-1.5 0v3.5a.75.75 0 0 0 1.5 0v-3.5Zm.25 6a1 1 0 1 0 2 0 1 1 0 0 0-2 0Z"/></svg>
-    Broken
-  </button>
-  <button class="btn" id="copy-all-btn" title="Copy All (Visible) CDN URLs to Clipboard (Shift+A)">
+  <button class="btn" id="copy-all-btn" title="copy all CDN URLs to clipboard (Shift+A)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>
-    Copy All
+    Copy all
   </button>
-  <span class="tb-sep tb-sel-grp" aria-hidden="true" style="display:none"></span>
-  <button class="btn" id="open-sel-btn" title="Open the Selected CDN URLs in New Tabs" style="display:none">
-    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2A1.75 1.75 0 0 0 2 3.75v8.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0 0 14 12.25v-8.5A1.75 1.75 0 0 0 12.25 2h-8.5Zm6.5 9.25a.75.75 0 0 1-1.5 0V6.56L6.78 8.28a.75.75 0 0 1-1.06-1.06l3-3a.75.75 0 0 1 1.06 0l3 3a.75.75 0 1 1-1.06 1.06L9.75 6.56v4.69Z"/></svg>
-    <span id="open-sel-label">Open 0</span>
-  </button>
-  <button class="btn" id="copy-sel-btn" title="Copy the Selected CDN URLs (S)" style="display:none">
-    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 1.5a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5h-8.5ZM3 5.75A.75.75 0 0 1 3.75 5h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 3 5.75Zm0 4A.75.75 0 0 1 3.75 9h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 3 9.75ZM3.75 13a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5h-8.5Z"/></svg>
-    <span id="copy-sel-label">Copy 0</span>
-  </button>
-  <span class="tb-sep" aria-hidden="true"></span>
-  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="Browse Recorded HTTP/WS Captures (C)" style="text-decoration:none">
+  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="browse recorded HTTP/WS captures (C)" style="text-decoration:none">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25Z"/><path d="M5 5.75A.75.75 0 0 1 5.75 5h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 5.75Zm0 3A.75.75 0 0 1 5.75 8h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 8.75Zm0 3a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1-.75-.75Z"/></svg>
     Captures
   </a>
-  <button class="btn" id="reset-btn" title="Reset All Counters for a Clean Benchmark Window (R)" style="border-color:var(--warn);color:var(--warn)">
+  <button class="btn" id="reset-btn" title="reset all counters for a clean benchmark window (R)" style="border-color:var(--warn);color:var(--warn)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 1-4.546 2.914.75.75 0 0 0-1.36-.632A6.5 6.5 0 1 0 8 1.5v-.994a.25.25 0 0 0-.382-.214L4.5 2.5l3.118 1.993A.25.25 0 0 0 8 4.279Z"/></svg>
     Reset
   </button>
-  <button class="btn" id="theme-btn" title="Toggle Dark / Light Theme (T)">
+  <button class="btn" id="export-btn" title="export as JSON / CSV (E)">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14Z"/><path d="M7.25 7.69V1.75a.75.75 0 0 1 1.5 0v5.94l1.97-1.97a.75.75 0 1 1 1.06 1.06L8 11.06 4.22 7.28a.75.75 0 0 1 1.06-1.06l1.97 1.47Z"/></svg>
+    Export
+  </button>
+  <button class="btn" id="theme-btn" title="toggle dark / light theme (T)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6Zm0-4.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3ZM8 0a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V.75A.75.75 0 0 1 8 0Zm0 13a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 13ZM2.34 2.34a.75.75 0 0 1 1.06 0l1.06 1.06A.75.75 0 0 1 3.4 4.46L2.34 3.4a.75.75 0 0 1 0-1.06Zm9.14 9.14a.75.75 0 0 1 1.06 0l1.06 1.06a.75.75 0 1 1-1.06 1.06l-1.06-1.06a.75.75 0 0 1 0-1.06ZM0 8a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 0 8Zm13 0a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 13 8ZM2.34 13.66a.75.75 0 0 1 0-1.06l1.06-1.06a.75.75 0 1 1 1.06 1.06l-1.06 1.06a.75.75 0 0 1-1.06 0Zm9.14-9.14a.75.75 0 0 1 0-1.06l1.06-1.06a.75.75 0 1 1 1.06 1.06l-1.06 1.06a.75.75 0 0 1-1.06 0Z"/></svg>
     Theme
   </button>
@@ -10518,20 +10275,19 @@ def _s2l_viewer_endpoint() -> Response:
       <th class="sortable" data-sort="idx" style="width:42px">#<span class="caret"></span></th>
       <th class="sortable" data-sort="host">CDN HOST<span class="caret"></span></th>
       <th class="sortable" data-sort="port" style="width:80px">PORT<span class="caret"></span></th>
-      <th class="sortable" data-sort="health" style="width:170px">HEALTH<span class="caret"></span></th>
+      <th style="width:170px">HEALTH</th>
       <th class="sortable" data-sort="url">LOCAL URL<span class="caret"></span></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
   </div>
   <div class="empty" id="empty" style="display:none">
-    <div class="big" id="empty-big">No MULTIPORT CDNs yet</div>
-    <div class="sub" id="empty-sub">They appear here in real time as the proxy registers them.<br>Browse the target site to populate this table.</div>
-    <button class="btn empty-clear" id="empty-clear" style="display:none;margin-top:14px">Clear Filter</button>
+    <div class="big">No MULTIPORT CDNs yet</div>
+    <div class="sub">They appear here in real time as the proxy registers them.<br>Browse the target site to populate this table.</div>
   </div>
 </main>
 <footer>
-  <span id="ft-left"><span class="tag" id="latency">— ms</span> · <span class="ft-updated" id="ft-updated" title="Time Since the Last Successful Poll">Updated —</span> · <span class="kbd">P</span> Pause <span class="kbd">/</span> Filter <span class="kbd">?</span> Help</span>
+  <span id="ft-left">S2L web viewer · <span class="tag" id="latency">— ms</span> · <span class="kbd">P</span> pause <span class="kbd">T</span> theme <span class="kbd">E</span> export <span class="kbd">O</span> open-all <span class="kbd">⇧A</span> copy-all <span id="ft-cap"><span class="kbd">C</span> captures </span><span class="kbd">R</span> reset <span class="kbd">/</span> filter <span class="kbd">?</span> help</span>
   <span class="flags" id="flags"></span>
   <span id="ft-right">—</span>
 </footer>
@@ -10541,23 +10297,18 @@ def _s2l_viewer_endpoint() -> Response:
   <div class="help-card">
     <div class="help-head"><span>S2L Viewer — Keyboard Shortcuts</span><button class="help-close" id="help-close">&times;</button></div>
     <div class="help-body">
-      <div class="help-row"><span class="kbd">P</span><span>Pause / Resume Polling</span></div>
-      <div class="help-row"><span class="kbd">T</span><span>Toggle Dark / Light Theme</span></div>
-      <div class="help-row"><span class="kbd">O</span><span>Open All CDN Ports in New Tabs</span></div>
-      <div class="help-row"><span class="kbd">⇧A</span><span>Copy All CDN URLs to Clipboard</span></div>
-      <div class="help-row" id="help-cap"><span class="kbd">C</span><span>Open the Capture Browser</span></div>
-      <div class="help-row"><span class="kbd">R</span><span>Reset All Counters (Benchmark Window)</span></div>
-      <div class="help-row"><span class="kbd">/</span><span>Focus the CDN Host Filter</span></div>
-      <div class="help-row"><span class="kbd">H</span><span>Sort by Health (Broken CDNs First)</span></div>
-      <div class="help-row"><span class="kbd">B</span><span>Toggle the Broken-CDN Filter</span></div>
-      <div class="help-row"><span class="kbd">⇧B</span><span>Select All Broken CDNs (Filter + Select in One Step)</span></div>
-      <div class="help-row"><span class="kbd">S</span><span>Copy the Selected CDN URLs</span></div>
-      <div class="help-row"><span class="kbd">⇧O</span><span>Open the Selected CDN URLs in New Tabs</span></div>
-      <div class="help-row"><span class="kbd">⌃A</span><span>Select All Visible CDN Rows</span></div>
-      <div class="help-row"><span class="kbd">?</span><span>Toggle This Help Overlay</span></div>
-      <div class="help-row"><span class="kbd">Esc</span><span>Clear Filter / Selection / Close Overlay</span></div>
+      <div class="help-row"><span class="kbd">P</span><span>pause / resume polling</span></div>
+      <div class="help-row"><span class="kbd">T</span><span>toggle dark / light theme</span></div>
+      <div class="help-row"><span class="kbd">E</span><span>export as JSON (Shift+E = CSV)</span></div>
+      <div class="help-row"><span class="kbd">O</span><span>open all CDN ports in new tabs</span></div>
+      <div class="help-row"><span class="kbd">⇧A</span><span>copy all CDN URLs to clipboard</span></div>
+      <div class="help-row" id="help-cap"><span class="kbd">C</span><span>open the capture browser</span></div>
+      <div class="help-row"><span class="kbd">R</span><span>reset all counters (benchmark window)</span></div>
+      <div class="help-row"><span class="kbd">/</span><span>focus the CDN host filter</span></div>
+      <div class="help-row"><span class="kbd">?</span><span>toggle this help overlay</span></div>
+      <div class="help-row"><span class="kbd">Esc</span><span>close overlay / modal</span></div>
     </div>
-    <div class="help-foot">Click any column header to sort · Click a row to select it (Shift+click = range, Ctrl+click = add) · Polling auto-pauses while a selection is active · Hover a row for copy/cURL buttons</div>
+    <div class="help-foot">click any column header to sort · hover a row for copy/cURL buttons</div>
   </div>
 </div>
 <script>
@@ -10571,19 +10322,9 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
   var rowMap=Object.create(null);
   var inFlight=false, consecutiveErr=0, paused=false, refreshMs=DEFAULT_REFRESH;
   var sortKey="idx", sortDir="asc", filterText="";
+  var chartData=[];                 // rolling history of req_per_s (last 120 samples = ~60s at 500ms, but we sample every poll)
+  var CHART_MAX=120;
   var lastData=null;
-  var lastPollOk=0;                  // ms timestamp of last successful poll (for "updated Xs ago")
-  // Bulk-selection state: a Set of host names the user has selected (click on
-  // a row's non-button area toggles; Shift+click selects a range from the
-  // last anchor). The selection survives the 50 ms refresh because it lives
-  // on the stable <tr> node (.selected class) + in this Set.
-  var selectedHosts=new Set();
-  var selAnchorHost=null;            // last clicked host (for Shift+click range)
-  // Auto-pause-on-selection state: selPausedPolling is true when WE paused
-  // polling because a selection started (so we know to resume when it clears).
-  // selWasPaused is true when the USER manually paused — we don't auto-resume
-  // in that case (their manual choice takes precedence).
-  var selPausedPolling=false, selWasPaused=false;
 
   // ── Theme persistence ────────────────────────────────────────────────
   function applyStoredTheme(){
@@ -10591,20 +10332,6 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     if(t === "light") document.documentElement.setAttribute("data-theme","light");
   }
   applyStoredTheme();
-  // ── localStorage persistence: remember the user's sort column/direction
-  // and refresh rate between browser sessions so they don't have to
-  // re-configure every time they open the viewer. Filter text is NOT
-  // persisted (a stale filter would hide data on reload — confusing).
-  (function applyStoredPrefs(){
-    var sk = localStorage.getItem("s2l-sort-key");
-    var sd = localStorage.getItem("s2l-sort-dir");
-    if(sk && ["idx","host","port","health","url"].indexOf(sk) !== -1) sortKey = sk;
-    if(sd === "asc" || sd === "desc") sortDir = sd;
-    var rr = localStorage.getItem("s2l-refresh");
-    if(rr){ var n = parseInt(rr, 10); if(!isNaN(n) && n >= 0) refreshMs = n; }
-  })();
-  function persistSort(){ localStorage.setItem("s2l-sort-key", sortKey); localStorage.setItem("s2l-sort-dir", sortDir); }
-  function persistRefresh(){ localStorage.setItem("s2l-refresh", String(refreshMs)); }
 
   // ── Deep-linking: ?host=<hostname> pre-filters the CDN table on load.
   // Lets the capture browser's "back to viewer" link return to a filtered
@@ -10646,17 +10373,6 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     if(s<3600) return Math.floor(s/60)+"m ago";
     return Math.floor(s/3600)+"h ago";
   }
-  // "updated Xs ago" indicator in the footer. Green when fresh (<3s), amber
-  // when getting stale (<15s), red when clearly lagging or never polled.
-  // Ticked every 1s so it stays accurate even while polling is paused (then
-  // it visibly drifts to red, which is itself useful signal).
-  function renderUpdated(){
-    var el=$("ft-updated"); if(!el) return;
-    if(!lastPollOk){ el.textContent="Updated —"; el.className="ft-updated dead"; return; }
-    var s=(Date.now()-lastPollOk)/1000;
-    el.textContent="Updated "+fmtAgo(s);
-    el.className = s<3 ? "ft-updated" : s<15 ? "ft-updated stale" : "ft-updated dead";
-  }
   function showToast(msg, kind){
     var t=$("toast"); t.textContent=msg; t.className="toast"+(kind?" "+kind:""); t.classList.add("show");
     clearTimeout(t._tid); t._tid=setTimeout(function(){t.classList.remove("show");},1800);
@@ -10665,88 +10381,133 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     var p=$("pulse"); p.className="pulse"+(state==="stale"?" stale":state==="dead"?" dead":"");
   }
 
-  // ── Health cell per host ─────────────────────────────────────────────
-  // Health cell: a STABLE structure (built once per row, never recreated).
-  // Only the dot's class + the text spans are touched on each refresh — the
-  // innerHTML is never rebuilt per tick, so nothing inside it can be yanked
-  // out from under an in-progress mouse event. Sparkline removed (kept the
-  // dot + status + error badge + sub-line, which is all that's needed).
-  function buildHealthCell(){
-    var wrap=document.createElement("div");
-    wrap.className="health";
-    wrap.setAttribute("role","img");
-    wrap.innerHTML='<span class="hdot unknown" aria-hidden="true"></span>'
-      + '<span class="hmeta"><span class="status">—</span>'
-      + '<span class="errbadge" style="display:none"></span>'
-      + '<span class="sub">no traffic yet</span></span></span>';
-    return wrap;
-  }
-  function updateHealthCell(wrap, h){
-    var dot=wrap.firstChild, meta=wrap.lastChild;
-    var stEl=meta.children[0], eb=meta.children[1], sub=meta.children[2];
-    if(!h){
-      dot.className="hdot unknown";
-      stEl.className="status"; stEl.textContent="—";
-      eb.style.display="none";
-      sub.textContent="no traffic yet";
-      wrap.setAttribute("aria-label","host health: no traffic yet");
-      return;
+  // ── Throughput chart (SVG) ───────────────────────────────────────────
+  function renderChart(rps){
+    chartData.push(rps);
+    if(chartData.length>CHART_MAX) chartData.shift();
+    var n=chartData.length;
+    var peak=0, sum=0;
+    for(var i=0;i<n;i++){ peak=Math.max(peak,chartData[i]); sum+=chartData[i]; }
+    var avg = n? sum/n : 0;
+    setText($("cv-cur"), rps.toFixed(1)+"/s");
+    setText($("cv-peak"), peak.toFixed(1)+"/s");
+    setText($("cv-avg"), avg.toFixed(1)+"/s");
+    setText($("cv-total"), lastData? (lastData.proxied||0) : 0);
+
+    var w=600, h=64, max=Math.max(peak, 0.5);
+    var step = n>1 ? w/(CHART_MAX-1) : 0;
+    var pts=[], areaPts=[];
+    for(var j=0;j<n;j++){
+      var x = j*step;
+      var y = h - 2 - (chartData[j]/max)*(h-6);
+      pts.push(x.toFixed(1)+","+y.toFixed(1));
     }
-    var st=h.last_status||0;
-    var cls="ok", statusCls="";
-    if(st===0||st>=500){ cls="bad"; statusCls="bad"; }
-    else if(st>=400||h.errors>0){ cls="warn"; statusCls="warn"; }
-    dot.className="hdot "+cls;
-    stEl.className="status "+statusCls; stEl.textContent=String(st||"—");
-    var ago=h.last_seen?fmtAgo(Date.now()/1000 - h.last_seen):"—";
-    var rtt=(h.last_rtt_ms!=null)?h.last_rtt_ms+"ms":"—";
-    var reqs=h.requests||0, errs=h.errors||0;
-    sub.textContent=rtt+" · "+ago+" · "+reqs+" req";
-    if(errs>0){
-      var rate=reqs>0?(errs/reqs*100):100;
-      var ecls=(rate>=10||st>=500)?"bad":"warn";
-      eb.className="errbadge "+ecls;
-      eb.textContent="!"+errs;
-      eb.title=errs+" error(s) in "+reqs+" request(s) ("+rate.toFixed(1)+"%)";
-      eb.style.display="";
-    } else { eb.style.display="none"; }
-    wrap.setAttribute("aria-label","host health: status "+(st||"unknown")+", "+rtt+" RTT, "+reqs+" requests"+(errs?(", "+errs+" errors"):"")+", seen "+ago);
+    // Area path: start at bottom-left, trace the line, close at bottom-right.
+    var areaD = "M0,"+h+" L" + pts.join(" L") + " "+((n-1)*step).toFixed(1)+","+h+" Z";
+    $("chart-line").setAttribute("points", pts.join(" "));
+    $("chart-area").setAttribute("d", areaD);
+    if(n){
+      var lx=(n-1)*step, ly=h-2-(chartData[n-1]/max)*(h-6);
+      var cc=$("chart-cur"); cc.setAttribute("cx",lx.toFixed(1)); cc.setAttribute("cy",ly.toFixed(1));
+    }
+  }
+
+  // ── Per-host request-share bar (stacked) ─────────────────────────────
+  // Shows each active CDN host's share of total requests as a colored segment
+  // in a horizontal bar, with a legend. Uses a fixed palette cycled by host
+  // index so each host gets a stable color. Renders from active[].health.requests.
+  var HOST_COLORS = ["#58a6ff","#3fb950","#d29922","#bc8cff","#f85149","#79c0ff","#56d4dd","#ff7b72","#7ee787","#ffa657"];
+  function renderHostBar(active){
+    var bar=$("host-bar"), leg=$("host-bar-legend");
+    if(!active || !active.length){ bar.innerHTML=""; leg.innerHTML=""; return; }
+    // Sum requests across active hosts (skip hosts with no health record).
+    var items=[];
+    var total=0;
+    active.forEach(function(h,i){
+      var reqs = (h.health && h.health.requests) ? h.health.requests : 0;
+      if(reqs>0){ items.push({host:h.host, reqs:reqs, color:HOST_COLORS[i % HOST_COLORS.length]}); total+=reqs; }
+    });
+    if(!total){ bar.innerHTML=""; leg.innerHTML='<span style="color:var(--dim)">no per-host request data yet</span>'; return; }
+    // Build segments (sorted desc so the biggest hosts are on the left).
+    items.sort(function(a,b){return b.reqs-a.reqs;});
+    var segs=[], legs=[];
+    items.forEach(function(it){
+      var pct = (it.reqs/total*100);
+      segs.push('<div class="seg" style="width:'+pct.toFixed(2)+'%;background:'+it.color+'" title="'+it.host+': '+it.reqs+' req ('+pct.toFixed(1)+'%)"></div>');
+      legs.push('<span class="lh"><span class="sw" style="background:'+it.color+'"></span>'+it.host+'<span class="pct">'+pct.toFixed(0)+'%</span></span>');
+    });
+    bar.innerHTML=segs.join("");
+    leg.innerHTML=legs.join("");
+  }
+
+  // ── WAF badge ────────────────────────────────────────────────────────
+  var KNOWN_WAFS = ["Cloudflare","Akamai","Sucuri WAF","Imperva/Incapsula","AWS CloudFront","Fastly","ESF","F5 BIG-IP","Citrix Netscaler","Reblaze","Distil"];
+  function renderWAF(plat){
+    var name = (plat && plat.name) || "Unknown";
+    var age = (plat && plat.age_s) || 0;
+    var badge=$("waf-badge"), nm=$("waf-name");
+    setText(nm, name);
+    var known = KNOWN_WAFS.indexOf(name) !== -1;
+    badge.className = "waf-badge"+(known?" known":"");
+    badge.title = "detected upstream WAF/platform: "+name+(age?(" · "+fmtAgo(age)):"");
+  }
+
+  // ── Health cell per host ─────────────────────────────────────────────
+  function healthHTML(h){
+    if(!h) return '<div class="health"><span class="hdot unknown"></span><span class="hmeta"><span class="sub">no traffic yet</span></span></span></div>';
+    var cls = "ok", statusCls="";
+    var st = h.last_status||0;
+    if(st===0 || st>=500){ cls="bad"; statusCls="bad"; }
+    else if(st>=400 || h.errors>0){ cls="warn"; statusCls="warn"; }
+    var ago = h.last_seen ? fmtAgo(Date.now()/1000 - h.last_seen) : "—";
+    var rtt = (h.last_rtt_ms!=null) ? h.last_rtt_ms+"ms" : "—";
+    var reqs = h.requests||0;
+    var errs = h.errors||0;
+    // Error-rate badge: only shown when the host has errors, so a clean host
+    // stays uncluttered. Color escalates with the error rate (warn < 10%,
+    // bad >= 10% or any 5xx in the last sample).
+    var errBadge = "";
+    if(errs > 0){
+      var rate = reqs>0 ? (errs/reqs*100) : 100;
+      var ecls = (rate>=10 || st>=500) ? "bad" : "warn";
+      errBadge = '<span class="errbadge '+ecls+'" title="'+errs+' error(s) in '+reqs+' request(s) ('+rate.toFixed(1)+'%)">!'+errs+'</span>';
+    }
+    // Mini RTT sparkline from rtt_history (up to 20 samples). Color matches
+    // the health dot so a degrading host's sparkline turns amber/red too.
+    var spark = "";
+    var hist = h.rtt_history || [];
+    if(hist.length >= 2){
+      var w=48, hh=18, n=hist.length, mx=Math.max.apply(null,hist), mn=Math.min.apply(null,hist);
+      var range=(mx-mn)||1, pts=[];
+      for(var i=0;i<n;i++){
+        var x=(i/(n-1))*w;
+        var y=hh-1-((hist[i]-mn)/range)*(hh-2);
+        pts.push(x.toFixed(1)+","+y.toFixed(1));
+      }
+      var lastx=w, lasty=hh-1-((hist[n-1]-mn)/range)*(hh-2);
+      var scol = cls==="ok"?"var(--grn)":cls==="warn"?"var(--warn)":"var(--bad)";
+      spark = '<svg class="hspark" viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" title="RTT trend: '+mn+'–'+mx+'ms">'
+        + '<polyline points="'+pts.join(" ")+'" fill="none" stroke="'+scol+'" stroke-width="1.3" stroke-linejoin="round"/>'
+        + '<circle cx="'+lastx.toFixed(1)+'" cy="'+lasty.toFixed(1)+'" r="1.6" fill="'+scol+'"/>'
+        + '</svg>';
+    }
+    var ariaLabel = "host health: status "+(st||"unknown")+", "+rtt+" RTT, "+reqs+" requests"+(errs?(", "+errs+" errors"):"")+", seen "+ago;
+    return '<div class="health" role="img" aria-label="'+ariaLabel+'"><span class="hdot '+cls+'" aria-hidden="true"></span>'+spark
+      + '<span class="hmeta"><span class="status '+statusCls+'">'+(st||"—")+'</span>'+errBadge
+      + '<span class="sub">'+rtt+' · '+ago+' · '+reqs+' req</span></span></div>';
   }
 
   // ── Sorting + filtering ──────────────────────────────────────────────
-  // Health "badness" rank for the sortable HEALTH column: higher = more
-  // broken. asc = worst-first (surfaces broken CDNs to the top on the first
-  // click), desc = best-first. Used by applySortFilter AND by the filtered
-  // export so the two stay consistent.
-  function healthBadness(h){
-    if(!h) return 0.5;                  // no health record at all = mild unknown
-    var st=h.last_status||0, errs=h.errors||0;
-    var base = 0;                        // 2xx/3xx = healthy baseline
-    if(st===0) base = 1;                 // unknown / no traffic yet
-    else if(st>=500) base = 5;           // server error
-    else if(st>=400) base = 3;           // client error
-    return base + Math.min(errs, 50)*0.02; // errors nudge worse, capped
-  }
   function applySortFilter(active){
     var f=filterText.toLowerCase();
-    var brokenMode = f === "__broken__";
-    var filtered;
-    if(!f){ filtered = active.slice(); }
-    else if(brokenMode){ filtered = active.filter(isBrokenHost); }
-    else { filtered = active.filter(function(h){
+    var filtered = !f ? active : active.filter(function(h){
       return h.host.toLowerCase().indexOf(f)!==-1 || String(h.port).indexOf(f)!==-1 || h.url.toLowerCase().indexOf(f)!==-1;
-    }); }
+    });
     filtered.sort(function(a,b){
-      var av, bv;
+      var av=a[sortKey], bv=b[sortKey];
       if(sortKey==="idx"){ av=active.indexOf(a)+1; bv=active.indexOf(b)+1; }
-      else if(sortKey==="port"){ av=a.port; bv=b.port; }
-      else if(sortKey==="health"){ av=healthBadness(a.health); bv=healthBadness(b.health); }
-      else { av=a[sortKey]; bv=b[sortKey]; }
+      if(sortKey==="port"){ av=a.port; bv=b.port; }
       var r = av<bv?-1:av>bv?1:0;
-      // For HEALTH, invert the direction so the FIRST click (asc) surfaces the
-      // WORST CDNs to the top — that's the useful default (find what's broken).
-      // Second click (desc) → best-first. Other columns keep normal asc/desc.
-      if(sortKey==="health"){ return sortDir==="asc"? -r : r; }
       return sortDir==="asc"? r : -r;
     });
     return filtered;
@@ -10764,52 +10525,12 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     el.innerHTML=html.join("");
   }
 
-  // Apply the current selection set to the visible <tr> nodes (add/remove
-  // the .selected class). Called after a selection change AND at the end of
-  // every render() so the class sticks across the 50 ms refresh (the <tr>
-  // node is stable, so toggling its class is cheap and non-destructive).
-  function applySelectionToRows(){
-    for(var host in rowMap){
-      var tr=rowMap[host].tr;
-      tr.classList.toggle("selected", selectedHosts.has(host));
-    }
-  }
-  // Update the header "sel" stat + the "Copy N"/"Open N" buttons + the
-  // selection-group separator visibility based on the current selection
-  // size. All hidden when nothing is selected.
-  function updateSelStat(){
-    var n=selectedHosts.size;
-    var ssel=$("s-selected"), sselParent=ssel?ssel.parentNode:null;
-    var csel=$("copy-sel-btn"), cslabel=$("copy-sel-label");
-    var osel=$("open-sel-btn"), oslabel=$("open-sel-label");
-    var sep=document.querySelector(".tb-sel-grp");
-    if(ssel) setText(ssel, String(n));
-    if(sselParent) sselParent.style.display = n>0 ? "" : "none";
-    if(csel) csel.style.display = n>0 ? "" : "none";
-    if(cslabel) cslabel.textContent = "Copy "+n;
-    if(osel) osel.style.display = n>0 ? "" : "none";
-    if(oslabel) oslabel.textContent = "Open "+n;
-    if(sep) sep.style.display = n>0 ? "" : "none";
-    // Auto-pause-on-selection (candidate m): when the user starts a selection,
-    // pause polling so the table is stable for inspection. When the selection
-    // is cleared (by Esc or by clicking away), resume if the user hadn't
-    // manually paused. Track the user's manual pause state separately so we
-    // don't clobber it.
-    if(n>0 && !paused && !selWasPaused){
-      selPausedPolling = true;
-      doPause(true, "selection");
-    } else if(n===0 && selPausedPolling){
-      selPausedPolling = false;
-      doPause(false, "");
-    }
-  }
-
   function render(d){
     lastData=d;
     $("rate").textContent = (d.refresh_ms||DEFAULT_REFRESH)+"ms";
     setText($("target"), d.target||"");
     setText($("proxy"), d.proxy||"");
-    setText($("uptime"), "up "+fmtUptime(d.uptime_s||0));
+    setText($("uptime"), "⏱ "+fmtUptime(d.uptime_s||0));
     setText($("s-active"), String(d.active.length));
     setText($("s-pending"), String(d.pending||0));
     setText($("s-shared"), String(d.shared||0));
@@ -10817,27 +10538,14 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     setText($("s-cdn"), String(d.cdn_fetched||0));
     setText($("s-cap"), String(d.captured||0));
     setText($("s-wscap"), String(d.ws_captured||0));
-    // Broken stat: count hosts with 4xx/5xx status or errors. Red-tinted
-    // when >0 so a degraded CDN set is visible at a glance in the header.
-    var brokenCount = d.active.filter(isBrokenHost).length;
-    var bstat=$("s-broken").parentNode;
-    setText($("s-broken"), String(brokenCount));
-    bstat.classList.toggle("has-broken", brokenCount>0);
-    bstat.classList.toggle("active", filterText==="__broken__");
     setText($("latency"), ($("latency")._last||"—")+" ms");
+    if(d.platform) renderWAF(d.platform);
     if(d.flags) renderFlags(d.flags);
+    renderChart(d.req_per_s||0);
+    renderHostBar(d.active);
+
     var sorted = applySortFilter(d.active);
-    var seen=Object.create(null);
-    var prevTr=null;
-    // Smart-merge render (the click-bug fix):
-    //  · existing <tr> are reused as-is — buttons/links are created ONCE on
-    //    first appearance and never recreated or detached;
-    //  · a row is moved only with insertBefore when it's actually out of
-    //    position (minimal DOM mutation), never by re-appending a fragment
-    //    that detaches every row each tick — that detach/reattach at 50 ms
-    //    was what killed in-progress clicks;
-    //  · the health cell is a stable structure updated via textContent /
-    //    className, so its innerHTML is never rebuilt per tick either.
+    var seen=Object.create(null), frag=document.createDocumentFragment();
     for(var i=0;i<sorted.length;i++){
       var h=sorted[i], key=h.host;
       seen[key]=true;
@@ -10847,21 +10555,19 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
         var cN=document.createElement("td"), cH=document.createElement("td"),
             cP=document.createElement("td"), cHl=document.createElement("td"), cU=document.createElement("td");
         cH.className="host"; cP.className="port";
-        var a=document.createElement("a"); a.target="_blank";
+        var a=document.createElement("a"); a.href=h.url; a.target="_blank"; a.textContent=h.url; a.title=h.url;
         var cb=document.createElement("button"); cb.className="copy-btn"; cb.textContent="copy";
         (function(url,btn){btn.onclick=function(ev){ev.preventDefault();ev.stopPropagation();
           navigator.clipboard && navigator.clipboard.writeText(url);
           btn.closest("tr").classList.add("copy-flash");
           setTimeout(function(){btn.closest("tr").classList.remove("copy-flash");},800);
           showToast("Copied "+url);};})(h.url,cb);
-        // "cURL" button: copies a ready-to-paste `curl` command for this CDN
-        // host's REAL upstream URL (https://<host>/), not the local proxy URL.
-        // This lets a developer debug the upstream CDN directly from a
-        // terminal, bypassing the proxy.
+        // "cURL" button: copies a ready-to-paste `curl` command for this CDN host
+        // (GET the local URL with a browser-like UA + Accept header) so a
+        // developer can instantly debug a host from the terminal.
         var curlBtn=document.createElement("button"); curlBtn.className="copy-btn curl-btn"; curlBtn.textContent="cURL";
         (function(host,url,btn){btn.onclick=function(ev){ev.preventDefault();ev.stopPropagation();
-          var realUrl='https://'+host+'/';
-          var cmd='curl -sS -D - "'+realUrl+'" \\\n  -H "User-Agent: Mozilla/5.0 (site2local)" \\\n  -H "Accept: */*"';
+          var cmd='curl -sS -D - "'+url+'/" \\\n  -H "User-Agent: Mozilla/5.0 (site2local)" \\\n  -H "Accept: */*"';
           if(navigator.clipboard && navigator.clipboard.writeText){
             navigator.clipboard.writeText(cmd).then(function(){
               btn.closest("tr").classList.add("copy-flash");
@@ -10875,100 +10581,24 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
           }
         };})(h.host,h.url,curlBtn);
         cU.appendChild(a); cU.appendChild(cb); cU.appendChild(curlBtn);
-        var hc=buildHealthCell();
-        cHl.appendChild(hc);
         tr.appendChild(cN); tr.appendChild(cH); tr.appendChild(cP); tr.appendChild(cHl); tr.appendChild(cU);
         tr.className="new";
-        // Row click (on the non-button area) toggles selection for bulk
-        // actions. Shift+click selects a range from the last anchor row.
-        // Button/link clicks inside the URL cell stop propagation so they
-        // don't trigger selection. Bound ONCE at row creation.
-        (function(hostKey){
-          tr.addEventListener("click", function(ev){
-            // Ignore clicks on the URL cell's interactive children (the <a>,
-            // copy, cURL buttons) — they have their own handlers + stopPropagation.
-            if(ev.target.closest("a, button")) return;
-            var sortedHosts = lastData ? applySortFilter(lastData.active).map(function(x){return x.host;}) : [];
-            if(ev.shiftKey && selAnchorHost && sortedHosts.indexOf(selAnchorHost)!==-1){
-              // Range select from selAnchorHost to hostKey (inclusive).
-              var i0=sortedHosts.indexOf(selAnchorHost), i1=sortedHosts.indexOf(hostKey);
-              if(i0===-1||i1===-1) return;
-              var lo=Math.min(i0,i1), hi=Math.max(i0,i1);
-              for(var k=lo;k<=hi;k++){ selectedHosts.add(sortedHosts[k]); }
-            } else if(ev.ctrlKey || ev.metaKey){
-              // Ctrl/Cmd+click = additive toggle (keep existing selection).
-              if(selectedHosts.has(hostKey)) selectedHosts.delete(hostKey);
-              else selectedHosts.add(hostKey);
-              selAnchorHost=hostKey;
-            } else {
-              // Plain click = exclusive toggle (clear others).
-              if(selectedHosts.has(hostKey) && selectedHosts.size===1){ selectedHosts.clear(); }
-              else { selectedHosts.clear(); selectedHosts.add(hostKey); }
-              selAnchorHost=hostKey;
-            }
-            applySelectionToRows();
-            updateSelStat();
-          });
-        })(key);
-        rowMap[key]={tr:tr, cN:cN, cH:cH, cP:cP, cHl:hc, cU:a};
-        r=rowMap[key];
-      }
-      // Update cell text in place — never recreate the row or its buttons.
+        frag.appendChild(tr);
+        rowMap[key]={tr:tr, cN:cN, cH:cH, cP:cP, cHl:cHl, cU:a};
+      } else { frag.appendChild(r.tr); }
+      r=rowMap[key];
       setText(r.cN, String(i+1));
       r.cN.className="idx";
       setText(r.cH, h.host);
       setText(r.cP, ":"+h.port);
-      updateHealthCell(r.cHl, h.health);
+      r.cHl.innerHTML = healthHTML(h.health);
       if(r.cU.textContent!==h.url){ r.cU.textContent=h.url; r.cU.href=h.url; r.cU.title=h.url; }
-      // Position with minimal DOM mutation: insertBefore only when the row
-      // isn't already in the right slot. This is what keeps a click on a
-      // copy/cURL button from being cancelled by the next 50 ms refresh tick.
-      var tr=r.tr;
-      if(prevTr===null){
-        if(rowsEl.firstChild!==tr){ rowsEl.insertBefore(tr, rowsEl.firstChild); }
-      } else {
-        if(prevTr.nextSibling!==tr){ rowsEl.insertBefore(tr, prevTr.nextSibling); }
-      }
-      prevTr=tr;
     }
-    // Row lifecycle: distinguish "host gone from the data" (delete + remove
-    // its <tr>) from "host filtered out by the current filter/sort" (just
-    // hide its <tr>, keep it in rowMap so toggling the filter back restores
-    // the SAME node — buttons, hover state, flash animations all survive).
-    // This is what makes the Broken filter toggle non-destructive.
-    var activeHosts=Object.create(null);
-    d.active.forEach(function(h){ activeHosts[h.host]=true; });
-    var visibleCount=0;
-    for(var k in rowMap){
-      var rr=rowMap[k];
-      if(!activeHosts[k]){                   // host left the data entirely
-        rr.tr.remove(); delete rowMap[k];
-      } else if(!seen[k]){                  // host exists but filtered out → hide
-        rr.tr.style.display="none";
-      } else {                              // host is visible
-        if(rr.tr.style.display==="none") rr.tr.style.display=""; visibleCount++;
-      }
-    }
+    for(var k in rowMap){ if(!seen[k]){ rowMap[k].tr.remove(); delete rowMap[k]; } }
+    rowsEl.appendChild(frag);
+    var visibleCount = Object.keys(rowMap).length;
     setText($("filter-count"), filterText ? visibleCount+"/"+d.active.length : "");
-    // Filter-aware empty state: when a filter narrows the table to 0 rows,
-    // show a centered "no match" message with a Clear Filter button instead
-    // of the default "No CDNs yet" message (which is misleading — the data
-    // exists, the filter just doesn't match). Prevents the black-void "dead
-    // end" the VLM flagged.
-    var hasData = d.active.length > 0;
-    var filteredEmpty = hasData && visibleCount === 0 && !!filterText;
-    var showEmpty = !hasData || filteredEmpty;
-    empty.style.display = showEmpty ? "block" : "none";
-    var ebig=$("empty-big"), esub=$("empty-sub"), eclear=$("empty-clear");
-    if(filteredEmpty){
-      if(ebig) ebig.textContent = "No hosts match \""+filterText+"\"";
-      if(esub) esub.innerHTML = "The filter returned 0 of "+d.active.length+" CDN hosts.<br>Try a different search term, or clear the filter to see all hosts.";
-      if(eclear) eclear.style.display = "";
-    } else {
-      if(ebig) ebig.textContent = "No MULTIPORT CDNs yet";
-      if(esub) esub.innerHTML = "They appear here in real time as the proxy registers them.<br>Browse the target site to populate this table.";
-      if(eclear) eclear.style.display = "none";
-    }
+    empty.style.display = d.active.length? "none":"block";
     var ths=document.querySelectorAll("th.sortable");
     for(var j=0;j<ths.length;j++){
       var th=ths[j];
@@ -10977,11 +10607,6 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
         th.classList.add(sortDir==="asc"?"sorted-asc":"sorted-desc");
       }
     }
-    // Re-apply the selection class to all rows so it survives the refresh
-    // (the <tr> nodes are stable, so this just re-syncs the .selected class
-    // in case a host's visibility changed).
-    applySelectionToRows();
-    updateSelStat();
   }
 
   function poll(){
@@ -10993,7 +10618,7 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     p.then(function(d){
       var lat=Math.round(performance.now()-t0);
       $("latency")._last=lat; $("latency").textContent=lat+" ms"; $("latency").className="tag ok";
-      lastPollOk=Date.now(); render(d); renderUpdated(); consecutiveErr=0; pulse("ok");
+      render(d); consecutiveErr=0; pulse("ok");
       $("ft-right").textContent="OK"; $("ft-right").className="";
     }).catch(function(e){
       consecutiveErr++;
@@ -11008,30 +10633,14 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     var v=parseInt(e.target.value,10);
     if(v===0){ paused=true; $("pause-label").textContent="Resume"; $("pause-btn").classList.add("active"); refreshMs=DEFAULT_REFRESH; }
     else { paused=false; refreshMs=v; $("pause-label").textContent="Pause"; $("pause-btn").classList.remove("active"); schedule(); }
-    persistRefresh();
   });
-  // Restore the rate-sel dropdown's selected option from the persisted
-  // refresh rate (the variable was set at init, but the <select> element
-  // still shows the default 50ms option unless we sync it here).
-  (function syncRateSel(){
-    var rs=$("rate-sel"); if(!rs) return;
-    var val = paused ? "0" : String(refreshMs);
-    for(var i=0;i<rs.options.length;i++){ if(rs.options[i].value===val){ rs.selectedIndex=i; break; } }
-  })();
-  // Centralized pause/resume. `reason` is "" for manual, "selection" for
-  // auto-pause. Tracks selWasPaused so the auto-pause logic doesn't fight a
-  // manual pause: if the user manually paused, we never auto-resume.
-  function doPause(state, reason){
-    if(reason==="") selWasPaused = state;   // manual toggle updates the flag
-    paused = state;
-    $("pause-label").textContent = paused ? "Resume" : "Pause";
-    var pb=$("pause-btn"); if(pb) pb.classList.toggle("active", paused);
-    var rs=$("rate-sel"); if(rs) rs.value = paused ? "0" : String(refreshMs);
-    if(!paused) schedule();
-  }
   $("pause-btn").addEventListener("click", function(){
-    doPause(!paused, "");
-    showToast(paused ? "Polling paused" : "Polling resumed");
+    paused=!paused;
+    $("pause-label").textContent=paused?"Resume":"Pause";
+    this.classList.toggle("active",paused);
+    $("rate-sel").value = paused? "0" : String(refreshMs);
+    if(!paused) schedule();
+    showToast(paused?"Polling paused":"Polling resumed");
   });
   $("theme-btn").addEventListener("click", function(){
     var cur=document.documentElement.getAttribute("data-theme");
@@ -11041,7 +10650,32 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     localStorage.setItem("s2l-theme", next||"dark");
     showToast((next==="light"?"Light":"Dark")+" theme");
   });
-
+  function exportJSON(){
+    if(!lastData){ showToast("No data yet"); return; }
+    var blob=new Blob([JSON.stringify(lastData,null,2)],{type:"application/json"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a"); a.href=url; a.download="s2l_viewer_"+(lastData.ts||"snap").replace(/:/g,"")+".json";
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Exported JSON ("+lastData.active.length+" hosts)");
+  }
+  function exportCSV(){
+    if(!lastData || !lastData.active.length){ showToast("No CDN hosts to export","warn"); return; }
+    var rows=[["host","port","url","last_status","last_rtt_ms","requests","errors","last_seen"]];
+    lastData.active.forEach(function(h){
+      var hl=h.health||{};
+      rows.push([h.host,h.port,h.url,hl.last_status||"",hl.last_rtt_ms||"",hl.requests||"",hl.errors||"",hl.last_seen?new Date(hl.last_seen*1000).toISOString():""]);
+    });
+    var csv=rows.map(function(r){return r.map(function(c){var s=String(c);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}).join(",");}).join("\n");
+    var blob=new Blob([csv],{type:"text/csv"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a"); a.href=url; a.download="s2l_cdn_"+(lastData.ts||"snap").replace(/:/g,"")+".csv";
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Exported CSV ("+lastData.active.length+" hosts)");
+  }
+  // Export button: click = JSON, shift+click = CSV.
+  $("export-btn").addEventListener("click", function(e){
+    if(e.shiftKey) exportCSV(); else exportJSON();
+  });
   $("open-all-btn").addEventListener("click", function(){
     if(!lastData || !lastData.active.length){ showToast("No CDN hosts to open","warn"); return; }
     if(lastData.active.length>5 && !confirm("Open "+lastData.active.length+" CDN URLs in new tabs?")) return;
@@ -11050,117 +10684,29 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
     });
     showToast("Opened "+lastData.active.length+" CDN URLs");
   });
-  // "Broken" button: filter the table to CDN hosts whose last status was 4xx
-  // or 5xx (or that have errors), and sort them worst-first. Toggling again
-  // clears it. The sentinel "__broken__" is recognized by applySortFilter so
-  // it doesn't collide with a normal free-text host search.
-  function isBrokenHost(h){
-    var st=(h.health&&h.health.last_status)||0;
-    var errs=(h.health&&h.health.errors)||0;
-    return st>=400 || errs>0;
-  }
-  // Toggle the Broken filter (on = show only 4xx/5xx hosts, worst-first;
-  // off = clear). Shared by the toolbar Broken button AND the header "broken"
-  // stat (which acts as a clickable shortcut to the same filter).
-  function toggleBrokenFilter(){
-    if(!lastData || !lastData.active.length){ showToast("No CDN hosts","warn"); return; }
-    var isOn = filterText==="__broken__";
-    if(isOn){
-      filterText=""; $("filter").value="";
-      var bb=$("broken-btn"); if(bb) bb.classList.remove("active");
-      if(lastData) render(lastData);
-      showToast("Cleared broken filter");
-      return;
-    }
-    var broken = lastData.active.filter(isBrokenHost);
-    if(!broken.length){ showToast("No broken CDNs — all healthy","warn"); return; }
-    filterText="__broken__";
-    var bb2=$("broken-btn"); if(bb2) bb2.classList.add("active");
-    sortKey="health"; sortDir="asc";           // worst-first (see applySortFilter)
-    if(lastData) render(lastData);
-    showToast("Showing "+broken.length+" broken CDN"+(broken.length===1?"":"s")+" · worst-first");
-  }
-  $("broken-btn").addEventListener("click", toggleBrokenFilter);
-  // Clicking the header "broken" stat also toggles the filter — a stat that
-  // doubles as an action is a natural triage entry point.
-  var bstatEl=$("s-broken");
-  if(bstatEl) bstatEl.parentNode.addEventListener("click", toggleBrokenFilter);
-  // Copy CDN URLs to clipboard. When a filter is active (free-text OR the
-  // Broken filter), copies ONLY the visible/filtered URLs — that's the set
-  // the user is looking at, so it's almost always what they want. With no
-  // filter, copies all (same as before).
-  function copyURLs(hosts, label){
-    if(!hosts || !hosts.length){ showToast("No CDN URLs to copy","warn"); return; }
-    var urls = hosts.map(function(h){ return h.url; }).join("\n");
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(urls).then(function(){
-        showToast("Copied "+hosts.length+" CDN URL"+(hosts.length===1?"":"s")+label);
-      }, function(){ showToast("Clipboard write failed","warn"); });
-    } else {
-      var ta=document.createElement("textarea"); ta.value=urls; document.body.appendChild(ta);
-      ta.select(); try{document.execCommand("copy"); showToast("Copied "+hosts.length+" CDN URL"+(hosts.length===1?"":"s")+label);}catch(e){showToast("Copy failed","warn");}
-      ta.remove();
-    }
-  }
+  // Copy all CDN URLs to clipboard (one per line), for pasting into scripts.
   $("copy-all-btn").addEventListener("click", function(){
     if(!lastData || !lastData.active.length){ showToast("No CDN hosts to copy","warn"); return; }
-    // Visible = applySortFilter result (respects free-text + Broken filter).
-    var visible = applySortFilter(lastData.active);
-    var label = (filterText && filterText!=="__broken__") ? " · filtered"
-              : filterText==="__broken__" ? " · broken" : "";
-    copyURLs(visible, label);
+    var urls = lastData.active.map(function(h){ return h.url; }).join("\n");
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(urls).then(function(){
+        showToast("Copied "+lastData.active.length+" CDN URLs to clipboard");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      // Fallback: select a temp textarea.
+      var ta=document.createElement("textarea"); ta.value=urls; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied "+lastData.active.length+" CDN URLs");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
   });
-  // Copy ONLY the selected CDN URLs (the bulk-action target). Order matches
-  // the current sort so the pasted list reads top-to-bottom like the screen.
-  $("copy-sel-btn").addEventListener("click", function(){
-    if(!lastData){ showToast("No data yet"); return; }
-    if(!selectedHosts.size){ showToast("No rows selected — click a row to select","warn"); return; }
-    // Preserve current sort order in the copied list.
-    var ordered = applySortFilter(lastData.active).filter(function(h){ return selectedHosts.has(h.host); });
-    copyURLs(ordered, " · selected");
-  });
-  // Open ONLY the selected CDN URLs in new tabs. Same ordering as copy-sel.
-  // Confirms before opening >5 to avoid a tab explosion.
-  $("open-sel-btn").addEventListener("click", function(){
-    if(!lastData){ showToast("No data yet"); return; }
-    if(!selectedHosts.size){ showToast("No rows selected — click a row to select","warn"); return; }
-    var ordered = applySortFilter(lastData.active).filter(function(h){ return selectedHosts.has(h.host); });
-    if(ordered.length>5 && !confirm("Open "+ordered.length+" CDN URLs in new tabs?")) return;
-    ordered.forEach(function(h){ window.open(h.url, "_blank", "noopener"); });
-    showToast("Opened "+ordered.length+" CDN URL"+(ordered.length===1?"":"s"));
-  });
-  // Select all visible rows (Ctrl+A). "Visible" = the current filtered+sorted
-  // set, so it respects the Broken filter and free-text search. Ctrl+A is
-  // normally "select all page text" — preventDefault so we own it here.
-  function selectAllVisible(){
-    if(!lastData || !lastData.active.length){ return; }
-    var visible = applySortFilter(lastData.active);
-    visible.forEach(function(h){ selectedHosts.add(h.host); });
-    applySelectionToRows();
-    updateSelStat();
-    showToast("Selected "+visible.length+" visible CDN"+(visible.length===1?"":"s"));
-  }
   $("filter").addEventListener("input", function(e){ filterText=e.target.value.trim();
-    // Typing into the filter takes over from the Broken button — clear its
-    // active state so the two filter modes don't fight each other.
-    var bb=$("broken-btn"); if(bb) bb.classList.remove("active");
     if(lastData) render(lastData); });
-  // "Clear filter" button in the empty state — clears the free-text filter
-  // (or the Broken filter) and re-renders so the user escapes the dead-end.
-  var emptyClearBtn=$("empty-clear");
-  if(emptyClearBtn) emptyClearBtn.onclick=function(){
-    filterText=""; $("filter").value="";
-    var bb=$("broken-btn"); if(bb) bb.classList.remove("active");
-    if(lastData) render(lastData);
-    showToast("Filter cleared");
-  };
   var ths=document.querySelectorAll("th.sortable");
   for(var i=0;i<ths.length;i++){
     ths[i].addEventListener("click", function(){
       var key=this.getAttribute("data-sort");
       if(sortKey===key){ sortDir = sortDir==="asc"?"desc":"asc"; }
       else { sortKey=key; sortDir="asc"; }
-      persistSort();
       if(lastData) render(lastData);
     });
   }
@@ -11173,6 +10719,7 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
         showToast("Stats reset — counters zeroed");
         // Force an immediate poll so the UI reflects the reset.
         if(lastData){ lastData.captured=0; lastData.ws_captured=0; lastData.proxied=0; lastData.cdn_fetched=0; lastData.req_per_s=0; render(lastData); }
+        chartData=[]; renderChart(0);
       })
       .catch(function(e){ showToast("Reset failed: "+e,"warn"); });
   });
@@ -11184,80 +10731,18 @@ var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
   document.addEventListener("keydown", function(e){
     if(e.target.tagName==="INPUT") return;
     if(e.key==="?" || (e.shiftKey && e.key==="/")){ e.preventDefault(); toggleHelp(); return; }
-    if(e.key==="Escape"){
-      helpOverlay.classList.remove("open");
-      // Esc clears things in priority order: first an active filter (free-text
-      // or Broken), then any row selection, then it just closes the overlay.
-      var hadFilter=!!filterText;
-      var hadSelection=selectedHosts.size>0;
-      // Esc clears one thing at a time (priority: filter → selection → close).
-      // This gives the user granular control — they can clear the filter
-      // without losing their row selection, then press Esc again to clear
-      // the selection.
-      if(hadFilter){
-        filterText=""; $("filter").value=""; var bb=$("broken-btn"); if(bb) bb.classList.remove("active");
-        if(lastData) render(lastData);
-        showToast("Filter cleared");
-      } else if(hadSelection){
-        selectedHosts.clear(); selAnchorHost=null;
-        if(lastData) render(lastData);
-        showToast("Selection cleared");
-      }
-      return;
-    }
+    if(e.key==="Escape"){ helpOverlay.classList.remove("open"); return; }
     if(e.key==="p"||e.key==="P"){ $("pause-btn").click(); }
     else if(e.key==="t"||e.key==="T"){ $("theme-btn").click(); }
+    else if(e.key==="e"||e.key==="E"){ $("export-btn").click(); }
     else if(e.key==="o"||e.key==="O"){ $("open-all-btn").click(); }
     else if(e.key==="r"||e.key==="R"){ $("reset-btn").click(); }
-    else if(e.key==="h"||e.key==="H"){
-      // Sort by health: first press = worst-first, again = flip direction.
-      var th=document.querySelector('th[data-sort="health"]');
-      if(th) th.click();
-    }
-    else if(e.key==="b"||e.key==="B"){
-      // Shift+B = "Select all broken": activate the Broken filter AND select
-      // all the broken hosts in one step (so you can immediately bulk
-      // copy/open them). Plain B just toggles the filter (no selection).
-      if(e.shiftKey && lastData){
-        var broken = lastData.active.filter(isBrokenHost);
-        if(!broken.length){ showToast("No broken CDNs — all healthy","warn"); return; }
-        // Activate the Broken filter first (so the selected rows are visible).
-        if(filterText !== "__broken__") toggleBrokenFilter();
-        // Then select all visible (broken) hosts.
-        selectedHosts.clear();
-        broken.forEach(function(h){ selectedHosts.add(h.host); });
-        applySelectionToRows();
-        updateSelStat();
-        showToast("Selected "+broken.length+" broken CDN"+(broken.length===1?"":"s"));
-      } else {
-        $("broken-btn").click();
-      }
-    }
-    else if(e.key==="s"||e.key==="S"){
-      // Copy selected (bulk-action shortcut). If nothing is selected, no-op
-      // silently — pressing S by accident shouldn't toast a warning.
-      if(selectedHosts.size) $("copy-sel-btn").click();
-    }
     else if(S2L_CFG.captures && (e.key==="c"||e.key==="C")){ window.open("/__s2l_captures__","_blank"); }
     else if(e.shiftKey && (e.key==="a"||e.key==="A")){ $("copy-all-btn").click(); }
-    else if(e.shiftKey && (e.key==="o"||e.key==="O")){
-      // Shift+O = open selected (mirrors O = open all). No-op if nothing
-      // is selected (pressing by accident shouldn't toast a warning).
-      if(selectedHosts.size) $("open-sel-btn").click();
-    }
-    else if(e.ctrlKey || e.metaKey){
-      // Ctrl/Cmd+A = select all visible rows (prevents the browser's
-      // "select all page text" behavior). Only triggers on A.
-      if(e.key==="a"||e.key==="A"){ e.preventDefault(); selectAllVisible(); }
-    }
     else if(e.key==="/"){ e.preventDefault(); $("filter").focus(); }
   });
 
   poll();
-  // Tick the "updated Xs ago" footer indicator every second so it stays
-  // accurate even while polling is paused (then it drifts to red — useful
-  // signal that the live view is frozen). Cheap: only touches one span.
-  setInterval(renderUpdated, 1000);
 })();
 </script>
 </body>
@@ -12537,10 +12022,8 @@ if __name__ == "__main__":
 
     log(f"Listening on http://{HOST}:{PORT}", "INFO")
     if PROXY_CDN and MULTIPORT:
-        if WEB_CDNVIEWER:
-            log(f"MULTIPORT web viewer → http://localhost:{PORT}/__s2l_viewer__ (50 ms live refresh)", "INFO")
-        if WEB_CAPTUREVIEWER:
-            log(f"Capture browser    → http://localhost:{PORT}/__s2l_captures__", "INFO")
+        log(f"MULTIPORT web viewer → http://localhost:{PORT}/__s2l_viewer__ (50 ms live refresh)", "INFO")
+        log(f"Capture browser    → http://localhost:{PORT}/__s2l_captures__", "INFO")
 
     if HOOK_GUI:
         # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
