@@ -22,7 +22,9 @@ Nope, site2local is independent and constantly being updated, i don't push the u
 
 ## Known bugs
 If you cache too many websites on your pc, crawl may start failing to get some files, it is recommended to always clean your browser cache.
+
 If some page fail to start (eg, game content isn't downloading) refresh the page
+
 If you access the website that you crawled on computer on a phone, the site may be rendered incorrectly for your device. (planning to fix soon)
 
 ## Optional Things
