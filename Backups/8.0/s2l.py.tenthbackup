@@ -310,17 +310,11 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # are hidden from the other page, so the proxy runs headless with zero web
 # surface. Flip either on to expose the corresponding self-contained viewer.
 WEB_CDNVIEWER    = False            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CAPTUREVIEWER = False            # /__s2l_captures__ + /__s2l_captures_data__ + /__s2l_captures_files__ + /__s2l_capture_file__
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-WS_PING_INTERVAL    = 20       # seconds between WS keepalive pings (0 = off).
-                                # ON by default: without pings a half-open upstream
-                                # (network drop, NAT timeout) leaves a zombie tunnel
-                                # — the game/app freezes with no error and the relay
-                                # threads leak until the tab is closed.
-WS_PONG_TIMEOUT     = 15       # seconds to wait for a pong after a ping before
-                                # declaring the upstream dead (must be < WS_PING_INTERVAL
-                                # to keep detection meaningful; clamped at runtime)
+WS_PING_INTERVAL    = 0        # seconds between WS keepalive pings (0 = off)
 WS_AUTO_RECONNECT   = False     # transparently re-establish dropped WS upstreams
 WS_DEFLATE          = False    # negotiate permessage-deflate (RFC 7692)
 WS_LOG_FRAMES       = False    # log every WS frame (verbose; for debugging)
@@ -1239,7 +1233,7 @@ def _launch_hook_gui() -> None:
             QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QLineEdit, QComboBox,
             QCheckBox, QPushButton, QLabel, QSplitter, QScrollArea, QGridLayout,
             QVBoxLayout, QHBoxLayout, QMessageBox, QInputDialog,
-            QFileDialog, QHeaderView, QAbstractItemView, QTextEdit, QSizePolicy,
+            QFileDialog, QHeaderView, QAbstractItemView, QTextEdit,
         )
     except ImportError:
         log("PyQt6 not available — HOOK_GUI ignored "
@@ -1276,8 +1270,11 @@ def _launch_hook_gui() -> None:
         # setStyleSheet calls scattered across the builder functions still
         # produce colors consistent with the surrounding Fusion widgets.
         pal = app.palette()
+        _BG       = pal.color(QPalette.ColorRole.Window).name()
         _PNL      = pal.color(QPalette.ColorRole.Base).name()
         _PNL_ALT  = pal.color(QPalette.ColorRole.AlternateBase).name()
+        _BTN      = pal.color(QPalette.ColorRole.Button).name()
+        _HDR      = pal.color(QPalette.ColorRole.Button).name()
         _ACC      = pal.color(QPalette.ColorRole.WindowText).name()
         _FG       = pal.color(QPalette.ColorRole.WindowText).name()
         _DIM      = pal.color(QPalette.ColorRole.PlaceholderText).name() \
@@ -1289,6 +1286,8 @@ def _launch_hook_gui() -> None:
         _RED      = "#c64042"   # semantic red — no native Fusion equivalent
         _CYN      = pal.color(QPalette.ColorRole.Highlight).name()
         _PURP     = pal.color(QPalette.ColorRole.LinkVisited).name()
+        _LINK     = pal.color(QPalette.ColorRole.Link).name()
+        _ENT      = _BTN
         # Button tints for destructive / affirmative actions. Kept muted so
         # they don't clash with Fusion's flat button look.
         _RED_BG = "#a52a2a"
@@ -1518,16 +1517,6 @@ def _launch_hook_gui() -> None:
         right_lay.addWidget(info_lbl)
 
         body_box = _text_box(right, wrap=True)
-        # Size policy Ignored: the layout must NEVER derive this pane's size
-        # from the document. QPlainTextEdit's sizeHint scales with content, so
-        # loading a large body would push the QSplitter around and grow the
-        # editor pane until it swallows the Traffic Log. With Ignored, pane
-        # size is controlled ONLY by the splitter handle (i.e. the user).
-        _editor_sp = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        _editor_sp.setHorizontalStretch(0)
-        _editor_sp.setVerticalStretch(0)
-        body_box.setSizePolicy(_editor_sp)
-        body_box.setMinimumHeight(60)
         right_lay.addWidget(body_box, 1)
 
         # Body editor Ctrl+F find bar (hidden until Ctrl+F in body_box)
@@ -2169,14 +2158,11 @@ def _launch_hook_gui() -> None:
         whf.addWidget(_lbl(ws_hex_frame, "Hex (editable)", font=_mono_sm_b, color=_YLW))
         ws_hex_box = _text_box(ws_hex_frame, wrap=False)
         ws_hex_box.setStyleSheet(f"background: {_PNL}; color: {_GRN};")
-        _ws_sp = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        ws_hex_box.setSizePolicy(_ws_sp)
         whf.addWidget(ws_hex_box, 1)
 
         wtf2.addWidget(_lbl(ws_txt_frame, "Text (live preview)", font=_mono_sm_b, color=_DIM))
         ws_txt_box = _text_box(ws_txt_frame, wrap=False, readonly=True)
         ws_txt_box.setStyleSheet(f"background: {_PNL_ALT}; color: {_FG};")
-        ws_txt_box.setSizePolicy(_ws_sp)   # same content-independent sizing
         wtf2.addWidget(ws_txt_box, 1)
 
         # ── Hex / text helpers + live sync ────────────────────────────────
@@ -3707,48 +3693,6 @@ def rewrite_origin(fwd: dict, origin_base: str) -> None:
                     val = fwd[key]
                     break
 
-# ── Client-aware proxy addressing ────────────────────────────────────────────
-# Rewrites used to hardcode "http://localhost:PORT". That only works on the
-# machine running S2L: on a phone/tablet browsing via the LAN IP, every
-# rewritten URL pointed at the DEVICE's own localhost → ERR_CONNECTION_REFUSED
-# → HTML5 games/apps never loaded on remote devices (and origins/Referer
-# checks failed for the same reason). Deriving the base from the request's
-# Host header keeps every rewrite reachable from ANY client.
-
-_NETLOC_RE       = re.compile(r"^[A-Za-z0-9._\-]+:\d{1,5}$|^[A-Za-z0-9._\-]+$")
-_NETLOC_IPV6_RE  = re.compile(r"^\[[0-9A-Fa-f:.]+\](?::\d{1,5})?$")
-
-def _request_host_header() -> str | None:
-    """Validated Host header (netloc, incl. port) the CURRENT client used.
-
-    Returns None outside a request context (background workers) or when the
-    header contains unexpected characters — callers then fall back to the
-    historical localhost default.
-    """
-    try:
-        host = flask_request.host or ""
-    except (RuntimeError, AttributeError, TypeError):
-        return None
-    if not host:
-        return None
-    if not (_NETLOC_RE.match(host) or _NETLOC_IPV6_RE.match(host)):
-        return None
-    return host
-
-def _request_hostname() -> str:
-    """Hostname part (no port, IPv6 kept bracketed) of the client's Host."""
-    h = _request_host_header()
-    if not h:
-        return "localhost"
-    if h.startswith("["):
-        return h.split("]")[0] + "]"
-    return h.split(":", 1)[0]
-
-def _proxy_base() -> str:
-    """Absolute proxy base URL as seen by the CURRENT client."""
-    h = _request_host_header()
-    return f"http://{h}" if h else f"http://localhost:{PORT}"
-
 def rewrite_abs_urls(html: bytes) -> bytes:
     """Rewrite absolute MAIN_HOST URLs inside HTML *attribute values* → proxy-relative.
 
@@ -3771,16 +3715,15 @@ def rewrite_abs_urls(html: bytes) -> bytes:
     # match would also strip a longer domain sharing the same prefix, or any other domain
     # that merely starts with the same characters as MAIN_HOST.
     #
-    # The replacement is an ABSOLUTE URL (base derived from the request's Host
-    # header — see _proxy_base) rather than a bare relative path: this function
-    # runs standalone whenever PROXY_CDN is False (no _rewrite_ext_urls pass
-    # first), and also on CDN documents served from a different origin
-    # (dedicated MULTIPORT port, /__s2l_ext__/...) — a relative path only
-    # resolves correctly back to MAIN_HOST when the current document already
-    # happens to be served from the main proxy port.
+    # The replacement is an ABSOLUTE http://localhost:PORT URL rather than a
+    # bare relative path: this function runs standalone whenever PROXY_CDN is
+    # False (no _rewrite_ext_urls pass first), and also on CDN documents served
+    # from a different origin (dedicated MULTIPORT port, /__s2l_ext__/...) —
+    # a relative path only resolves correctly back to MAIN_HOST when the
+    # current document already happens to be served from the main proxy port.
     host_b = re.escape(MAIN_HOST.encode())
-    proxy_root = _proxy_base().encode()
-    pattern = (rb'((?<![A-Za-z0-9_$.])(?:href|src|action|data-src|data-href|poster|srcset|content)\s*=\s*["\'])'
+    proxy_root = f"http://localhost:{PORT}".encode()
+    pattern = (rb'((?:href|src|action|data-src|data-href|poster|srcset|content)\s*=\s*["\'])'
                rb'https?://' + host_b + rb'(?![A-Za-z0-9\-.])')
     html = re.sub(pattern, rb'\1' + proxy_root, html, flags=re.IGNORECASE)
 
@@ -4091,13 +4034,8 @@ def _build_s2l_injector() -> bytes:
         # ── MessageEvent.prototype.origin spoof ────────────────────────────────
         # After relaxing targetOrigin, the SDK still checks event.origin !==
         # 'https://expected-origin' and ignores the message. Patch the getter so
-        # any origin served from OUR ports (main port or a CDN mini-server port)
-        # maps back to the real domain: localhost:MP and <LAN-IP>:MP both →
-        # "https://"+MAIN_HOST, :<cdn-port> → that CDN's real domain. Matching is
-        # PORT-based (not hostname-based): remote devices reach the proxy through
-        # a LAN IP, and a hostname whitelist would leave their MessageEvents
-        # untranslated — breaking app↔embed SDK handshakes on every device except
-        # the S2L host. Must NOT collapse every local port to MAIN_HOST: app↔embed
+        # localhost:MP → "https://"+MAIN_HOST, localhost:CDN_PORT → that CDN's
+        # real domain. Must NOT collapse every localhost to MAIN_HOST: app↔embed
         # handshakes verify each other's CDN origin, and a mismatch makes some
         # wrappers re-point the embed iframe at the real remote host.
         'try{'
@@ -4111,9 +4049,11 @@ def _build_s2l_injector() -> bytes:
                 'if(!o)return o;'
                 'try{'
                   'var pu=new URL(o);'
-                  'var pp=pu.port?parseInt(pu.port,10):(pu.protocol==="https:"?443:80);'
-                  'if(pp===MP)return "https://"+M;'
-                  'for(var h in HP){if(HP[h]===pp)return "https://"+h;}'
+                  'if(pu.hostname==="localhost"||pu.hostname==="127.0.0.1"){'
+                    'var pp=pu.port?parseInt(pu.port,10):(pu.protocol==="https:"?443:80);'
+                    'if(pp===MP)return "https://"+M;'
+                    'for(var h in HP){if(HP[h]===pp)return "https://"+h;}'
+                  '}'
                 '}catch(_e){}'
                 'return o;'
               '}'
@@ -4131,8 +4071,8 @@ def _build_s2l_injector() -> bytes:
         # reading innerHTML / comparing it to the expected virtual DOM. Patching
         # the setter causes subtle differences (URL rewrites that produce
         # different strings than the framework expects) → hydration mismatch →
-        # framework aborts → blank page on modern SPA sites. The
-        # MutationObserver + the .src setter patches already
+        # framework aborts → blank page on modern SPA sites (Discord, Twitter,
+        # Next.js apps). The MutationObserver + the .src setter patches already
         # cover >99% of real-world cases. document.write is kept patched
         # because it's rare in modern apps and trivially safe (no hydration
         # concerns).
@@ -4214,16 +4154,7 @@ def _build_s2l_injector() -> bytes:
         # ── CSS backgroundImage + cssText setter patch ────────────────────────
         # Catches: element.style.backgroundImage = "url(https://cdn.example.com/bg.png)"
         'try{'
-          'var _cssRw=function(v){'
-          'if(typeof v!=="string")return v;'
-          # Quoted first: url("...") / url('...') — body may contain parens.
-          'v=v.replace(/url\\(\\s*(["\'])(https?:\\/\\/[^"\']+)?\\1\\s*\\)/gi,function(m,q,u){var r=rw(u||"");return r&&r!==u?"url(\\""+r+"\\")":m;});'
-          # Unquoted: ONE level of balanced parens in the body (paths like
-          # %20(3)%20(1).png), so the match can never overshoot the url()'s
-          # own closing ')'. The trailing-trim stays as belt-and-suspenders.
-          'v=v.replace(/url\\(\\s*(https?:\\/\\/[^()"\'\\s]*(?:\\([^()"\'\\s]*\\)[^()"\'\\s]*)*)\\s*\\)/gi,function(m,u){var r=rw(u);if(r){while(r.charCodeAt(r.length-1)===41&&r.split("(").length<r.split(")").length)r=r.slice(0,-1);}return r&&r!==u?"url(\\""+r+"\\")":m;});'
-          'return v;'
-          '};'
+          'var _cssRw=function(v){return typeof v==="string"?v.replace(/url\\((["\']?)(https?:\\/\\/[^)"\'\\s<>]+)\\1\\)/gi,function(m,q,u){var r=rw(u);return r!==u?"url("+q+r+q+")":m;}):v;};'
           'var _bgD=Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype,"backgroundImage");'
           'if(_bgD&&_bgD.set){'
             'Object.defineProperty(CSSStyleDeclaration.prototype,"backgroundImage",{'
@@ -4269,22 +4200,6 @@ def _build_s2l_injector() -> bytes:
             'var a=this.getAttribute("action");'
             'if(a&&a.indexOf("http")===0){var r=rw(a);if(r!==a)this.setAttribute("action",r);}'
             'return _formSubmit.call(this);'
-          '};'
-        '}catch(e){}'
-        # ── HTMLAnchorElement.prototype.click() patch ────────────────────────
-        # JS that builds an <a href="https://real/..."> and calls a.click()
-        # SYNCHRONOUSLY (the classic JS-driven installer/download flow does
-        # exactly this) races the MutationObserver: the browser navigates before the
-        # observer microtask rewrites the attribute → the request leaves the
-        # proxy for the real host (Chrome then blocks the file download as
-        # "redirected through an insecure connection"). Rewriting inside
-        # click() itself is synchronous and cannot race.
-        'try{'
-          'var _aClick=HTMLAnchorElement.prototype.click;'
-          'HTMLAnchorElement.prototype.click=function(){'
-            'var h=this.getAttribute("href");'
-            'if(h&&h.indexOf("http")===0){var r=rw(h);if(r!==h)this.setAttribute("href",r);}'
-            'return _aClick.call(this);'
           '};'
         '}catch(e){}'
         # ── iframe.srcdoc patch ─────────────────────────────────────────────────
@@ -4867,10 +4782,10 @@ def _run_path_scanner() -> None:
     mode = (SCAN_PATHS or "").strip()
     if mode in ("all", "all-in-dir"):
         # Multi-wordlist mode — announce we're picking up the first one.
-        log("Loading first wordlist...", "SCAN")
+        log(f"Loading first wordlist...", "SCAN")
     elif mode and mode not in ("all", "all-in-dir"):
         # Single-wordlist mode — announce we're loading that specific file.
-        log("Loading wordlist...", "SCAN")
+        log(f"Loading wordlist...", "SCAN")
 
     log(f"Path scanner — {len(wordlists)} wordlists, {total_paths} paths for {MAIN_HOST}", "SCAN")
 
@@ -5330,10 +5245,10 @@ def _real_origin_for(incoming: str | None) -> str:
     would have sent to that upstream.
 
     The browser's own header reflects whatever local address is currently
-    serving the calling document — http://localhost:PORT on the S2L host
-    machine, http://<LAN-IP>:PORT on phones/other devices, or
-    http://<local-alias>:<cdn-port> when the call originates from inside a
-    CDN sub-iframe served on its own MULTIPORT port. Blindly forwarding THAT
+    serving the calling document — http://localhost:PORT for the main page
+    (or https://MAIN_HOST if the user's hosts file spoofs it), or
+    http://localhost:<cdn-port> when the call originates from inside a CDN
+    sub-iframe served on its own MULTIPORT port. Blindly forwarding THAT
     local value (or, just as wrong, blindly substituting the call's OWN
     target host — self-referencing) doesn't match what a real browser would
     send, and a surprising number of first-party APIs use Origin/Referer to
@@ -5346,35 +5261,15 @@ def _real_origin_for(incoming: str | None) -> str:
         try:
             p = urlparse(incoming)
             host, port = p.hostname or "", p.port
-            _req_host = _request_host_header()
-            _req_hostname = urlparse(f"http://{_req_host}").hostname if _req_host else None
-            # "Local" = the localhost aliases OR whatever address the current
-            # client actually used to reach us (LAN IP / hostname for remote
-            # devices — only localhost used to be recognized, which made every
-            # Origin/Referer check fail on phones and other LAN clients).
-            _is_local = (
-                host in _LOCAL_HOSTS
-                or (_req_host is not None and (p.netloc == _req_host or host == _req_hostname))
-            )
-            if _is_local:
+            if host in _LOCAL_HOSTS:
                 if port and port != PORT:
                     with _cdn_port_lock:
                         for h, pt in _cdn_host_port.items():
                             if pt == port:
                                 return f"https://{h}"
-                    return f"https://{MAIN_HOST}"
                 return f"https://{MAIN_HOST}"
             if host in (MAIN_HOST, "www." + MAIN_HOST):
                 return f"https://{MAIN_HOST}"
-            # Port-only match: the origin came from one of our CDN mini-server
-            # ports via a local alias we don't recognize (e.g. a phone hitting
-            # http://<LAN-IP>:8087). The ports belong to us, so the mapping is
-            # safe — translate to that CDN's real domain.
-            if port:
-                with _cdn_port_lock:
-                    for h, pt in _cdn_host_port.items():
-                        if pt == port:
-                            return f"https://{h}"
             with _cdn_port_lock:
                 if host in _cdn_host_port:
                     return f"https://{host}"
@@ -5672,22 +5567,8 @@ def _proxy_target(host: str, tail: str) -> str | None:
     proxy port — but this same rewriter also runs on CDN documents served via
     /__s2l_ext__/ or (MULTIPORT) a dedicated CDN port, where a relative path
     resolves against THAT origin instead, landing nowhere near MAIN_HOST. Use
-    an absolute URL (base from the request's Host header — correct for the
-    machine running S2L AND for phones/other LAN devices) so it's correct
-    from any origin.
+    an absolute http://localhost:PORT/... URL so it's correct from any origin.
     """
-    # IDEMPOTENCY GUARD — never wrap an already-proxied URL. Rewriting runs on
-    # multiple regex passes (HTML attributes, inline <script> bodies, CSS); the
-    # attribute pass legitimately matches JS property assignments inside inline
-    # scripts (j.src = 'https://...'), so a once-rewritten URL can reach this
-    # function again. Without this guard the second pass wrapped the proxy's
-    # own address one more level deep: an analytics snippet became
-    # /__s2l_ext__/localhost:PORT/__s2l_ext__/cdn.example.com/... (a
-    # 404). None → every caller keeps the current text unchanged.
-    if tail.startswith(_EXT_PREFIX):
-        return None
-    if host.split(":", 1)[0].lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-        return None
     _mh = {MAIN_HOST, "www." + MAIN_HOST}
     if MAIN_HOST.startswith("www."):
         _mh.add(MAIN_HOST[4:])
@@ -5697,7 +5578,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
     # assets through /__s2l_ext__/ — losing session cookies and auth.
     host_no_port = host.split(":", 1)[0]
     if host_no_port in _mh:
-        return f"{_proxy_base()}{tail}"
+        return f"http://localhost:{PORT}{tail}"
     if any(bad in host for bad in CDN_BLOCK):
         return None
     with _cdn_port_lock:
@@ -5705,7 +5586,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
         if port == 0:
             port = _cdn_host_port.get(host_no_port, 0)
     if port > 0 and MULTIPORT:
-        return f"http://{_request_hostname()}:{port}{tail}"
+        return f"http://localhost:{port}{tail}"
     # MUST be absolute (see docstring above) — this exact line was previously
     # returning a bare "/__s2l_ext__/host/path" relative reference. On the
     # main-port page that happens to resolve correctly by coincidence, but the
@@ -5718,7 +5599,7 @@ def _proxy_target(host: str, tail: str) -> str | None:
     # host, not arbitrary third parties. That 400 was exactly what broke
     # loading the next item from the real CDN (error-style body) — the
     # failed request was the app's own manifest/config fetch.
-    return f"{_proxy_base()}{_EXT_PREFIX}/{host}{tail}"
+    return f"http://localhost:{PORT}{_EXT_PREFIX}/{host}{tail}"
 
 def _rewrite_json_urls(data: bytes) -> bytes:
     """Rewrite absolute https?://host/path URLs embedded as JSON string values.
@@ -5746,7 +5627,7 @@ def _rewrite_json_urls(data: bytes) -> bytes:
         return f'"{r}"' if r else m.group(0)
 
     text = re.sub(
-        r'"https?://([a-zA-Z0-9\-._]+(?::\d+)?)((?:/[^"\\<>]*)?)"',
+        r'"https?://([a-zA-Z0-9\-._]+(?::\d+)?)((?:/[^"\\<>])?)"',
         _rep, text, flags=re.IGNORECASE)
     return text.encode("utf-8")
 
@@ -5799,25 +5680,8 @@ def _rewrite_ext_urls(html_bytes: bytes) -> bytes:
     # Path is optional (/? instead of /) so bare-host URLs like
     # href="https://example.com" (no trailing slash) also get rewritten.
     html = re.sub(
-        r'((?<![A-Za-z0-9_$.])(?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'<>]*)?(["\'])',
+        r'((?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'<>]*)?(["\'])',
         _attr_rep, html, flags=re.IGNORECASE)
-
-    # Protocol-relative attribute values (src="//host/path") resolve against the
-    # CURRENT page origin — for any host other than the document's own, the
-    # browser connects to the REAL site directly (e.g. a consent/loader
-    # script shipped as src="//site.example/assets/loader.js") — a proxy leak. Rewrite
-    # them like their https:// siblings. The lookbehind keeps JS property
-    # assignments (j.src = '//api...') out of scope — those belong to the
-    # inline-script pass.
-    def _attr_rep_pr(m):
-        host, tail = m.group(3), m.group(4) or "/"
-        if _is_dont_rewrite_host(host):
-            return m.group(0)
-        r = _proxy_target(host, tail)
-        return f"{m.group(1)}{m.group(2)}{r}{m.group(5)}" if r else m.group(0)
-    html = re.sub(
-        r'((?<![A-Za-z0-9_$.])(?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])//([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'<>]*)?(["\'])',
-        _attr_rep_pr, html, flags=re.IGNORECASE)
 
     def _ss_rep(m):
         parts = []
@@ -5849,51 +5713,14 @@ def _rewrite_ext_urls(html_bytes: bytes) -> bytes:
         return m.group(1) + ", ".join(parts) + m.group(3)
     html = re.sub(r'(srcset\s*=\s*["\'])([^"\']+)(["\'])', _ss_rep, html, flags=re.IGNORECASE)
 
-    # CSS url() rewriting — TWO quote-aware passes:
-    #
-    # 1. QUOTED urls: url("...") / url('...'). The string body may contain
-    #    parentheses (font/image paths like Background%20(3)%20(1).png occur
-    #    frequently in site-builder templates), so the match must end at the CLOSING QUOTE,
-    #    not at the first ')'. The old single regex stopped at the '(' inside
-    #    such paths, glued the tail ('.png");...') onto the rewritten URL and
-    #    produced an UNBALANCED url( token — the browser's CSS parser then
-    #    swallowed every rule after it up to the next '}'. On a large real
-    #    site that ate ~1 800 rules including the whole navbar block,
-    #    collapsing the menu into an unstyled vertical list with black text
-    #    and wrapped caret icons.
-    # 2. UNQUOTED urls: tolerate ONE level of balanced parentheses, then trim
-    #    a trailing ')' that isn't part of the URL (same idea as
-    #    _clean_url_match).
-    # Rewritten values are always re-quoted with double quotes — valid CSS in
-    # every context and immune to parens/commas in the proxied path.
-    def _css_url_from(u: str) -> str | None:
-        p = urlparse(u)
-        if not p.netloc or _is_dont_rewrite_host(p.netloc):
-            return None
-        tail = p.path + (f"?{p.query}" if p.query else "")
-        if not tail:
-            return None
-        return _proxy_target(p.netloc, tail)
-
-    def _css_quoted_rep(m):
-        r = _css_url_from(m.group(2))
-        return f'url("{r}")' if r else m.group(0)
-
-    def _css_unquoted_rep(m):
-        u = m.group(1)
-        while u and u.count("(") < u.count(")"):
-            u = u[:-1]
-        if not u:
+    def _css_rep(m):
+        host, tail = m.group(1), m.group(2)
+        if _is_dont_rewrite_host(host):
             return m.group(0)
-        r = _css_url_from(u)
-        return f'url("{r}")' if r else m.group(0)
-
-    html = re.sub(
-        r'url\(\s*(["\'])(https?://[a-zA-Z0-9\-._]+(?::\d+)?/[^"\']*)\1\s*\)',
-        _css_quoted_rep, html, flags=re.IGNORECASE)
-    html = re.sub(
-        r'url\(\s*(https?://[a-zA-Z0-9\-._]+(?::\d+)?/?(?:[^()\s]|\([^()\s]*\))*)\s*\)',
-        _css_unquoted_rep, html, flags=re.IGNORECASE)
+        r = _proxy_target(host, tail)
+        return f"url({r})" if r else m.group(0)
+    html = re.sub(r'url\(["\']?https?://([a-zA-Z0-9\-._]+(?::\d+)?)(/[^"\'\)\s<>]*)["\']?\)',
+                  _css_rep, html, flags=re.IGNORECASE)
 
     # Strip CSP delivered via <meta http-equiv="Content-Security-Policy" ...> —
     # the HTTP header is already stripped in filter_resp, but pages that set CSP
@@ -5925,7 +5752,7 @@ def _rewrite_ext_urls(html_bytes: bytes) -> bytes:
     # they load through the proxy. This changes the bytes, which changes the
     # hash, which makes the browser REFUSE to apply the resource — the page
     # then renders with NO styles and NO scripts (the classic "blank-ish page"
-    # symptom on sites that ship SRI on their CSS bundle).
+    # symptom on sites like discord.com that ship SRI on their CSS bundle).
     # Stripping integrity= here is the equivalent of stripping CSP: we are
     # intentionally modifying the content, so the integrity check is wrong.
     # The crossorigin attribute is left alone — s2l already serves everything
@@ -6330,38 +6157,11 @@ class _CaptureRecord:
 _capture_queue: queue.Queue = queue.Queue()
 
 def _capture_path(method: str, url: str, qs: str) -> str:
-    """Build a HUMAN-READABLE capture file path.
-
-    Layout: captures/<host>/<parent-dirs>/METHOD.path.slug.YYYYmmdd-HHMMSS-mmm[-q<hash>].json
-    e.g.    captures/api.example.com/games/save/POST.games.save.20261003-143012-456.json
-
-    The old scheme named files "METHOD_<ms-epoch>.json" (e.g.
-    POST_1699999999999.json) — opaque when browsing the captures folder. The
-    last two path segments now identify the endpoint in the FILENAME itself;
-    the full URL and query still live inside the JSON document, and the short
-    qs hash only keeps different query variants from colliding.
-    """
     parsed = urlparse(url)
-    host = re.sub(r"[^\w.\-]", "_",
-                  parsed.netloc.split("@")[-1].split(":")[0]) or "_nohost_"
-    segs = [re.sub(r"[^\w.\-]", "_", s) for s in parsed.path.strip("/").split("/") if s]
-    # Last 2 segments identify the endpoint (they go into the filename); the
-    # remaining ones become directory levels.
-    tail = segs[-2:] if len(segs) >= 2 else (segs or ["_root_"])
-    dirs = segs[:-2] if len(segs) >= 2 else []
-    slug = ".".join(t for t in tail if t)[:80] or "_root_"
-    ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
-    qtag = f"-q{hashlib.sha1(qs.encode()).hexdigest()[:6]}" if qs else ""
-    base = os.path.join(DATA_FOLDER, "captures", host, *dirs)
-    path = os.path.join(base, f"{method}.{slug}.{ts}{qtag}.json")
-    # The capture queue has a single writer thread — the existence loop below
-    # is race-free and keeps same-millisecond captures of the same endpoint
-    # from overwriting each other.
-    final, n = path, 1
-    while os.path.exists(final):
-        n += 1
-        final = f"{path[:-5]}-{n}.json"
-    return final
+    segs   = [re.sub(r"[^\w.\-]", "_", s) for s in parsed.path.strip("/").split("/") if s] or ["_root_"]
+    qs_tag = f"_qs{hashlib.sha1(qs.encode()).hexdigest()[:8]}" if qs else ""
+    return os.path.join(DATA_FOLDER, "captures", *segs,
+                        f"{method}{qs_tag}_{int(time.time()*1000)}.json")
 
 def _encode_body(data: bytes) -> tuple[str, str]:
     try:
@@ -6461,12 +6261,7 @@ def _ws_capture_worker() -> None:
                 "ws_url": rec.ws_url, "tunnel_id": rec.tunnel_id,
                 "payload": body_enc, "encoding": how, "size": len(rec.payload),
             }
-            # Legible filename: in.text.20261003-143012-456.t3.json — the old
-            # scheme (in_1_1699999999999_3.json) encoded the opcode as a bare
-            # number and the epoch made sorting/browsing by time pointless.
-            fn = (f"{rec.direction}.{rec.op_name}."
-                  f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1000) % 1000:03d}"
-                  f".t{rec.tunnel_id}.json")
+            fn = f"{rec.direction}_{rec.opcode}_{int(time.time()*1000)}_{rec.tunnel_id}.json"
             path = os.path.join(out_dir, fn)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -7129,50 +6924,32 @@ class _WSTunnel:
         self.msgs_out    = 0
         self.bytes_in    = 0
         self.bytes_out   = 0
-        # True once the BROWSER leg has ended (closed socket, CLOSE frame, or
-        # a send failure). When False, an upstream-only drop is eligible for
-        # transparent reconnect (WS_AUTO_RECONNECT) — the browser socket is
-        # kept open so the client never sees the upstream blip.
-        self.client_gone = False
-        # The single browser→upstream reader thread. Lives on the tunnel (not
-        # the pump call frame) so reconnect rounds can verify it's still alive
-        # and restart it if it gave up during a long upstream outage.
-        self.c2s_thread = None
         # Bookkeeping for the deflate direction flag — RFC 7692 says the
         # RSV1 bit on the FIRST frame of a message indicates compression.
         # Continuation frames never carry it.
         self._client_deflate_seen = False
         self._srv_deflate_seen    = False
 
-    def close(self, keep_client: bool = False):
-        """Close both sides and release deflate contexts.
-
-        keep_client=True leaves the BROWSER socket (and the permessage-deflate
-        contexts — the browser's compressor state is per-connection) alive:
-        an upstream-only drop with reconnect pending reuses them in the next
-        pump round. Closing them would make the transparent reconnect probe
-        hit a dead fd and would corrupt every subsequent compressed frame.
-        """
+    def close(self):
+        """Close both sides and release deflate contexts."""
         self.stop.set()
-        if not keep_client:
-            try: self.client_sock.close()
+        for s in (self.srv, self.client_sock):
+            try: s.close()
             except Exception: pass
-            _ws_deflate_cleanup(self.tunnel_id)
-        try: self.srv.close()
-        except Exception: pass
+        _ws_deflate_cleanup(self.tunnel_id)
 
 def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
     """Send periodic pings to the upstream server. If pong doesn't arrive
-    within WS_PONG_TIMEOUT seconds, declare the tunnel dead and tear it down.
+    within 30 seconds, declare the tunnel dead and tear it down.
 
     Tracks the timestamp of the LAST PING SENT separately from last_pong.
-    After sending a ping, wait WS_PONG_TIMEOUT seconds for a pong. If
-    last_pong hasn't advanced past the ping-send time by then, declare the
-    tunnel dead. This correctly handles both cases:
+    After sending a ping, wait 30 seconds for a pong. If last_pong
+    hasn't advanced past the ping-send time by then, declare the tunnel
+    dead. This correctly handles both cases:
       - Upstream is alive → pong arrives within milliseconds → last_pong
         advances → check passes → next ping cycle.
       - Upstream is dead → no pong ever → last_pong stays at its last
-        value → check fires after the window → tunnel torn down.
+        value → check fires after 30s → tunnel torn down.
 
     Guard: this function must NEVER be called with WS_PING_INTERVAL <= 0.
     The caller (_pump_ws_frames_v2) already guards against that, but we
@@ -7182,7 +6959,6 @@ def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
     """
     if WS_PING_INTERVAL <= 0:
         return   # keepalive disabled — should never be called, but guard anyway
-    _pong_window = max(5.0, min(float(WS_PONG_TIMEOUT), float(WS_PING_INTERVAL)))
     _last_ping_sent = 0.0   # timestamp of the most recent ping we sent
     while not tunnel.stop.wait(WS_PING_INTERVAL):
         if tunnel.stop.is_set():
@@ -7197,7 +6973,7 @@ def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
             _last_ping_sent = time.time()
             # Wait for the pong window to elapse. If the tunnel is closed
             # externally during this wait, exit cleanly.
-            if tunnel.stop.wait(_pong_window):
+            if tunnel.stop.wait(30):
                 return   # tunnel was closed while we were waiting
             if tunnel.stop.is_set():
                 return
@@ -7208,42 +6984,25 @@ def _ws_keepalive_loop(tunnel: "_WSTunnel") -> None:
                 log(f"WS keepalive: pong timeout: {tunnel.ws_url}", "WARN")
                 tunnel.stop.set()
                 return
-        except Exception as e:
-            log(f"WS keepalive error: {_short_exc(e)}", "DEBUG")
+        except Exception:
             tunnel.stop.set()
             return
 
-def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
-                       tunnel: "_WSTunnel | None" = None) -> "_WSTunnel":
+def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False) -> None:
     """v2 frame pump: bidirectional relay with ping/pong keepalive, deflate,
     message hooks, and auto-reconnect.
 
-    `tunnel` may be passed to RE-USE an existing _WSTunnel after a transparent
-    upstream reconnect (WS_AUTO_RECONNECT): the same browser socket, counters
-    and permessage-deflate contexts continue — the browser's deflate context
-    is per-CONNECTION, so resetting it mid-session would corrupt every
-    subsequent frame. Returns the tunnel so the reconnect loop can reuse it.
-
-    Block-until-done semantics: returns when either leg ends (or keepalive
-    declares the upstream dead). Does NOT close the sockets when the drop was
-    upstream-only and WS_AUTO_RECONNECT is enabled — the caller decides.
+    Drop-in replacement for _pump_ws_frames when WS_PING_INTERVAL > 0 or
+    WS_DEFLATE is enabled. Otherwise the original _pump_ws_frames is used.
     """
-    new_tunnel = tunnel is None
-    if new_tunnel:
-        tunnel = _WSTunnel(client_sock, srv, ws_url, use_deflate)
-        if use_deflate:
-            _ws_deflate_init(tunnel.tunnel_id)
-        log(f"WS tunnel opened → {ws_url}  (deflate={'on' if use_deflate else 'off'}, "
-            f"ping={WS_PING_INTERVAL}s)", "INFO")
-    else:
-        # Reconnect round: swap in the fresh upstream, revive the pump.
-        tunnel.srv = srv
-        tunnel.last_pong = time.time()
-        tunnel.stop.clear()
-        log(f"WS tunnel resumed → {ws_url}", "INFO")
+    tunnel = _WSTunnel(client_sock, srv, ws_url, use_deflate)
+    if use_deflate:
+        _ws_deflate_init(tunnel.tunnel_id)
 
-    # Start keepalive thread (fresh round each reconnect — old one exited when
-    # the upstream died; joining it here is unnecessary, it's daemon + short).
+    log(f"WS tunnel opened → {ws_url}  (deflate={'on' if use_deflate else 'off'}, "
+        f"ping={WS_PING_INTERVAL}s)", "INFO")
+
+    # Start keepalive thread
     keepalive_t = None
     if WS_PING_INTERVAL > 0:
         keepalive_t = threading.Thread(
@@ -7269,20 +7028,12 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
         while not tunnel.stop.is_set():
             frame = _ws_read_frame(client_sock)
             if frame is None:
-                tunnel.client_gone = True   # browser closed / socket error
                 break
             fin, rsv1, opcode, payload = frame
             if WS_LOG_FRAMES:
                 _op_name = _WS_OP_NAMES.get(opcode, f"?{opcode}")
                 log(f"WS→ {ws_url} fin={fin} rsv1={int(rsv1)} op={_op_name} len={len(payload)}", "DEBUG")
             if opcode == _WS_OPCODE_CLOSE:
-                # RFC 6455 §5.5.1: echo the CLOSE back so the browser's close
-                # handshake completes cleanly, then forward it upstream.
-                tunnel.client_gone = True
-                try:
-                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
-                except Exception:
-                    pass
                 tunnel.srv.send_frame(_WS_OPCODE_CLOSE, payload)
                 break
             if opcode in (_WS_OPCODE_CONTINUATION, _WS_OPCODE_TEXT, _WS_OPCODE_BINARY):
@@ -7296,14 +7047,6 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                     frag_compressed = use_deflate and rsv1
                 else:
                     frag_buf += payload
-                # Cap reassembly — WS_MAX_MSG_BYTES is enforced per-frame in
-                # _ws_read_frame, but an endless fin=0 continuation stream
-                # would otherwise grow frag_buf without bound (memory DoS).
-                if len(frag_buf) > WS_MAX_MSG_BYTES:
-                    log(f"WS→ reassembled message exceeds {_fmt_size(WS_MAX_MSG_BYTES)} "
-                        f"— dropping tunnel {ws_url}", "WARN")
-                    tunnel.client_gone = True
-                    break
                 if not fin:
                     continue
                 msg = bytes(frag_buf)
@@ -7333,29 +7076,12 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 ok = tunnel.srv.send_frame(frag_opcode or opcode, msg)
                 frag_opcode, frag_buf, frag_compressed = None, bytearray(), False
                 if not ok:
-                    if not (WS_AUTO_RECONNECT and not tunnel.client_gone):
-                        break
-                    # Upstream dropped but transparent reconnect is enabled —
-                    # keep reading the browser. Wait (bounded) for the
-                    # reconnect loop in _handle_ws_direct to swap in a fresh
-                    # upstream, then resume forwarding. Frames sent during the
-                    # outage window are relayed once the new upstream is in
-                    # place; giving up only if it never comes back.
-                    _dead_srv = tunnel.srv
-                    _waited = 0.0
-                    while (_waited < 15.0 and not tunnel.client_gone
-                           and tunnel.srv is _dead_srv):
-                        time.sleep(0.25)
-                        _waited += 0.25
-                    if tunnel.srv is _dead_srv:
-                        break   # reconnect never happened — end this relay
-                    continue
+                    break
             elif opcode == _WS_OPCODE_PING:
                 # Browser pings us → respond with pong directly
                 try:
                     client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
                 except Exception:
-                    tunnel.client_gone = True
                     break
             elif opcode == _WS_OPCODE_PONG:
                 # Browser PONG — unsolicited (we never PING the browser).
@@ -7406,11 +7132,6 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                     frag_buf = bytearray(payload)
                 else:
                     frag_buf += payload
-                # Same reassembly cap as the c2s direction (memory DoS guard).
-                if len(frag_buf) > WS_MAX_MSG_BYTES:
-                    log(f"WS← reassembled message exceeds {_fmt_size(WS_MAX_MSG_BYTES)} "
-                        f"— dropping tunnel {ws_url}", "WARN")
-                    break
                 if not fin:
                     continue
                 msg = bytes(frag_buf)
@@ -7450,45 +7171,23 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 frag_opcode, frag_buf = None, bytearray()
         tunnel.stop.set()
 
-    # The browser→upstream relay is the SINGLE reader on the client socket —
-    # a second concurrent reader would interleave frames and corrupt the
-    # stream. It reads `tunnel.srv` dynamically, so it survives upstream
-    # reconnects (tunnel.srv is swapped in-place). It's stored on the tunnel:
-    # if it gave up during a long outage, the next round spawns a fresh one.
-    if new_tunnel:
-        tunnel.c2s_thread = threading.Thread(target=_fwd_client_to_srv,
-                                             daemon=True, name="ws-c2s")
-        tunnel.c2s_thread.start()
-    elif tunnel.c2s_thread is None or not tunnel.c2s_thread.is_alive():
-        tunnel.c2s_thread = threading.Thread(target=_fwd_client_to_srv,
-                                             daemon=True, name="ws-c2s")
-        tunnel.c2s_thread.start()
+    t1 = threading.Thread(target=_fwd_client_to_srv, daemon=True, name="ws-c2s")
     t2 = threading.Thread(target=_fwd_srv_to_client, daemon=True, name="ws-s2c")
-    t2.start()
+    t1.start(); t2.start()
     tunnel.stop.wait()
 
-    # Upstream-only drop + reconnect enabled → keep the BROWSER socket open
-    # (and the deflate contexts — the browser's compressor state is per-
-    # connection) so the reconnect loop in _handle_ws_direct can resume the
-    # pump transparently. Any client-side end (CLOSE / socket error / send
-    # failure / reassembly cap) tears everything down exactly as before.
-    _reconnectable = (WS_AUTO_RECONNECT and not tunnel.client_gone)
-    tunnel.close(keep_client=_reconnectable)
+    tunnel.close()
     # Join relay threads with a timeout — they may be blocked in recv() and
     # closing the sockets doesn't always unblock curl_cffi's recv on all
     # platforms. Without this join, daemon threads accumulate (one pair per
-    # WS connection) and leak file descriptors / memory. In the reconnectable
-    # case the browser reader is intentionally NOT joined — it must survive
-    # across rounds; t2 (old upstream reader) is dead by definition.
+    # WS connection) and leak file descriptors / memory.
+    t1.join(timeout=3.0)
     t2.join(timeout=3.0)
     if keepalive_t is not None:
         keepalive_t.join(timeout=2.0)
-    if not _reconnectable:
-        if tunnel.c2s_thread is not None:
-            tunnel.c2s_thread.join(timeout=3.0)
-        log(f"WS tunnel closed ← {ws_url}  (in={tunnel.msgs_in}/{_fmt_size(tunnel.bytes_in)}, "
-            f"out={tunnel.msgs_out}/{_fmt_size(tunnel.bytes_out)})", "INFO")
-    return tunnel
+    _ws_deflate_cleanup(tunnel.tunnel_id)
+    log(f"WS tunnel closed ← {ws_url}  (in={tunnel.msgs_in}/{_fmt_size(tunnel.bytes_in)}, "
+        f"out={tunnel.msgs_out}/{_fmt_size(tunnel.bytes_out)})", "INFO")
 
 def _ws_handshake_accept(key: str) -> str:
     """Compute the Sec-WebSocket-Accept value for the handshake response."""
@@ -7508,7 +7207,7 @@ def _recv_exact(sock, n: int) -> bytes | None:
     chat, realtime dashboards) and the old 30s socket timeout was killing
     them silently.
     """
-    buf = bytearray()
+    buf = b""
     try:
         sock.settimeout(None)   # block forever — let the peer drive teardown
     except Exception:
@@ -7523,7 +7222,7 @@ def _recv_exact(sock, n: int) -> bytes | None:
         if not chunk:
             return None
         buf += chunk
-    return bytes(buf)
+    return buf
 
 def _ws_read_frame(sock) -> tuple[bool, bool, int, bytes] | None:
     """Read a single WebSocket frame.
@@ -8132,63 +7831,44 @@ def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
         it but it keeps the connection alive through intermediate proxies/CDNs
         that would otherwise close idle connections).
         """
-        try:
-            if SSE_HEARTBEAT <= 0:
-                # Heartbeat disabled — just forward chunks unchanged.
-                yield from _sse_stream_generator(upstream_r, target)
-                return
+        if SSE_HEARTBEAT <= 0:
+            # Heartbeat disabled — just forward chunks unchanged.
+            yield from _sse_stream_generator(upstream_r, target)
+            return
 
-            buf_q: queue.Queue = queue.Queue(maxsize=256)
-            upstream_done = threading.Event()
-            last_event_time = [time.time()]
+        buf_q: queue.Queue = queue.Queue(maxsize=256)
+        upstream_done = threading.Event()
+        last_event_time = [time.time()]
 
-            def _reader():
-                try:
-                    for chunk in _sse_stream_generator(upstream_r, target):
-                        last_event_time[0] = time.time()
-                        # Bounded put: if the consumer generator is abandoned
-                        # (browser disconnected → GeneratorExit), a plain put()
-                        # would block FOREVER here, leaking this thread and the
-                        # upstream connection. Time out and re-check whether
-                        # the consumer is still among us.
-                        while True:
-                            try:
-                                buf_q.put(chunk, timeout=5.0)
-                                break
-                            except queue.Full:
-                                if upstream_done.is_set():
-                                    return   # consumer gone — stop feeding
-                                continue
-                except Exception as e:
-                    try: buf_q.put_nowait(e)
-                    except queue.Full: pass
-                finally:
-                    upstream_done.set()
+        def _reader():
+            try:
+                for chunk in _sse_stream_generator(upstream_r, target):
+                    last_event_time[0] = time.time()
+                    buf_q.put(chunk)
+            except Exception as e:
+                buf_q.put(e)
+            finally:
+                upstream_done.set()
 
-            threading.Thread(target=_reader, daemon=True, name="sse-reader").start()
+        threading.Thread(target=_reader, daemon=True, name="sse-reader").start()
 
-            while True:
-                try:
-                    item = buf_q.get(timeout=1.0)
-                except queue.Empty:
-                    # No event for 1s — check if we need to inject a keepalive.
-                    if upstream_done.is_set() and buf_q.empty():
-                        break
-                    if time.time() - last_event_time[0] >= SSE_HEARTBEAT:
-                        yield b": ping\n\n"
-                        last_event_time[0] = time.time()
-                    continue
-                if isinstance(item, Exception):
-                    log(f"SSE keepalive stream error: {_short_exc(item)}", "WARN")
-                    break
-                yield item
+        while True:
+            try:
+                item = buf_q.get(timeout=1.0)
+            except queue.Empty:
+                # No event for 1s — check if we need to inject a keepalive.
                 if upstream_done.is_set() and buf_q.empty():
                     break
-        finally:
-            # Client disconnected (GeneratorExit) or stream ended — release the
-            # upstream connection so curl_cffi doesn't leak the socket.
-            try: upstream_r.close()
-            except Exception: pass
+                if time.time() - last_event_time[0] >= SSE_HEARTBEAT:
+                    yield b": ping\n\n"
+                    last_event_time[0] = time.time()
+                continue
+            if isinstance(item, Exception):
+                log(f"SSE keepalive stream error: {_short_exc(item)}", "WARN")
+                break
+            yield item
+            if upstream_done.is_set() and buf_q.empty():
+                break
 
     headers = filter_resp(_resp_headers_dict(upstream_r))
     # Force chunked: Werkzeug doesn't auto-chunk generators with no Content-Length
@@ -8240,10 +7920,6 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
     """
     stop = threading.Event()
     tunnel_id = id(client_sock)
-    # Shared last-activity timestamp — makes TUNNEL_TIMEOUT (idle teardown)
-    # actually enforceable: without it the 5.0s poll timeout below just loops
-    # forever on an idle tunnel and the config value is dead code.
-    last_activity = [time.time()]
     with _active_tunnels_lock:
         _active_tunnels[tunnel_id] = {"label": label, "started": time.time(),
                                        "bytes_in": 0, "bytes_out": 0}
@@ -8261,7 +7937,6 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
                 if opcode in (_WS_OPCODE_TEXT, _WS_OPCODE_BINARY, _WS_OPCODE_CONTINUATION):
                     if payload:
                         upstream_sock.sendall(payload)
-                        last_activity[0] = time.time()
                         with _active_tunnels_lock:
                             if tunnel_id in _active_tunnels:
                                 _active_tunnels[tunnel_id]["bytes_in"] += len(payload)
@@ -8291,12 +7966,6 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
                 try:
                     data = upstream_sock.recv(65536)
                 except (socket.timeout, TimeoutError):
-                    # Idle poll tick — enforce TUNNEL_TIMEOUT: no traffic in
-                    # EITHER direction for that long → tear the tunnel down
-                    # (frees the upstream socket + both relay threads).
-                    if TUNNEL_TIMEOUT > 0 and time.time() - last_activity[0] > TUNNEL_TIMEOUT:
-                        log(f"{label}: idle > {TUNNEL_TIMEOUT}s — closing tunnel", "INFO")
-                        break
                     continue   # check stop, then loop
                 except OSError:
                     break
@@ -8306,7 +7975,6 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
                 if not data and not use_udp:
                     break
                 if data:
-                    last_activity[0] = time.time()
                     # Send as binary WS frame (server→client, unmasked)
                     try:
                         client_sock.sendall(_ws_make_frame(_WS_OPCODE_BINARY, data))
@@ -8648,30 +8316,22 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             # ── Pump frames ──────────────────────────────────────────────
             # WS_AUTO_RECONNECT: if the upstream WS drops, try to re-establish
             # the connection transparently so the browser doesn't see a broken
-            # tunnel. The pump keeps the browser socket (and deflate contexts)
-            # alive on an upstream-only drop; this loop probes it and re-dials
-            # up to 3 times. A browser-side end (CLOSE / socket error) never
-            # triggers a reconnect.
+            # tunnel. We loop until the browser itself closes or a reconnect
+            # attempt fails after 3 retries.
             #
             # We always use _pump_ws_frames_v2 — it's a strict superset of the
             # old v1: same frame relay, plus optional keepalive/deflate/log/
-            # hook/gui integration. When all of those are disabled, v2 behaves
-            # exactly like v1 did, so there's no reason to keep two code
-            # paths. The old v1 _pump_ws_frames has been removed to keep the
-            # WS pipeline in one place.
+            # hook/gui integration. When all of those are disabled (the
+            # defaults), v2 behaves exactly like v1 did, so there's no reason
+            # to keep two code paths. The old v1 _pump_ws_frames has been
+            # removed to keep the WS pipeline in one place.
             _ws_attempts = 0
             _ws_max_reconnects = 3 if WS_AUTO_RECONNECT else 0
-            _ws_tunnel = None
             while True:
-                _ws_tunnel = _pump_ws_frames_v2(
-                    client_sock, srv, ws_url,
-                    use_deflate=_browser_wants_deflate, tunnel=_ws_tunnel)
-                if _ws_max_reconnects <= 0 or _ws_tunnel.client_gone:
-                    break
-                # Upstream-only drop. Check the browser side is still open —
-                # a closed client_sock means the browser navigated away or
-                # closed the tab; no point reconnecting. (The pump no longer
-                # closes it in this path, so the probe is meaningful.)
+                _pump_ws_frames_v2(client_sock, srv, ws_url, use_deflate=_browser_wants_deflate)
+                # Check if the browser side is still open — if not, we're done.
+                # A closed client_sock means the browser navigated away or
+                # closed the tab; no point reconnecting.
                 # FIX: sendall(b"") is a no-op on most platforms (returns 0
                 # immediately without calling send(2)), so it can't detect a
                 # closed browser socket. Use a non-blocking MSG_PEEK recv
@@ -8688,22 +8348,14 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
                 except Exception:
                     break   # probe failed → socket is dead
                 if _ws_attempts >= _ws_max_reconnects:
-                    log(f"WS upstream dropped — reconnect limit reached "
-                        f"({_ws_max_reconnects}): {ws_url}", "WS")
                     break
                 _ws_attempts += 1
                 log(f"WS upstream dropped — reconnecting (attempt {_ws_attempts}/{_ws_max_reconnects})", "WS")
-                time.sleep(0.5)   # brief backoff before re-dialing the upstream
                 try:
                     srv = _ws_connect_upstream(ws_url, extra_fwd)
                 except Exception as exc:
                     log(f"WS reconnect failed: {exc}", "WARN")
                     break
-            # Give-up path after a reconnectable drop: the pump left the
-            # browser socket open — close it and release deflate contexts now.
-            # Idempotent when the pump already closed everything.
-            if _ws_tunnel is not None:
-                _ws_tunnel.close()
 
             self.close_connection = True
 
@@ -9370,7 +9022,7 @@ def _viewer_cors_headers(origin: str) -> dict:
 
 def _viewer_disabled_response() -> Response:
     """404 returned by any /__s2l_*__ viewer route when its master flag
-    (WEB_CDNVIEWER) is off. Served for BOTH GET and
+    (WEB_CDNVIEWER / WEB_CAPTUREVIEWER) is off. Served for BOTH GET and
     OPTIONS so a disabled viewer has no discoverable CORS surface either.
     """
     r = Response("not found", status=404, content_type="text/plain; charset=utf-8")
@@ -9396,6 +9048,1086 @@ def _s2l_reset_stats_endpoint() -> Response:
     resp.headers["Cache-Control"] = "no-store"
     resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
     return resp
+
+# ── Capture browser endpoints ────────────────────────────────────────────────
+# Lets the viewer link to /__s2l_captures__ to browse recorded HTTP captures
+# (CAPTURE) and WebSocket captures (CAPTURE_WS) directly in the browser, with
+# per-host grouping + counts + a way to view individual capture JSON files.
+# /__s2l_captures_data__  → JSON listing of capture files (grouped by host)
+# /__s2l_capture_file__   → raw contents of one capture file (by relative path)
+# Both are GET + OPTIONS (CORS-preflightable) so a cross-origin dashboard can
+# embed them.
+
+def _list_captures(root: str, kind: str) -> list:
+    """Walk a capture directory tree, returning one entry per JSON file.
+
+    Each entry: {path (relative), host, size, mtime, kind}. Walks at most
+    2000 files to bound the work on huge capture sets.
+    """
+    out = []
+    if not os.path.isdir(root):
+        return out
+    n = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            rel = os.path.relpath(fp, root)
+            # Host = the first path segment under root (captures/<host>/... or
+            # captures_ws/<host>/t<id>/...).
+            parts = rel.split(os.sep)
+            host = parts[0] if parts else ""
+            out.append({
+                "path": rel.replace(os.sep, "/"),
+                "host": host,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "kind": kind,
+            })
+            n += 1
+            if n >= 2000:
+                return out
+    return out
+
+@app.route("/__s2l_captures_files__", methods=["GET", "OPTIONS"])
+def _s2l_captures_files_endpoint() -> Response:
+    """JSON listing of individual capture files for one host (+ optional kind).
+
+    Query params:
+      ?host=<hostname>   (required) — first path segment under captures[_ws]/
+      ?kind=http|ws      (optional, default http) — which tree to list
+
+    Returns up to 500 files (most-recent first) so the capture browser can show
+    a clickable per-file list. Each entry: {path, kind, size, mtime, url}.
+    The `url` points at /__s2l_capture_file__ so the browser can fetch the raw
+    JSON without constructing the URL itself.
+    """
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    host = (flask_request.args.get("host") or "").strip()
+    kind = (flask_request.args.get("kind") or "http").strip().lower()
+    if not host or kind not in ("http", "ws"):
+        resp = Response(json.dumps({"error": "host and kind required"}),
+                        content_type="application/json", status=400)
+        resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return resp
+    root = os.path.join(DATA_FOLDER, "captures" if kind == "http" else "captures_ws")
+    host_dir = os.path.join(root, host)
+    # Path-traversal guard: host_dir must stay under root.
+    if not os.path.abspath(host_dir).startswith(os.path.abspath(root) + os.sep):
+        resp = Response(json.dumps({"error": "forbidden"}),
+                        content_type="application/json", status=403)
+        resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return resp
+    files = []
+    if os.path.isdir(host_dir):
+        for dirpath, _dirs, fns in os.walk(host_dir):
+            for fn in fns:
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                rel = os.path.relpath(fp, root).replace(os.sep, "/")
+                files.append({
+                    "path": rel,
+                    "kind": kind,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                    "url": f"/__s2l_capture_file__?path={rel}&kind={kind}",
+                })
+                if len(files) >= 500:
+                    break
+            if len(files) >= 500:
+                break
+    # Most-recent first — the user almost always wants the latest capture.
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+    payload = {
+        "host": host, "kind": kind,
+        "total": len(files),
+        "files": files,
+    }
+    resp = Response(json.dumps(payload), content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_captures_data__", methods=["GET", "OPTIONS"])
+def _s2l_captures_data_endpoint() -> Response:
+    """JSON listing of all HTTP + WS capture files, grouped by host."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    http_root = os.path.join(DATA_FOLDER, "captures")
+    ws_root   = os.path.join(DATA_FOLDER, "captures_ws")
+    http_files = _list_captures(http_root, "http")
+    ws_files   = _list_captures(ws_root, "ws")
+    # Group by host for the browser.
+    hosts: dict = {}
+    for f in http_files + ws_files:
+        h = f["host"] or "(ungrouped)"
+        hosts.setdefault(h, {"http": 0, "ws": 0, "size": 0, "last": 0})
+        hosts[h][f["kind"]] += 1
+        hosts[h]["size"] += f["size"]
+        if f["mtime"] > hosts[h]["last"]:
+            hosts[h]["last"] = f["mtime"]
+    payload = {
+        "ts": time.strftime("%H:%M:%S"),
+        "http_total": len(http_files),
+        "ws_total": len(ws_files),
+        "http_size": sum(f["size"] for f in http_files),
+        "ws_size": sum(f["size"] for f in ws_files),
+        "hosts": [{"host": h, **d} for h, d in sorted(hosts.items())],
+        "http_root": os.path.relpath(http_root) if os.path.isdir(http_root) else None,
+        "ws_root":   os.path.relpath(ws_root)   if os.path.isdir(ws_root)   else None,
+    }
+    resp = Response(json.dumps(payload), content_type="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_capture_file__", methods=["GET", "OPTIONS"])
+def _s2l_capture_file_endpoint() -> Response:
+    """Return the raw JSON contents of one capture file (by ?path=&kind=)."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    rel = (flask_request.args.get("path") or "").strip()
+    kind = (flask_request.args.get("kind") or "http").strip().lower()
+    if not rel or kind not in ("http", "ws"):
+        return Response("Bad request", status=400)
+    root = os.path.join(DATA_FOLDER, "captures" if kind == "http" else "captures_ws")
+    # Resolve + guard against path traversal: the final path must stay under root.
+    # Both sides MUST be absolute for the startswith check — comparing a relative
+    # path against an absolute prefix always fails (the old bug: every capture
+    # file click returned 403 Forbidden because fp was relative but the prefix
+    # was absolute).
+    abs_root = os.path.abspath(root)
+    fp = os.path.abspath(os.path.normpath(os.path.join(root, rel)))
+    if not (fp == abs_root or fp.startswith(abs_root + os.sep)):
+        return Response("Forbidden", status=403)
+    if not os.path.isfile(fp):
+        return Response("Not found", status=404)
+    try:
+        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError as e:
+        return Response(str(e), status=500)
+    resp = Response(data, content_type="application/json; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
+@app.route("/__s2l_captures__", methods=["GET", "OPTIONS"])
+def _s2l_captures_endpoint() -> Response:
+    """Self-contained capture browser page (lists HTTP + WS captures)."""
+    if not WEB_CAPTUREVIEWER:
+        return _viewer_disabled_response()
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    page = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture Viewer</title>
+<style>
+  :root{--bg:#000000;--pnl:#000000;--pnl2:#141414;--bd:#ffffff;--bd2:rgba(255,255,255,.18);
+    --fg:#ffffff;--fg2:#ffffff;--dim:#9d9d9d;--acc:#ffffff;--grn:#4ade80;--ylw:#fbbf24;--mag:#c084fc;--red:#f87171;--cy:#7dd3fc}
+  [data-theme="light"]{--bg:#ffffff;--pnl:#ffffff;--pnl2:#f0f0f0;--bd:#000000;--bd2:rgba(0,0,0,.18);
+    --fg:#000000;--fg2:#000000;--dim:#595959;--acc:#000000;--grn:#16a34a;--ylw:#d97706;--mag:#9333ea;--red:#dc2626;--cy:#0284c7}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px;display:flex;flex-direction:column;min-height:100vh}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:var(--bg)}
+  ::-webkit-scrollbar-thumb{background:var(--bd);border-radius:6px;border:2px solid var(--bg)}
+  ::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+  ::selection{background:var(--acc);color:var(--bg)}
+  header{padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--pnl);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;color:var(--fg2);font-weight:700} h1 .v{color:var(--mag)}
+  a.back{color:var(--acc);text-decoration:none;font-size:12px} a.back:hover{text-decoration:underline}
+  .stats{margin-left:auto;display:flex;gap:14px;font-size:12px;color:var(--dim)}
+  .stats b{color:var(--fg2)}
+  .btn{padding:5px 10px;background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);font:inherit;font-size:11px;cursor:pointer}
+  .btn:hover{border-color:var(--acc)}
+  .btn.active{background:var(--acc);color:var(--bg);border-color:var(--acc)}
+  /* Global host filter — mirrors the CDN viewer's search bar styling so the
+     two viewers feel consistent. Faint border by default, accent on focus. */
+  .search{display:flex;align-items:center;gap:6px;min-width:160px;flex:1;max-width:280px;
+    padding:5px 10px;background:var(--pnl);border:1px solid var(--bd2);border-radius:6px}
+  .search:focus-within{border-color:var(--acc);box-shadow:0 0 0 2px rgba(255,255,255,.15)}
+  .search svg{width:13px;height:13px;color:var(--dim);flex-shrink:0}
+  .search input{flex:1;background:transparent;border:0;outline:0;color:var(--fg);font:inherit;font-size:12px}
+  .search input::placeholder{color:var(--dim)}
+  .search .count{color:var(--dim);font-size:10px;padding-left:6px;border-left:1px solid var(--bd2);margin-left:4px}
+  .pulse{width:9px;height:9px;border-radius:50%;background:var(--grn);display:inline-block;animation:p 1.6s infinite}
+  @keyframes p{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  main{flex:1;padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+  /* Card borders use the faint --bd2 (not full white) so stacked cards don't
+     form a heavy double-white grid against the outer container. The outer
+     page chrome (header/footer) keeps the full --bd white outline. */
+  .card{background:var(--pnl2);border:1px solid var(--bd2);border-radius:8px;overflow:hidden}
+  .card.open{border-color:var(--bd)}
+  .card-head{padding:11px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;cursor:pointer;color:var(--acc);font-weight:600;font-size:12px;user-select:none}
+  .card-head:hover{background:rgba(255,255,255,.04)}
+  .card-head .n{margin-left:auto;color:var(--dim);font-size:11px}
+  .card-body{padding:0;display:none}
+  .card.open .card-body{display:block}
+  .card.open .caret{transform:rotate(90deg)}
+  /* Card caret: CSS-based triangle (no emoji/character). Rotates 90deg
+     when the card is open, pointing down instead of right. */
+  .caret{display:inline-block;width:0;height:0;border-left:4px solid var(--dim);
+    border-top:4px solid transparent;border-bottom:4px solid transparent;
+    transition:transform .12s;margin-right:4px}
+  .card.open .caret{transform:rotate(90deg)}
+  .host{color:var(--fg2);font-weight:500}
+  /* Global Main/WS view tabs (header). Switching re-filters the host cards
+     to the selected capture kind so HTTP and WebSocket captures can be
+     browsed independently instead of mixed in one list. */
+  .kind-tabs{display:flex;gap:2px;background:var(--bg);border:1px solid var(--bd);
+    border-radius:7px;padding:2px}
+  .kind-tabs .ktab{background:none;border:0;color:var(--dim);font:inherit;font-size:11px;
+    font-weight:700;letter-spacing:.4px;padding:4px 14px;border-radius:5px;cursor:pointer;
+    text-transform:uppercase;transition:background .12s,color .12s}
+  .kind-tabs .ktab:hover{color:var(--fg2)}
+  .kind-tabs .ktab.active{background:var(--acc);color:var(--bg)}
+  .kind-tabs .ktab.active[data-kind="ws"]{background:var(--mag)}
+  .kind-tabs .ktab .badge{font-size:9px;opacity:.7;margin-left:5px;font-variant-numeric:tabular-nums}
+  /* Per-card count badge for the active kind (replaces the old http/ws chips
+     now that the global tabs drive the kind). */
+  .kcount{display:inline-block;min-width:22px;text-align:center;font-size:10px;font-weight:700;
+    padding:1px 7px;border-radius:9px;border:1px solid var(--bd2);color:var(--dim);
+    font-variant-numeric:tabular-nums;background:var(--pnl2)}
+  .card.open .kcount{color:var(--acc);border-color:var(--acc)}
+  .card.open[data-kind="ws"] .kcount{color:var(--mag);border-color:var(--mag)}
+  table.files{width:100%;border-collapse:collapse}
+  table.files td,th{padding:7px 14px;border-bottom:1px solid var(--bd2);text-align:left;font-size:11px}
+  table.files th{color:var(--fg2);text-transform:uppercase;letter-spacing:.5px;font-size:9px;font-weight:700;position:sticky;top:0;background:var(--pnl2)}
+  /* Sortable file headers — mirrors the CDN viewer's caret discoverability. */
+  table.files th.sortable{cursor:pointer;user-select:none}
+  table.files th.sortable:hover{color:var(--acc);background:rgba(255,255,255,.05)}
+  table.files th .caret{display:inline-block;width:0;height:0;margin-left:4px;vertical-align:middle;opacity:0;transition:opacity .12s}
+  table.files th.sortable:not(.sorted-asc):not(.sorted-desc) .caret{border-left:3px solid transparent;border-right:3px solid transparent;border-top:4px solid var(--dim)}
+  table.files th.sortable:hover .caret{opacity:.6}
+  table.files th.sorted-asc .caret{border-left:0;border-right:0;border-top:0;border-bottom:4px solid var(--acc);opacity:1}
+  table.files th.sorted-desc .caret{border-left:0;border-right:0;border-bottom:0;border-top:4px solid var(--acc);opacity:1}
+  table.files tr{cursor:pointer}
+  /* Subtle zebra striping for scannability on black, without adding row
+     borders. Hover is a stronger lift so the pointed row is obvious. */
+  table.files tbody tr:nth-child(even) td{background:rgba(255,255,255,.025)}
+  table.files tbody tr:hover td{background:rgba(255,255,255,.08)}
+  .fpath{color:var(--acc);max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fsize{color:var(--dim);font-variant-numeric:tabular-nums}
+  .ftime{color:var(--dim);font-variant-numeric:tabular-nums}
+  .empty{padding:40px;text-align:center;color:var(--dim)}
+  .empty .big{font-size:24px;color:var(--cy);margin-bottom:8px;font-weight:700}
+  .empty .sub{font-size:12px;line-height:1.7;max-width:420px;margin:0 auto}
+  .empty-clear{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
+    background:var(--pnl);border:1px solid var(--bd);border-radius:6px;color:var(--fg);
+    font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:background .12s,border-color .12s}
+  .empty-clear:hover{background:var(--pnl2);border-color:var(--acc)}
+  .loading{padding:14px;color:var(--dim);font-size:11px;text-align:center}
+  .file-filter{display:flex;align-items:center;gap:8px;padding:7px 14px;border-bottom:1px solid var(--bd2);
+    position:sticky;top:0;background:var(--pnl);z-index:1}
+  .file-filter .ff-input{flex:1;background:var(--bg);border:1px solid var(--bd2);border-radius:5px;
+    padding:5px 10px;color:var(--fg);font:inherit;font-size:11px;outline:0}
+  .file-filter .ff-input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(255,255,255,.15)}
+  .file-filter .ff-count{color:var(--dim);font-size:10px;min-width:50px;text-align:right;font-variant-numeric:tabular-nums}
+  footer{padding:9px 20px;border-top:1px solid var(--bd);background:var(--pnl);color:var(--dim);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  /* Modal viewer */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+  .modal-overlay.open{display:flex}
+  .modal{background:var(--pnl);border:1px solid var(--bd);border-radius:8px;width:100%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal-head{padding:10px 14px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;gap:10px;font-size:12px}
+  .modal-head .title{color:var(--fg2);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .modal-head .close{background:none;border:0;color:var(--dim);font-size:18px;cursor:pointer;padding:0 6px}
+  .modal-head .close:hover{color:var(--red)}
+  .modal-head .nav-btn{background:var(--pnl2);border:1px solid var(--bd);color:var(--fg);font-size:16px;font-weight:700;cursor:pointer;padding:2px 10px;border-radius:5px;line-height:1}
+  .modal-head .nav-btn:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+  .modal-head .nav-btn:disabled{opacity:.3;cursor:not-allowed}
+  .modal-head .pos{color:var(--dim);font-size:10px;font-variant-numeric:tabular-nums;min-width:42px;text-align:center}
+  .modal-head .action-btn{background:var(--pnl2);border:1px solid var(--cy);color:var(--cy);
+    font-size:10px;font-weight:700;cursor:pointer;padding:3px 10px;border-radius:5px;font-family:inherit}
+  .modal-head .action-btn:hover{background:var(--cy);color:#fff}
+  .modal-head .action-btn#modal-copy-body:hover{background:var(--grn);color:#fff}
+  .modal-head .action-btn#modal-download:hover{background:var(--acc);color:var(--bg)}
+  /* Tabs (Full / Request / Response) */
+  .modal-tabs{display:flex;gap:0;border-bottom:1px solid var(--bd2);padding:0 14px}
+  .modal-tabs .tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+    font:inherit;font-size:11px;font-weight:600;padding:8px 14px;cursor:pointer;letter-spacing:.3px}
+  .modal-tabs .tab:hover{color:var(--fg2)}
+  .modal-tabs .tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+  /* Fullscreen expand */
+  .modal.expanded{max-width:100%;max-height:100vh;width:100vw;height:100vh;border-radius:0}
+  .modal-body{padding:14px;overflow:auto;flex:1}
+  .modal-body pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.5;color:var(--fg)}
+  .modal-body pre .k{color:var(--acc)}
+  .modal-body pre .s{color:var(--grn)}
+  .modal-body pre .n{color:var(--ylw)}
+  /* Diff view (line-level add/del/eq highlighting) */
+  .modal-body pre.diff-view{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11px;line-height:1.6}
+  .diff-line{white-space:pre-wrap;word-break:break-word;padding:0 4px}
+  .diff-line.diff-add{background:rgba(63,185,80,.12);color:var(--grn)}
+  .diff-line.diff-del{background:rgba(248,81,73,.10);color:var(--red);text-decoration:line-through;text-decoration-color:rgba(248,81,73,.3)}
+  .diff-line.diff-eq{color:var(--dim)}
+  .diff-prefix{display:inline-block;width:14px;user-select:none;font-weight:700;opacity:.7}
+  .diff-text{display:inline}
+  /* Diff-select checkbox column */
+  .fdiff{width:28px;text-align:center}
+  .fdiff .diff-cb{cursor:pointer;accent-color:var(--mag)}
+  .diff-btn:hover{background:var(--mag)!important;color:#fff!important}
+  .toast{position:fixed;bottom:54px;left:50%;transform:translateX(-50%) translateY(20px);
+    background:var(--grn);color:#fff;padding:8px 18px;border-radius:6px;font-size:12px;font-weight:600;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:200}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  /* Help overlay (? key) — mirrors the CDN viewer's so the two viewers feel
+     consistent. Lists the keyboard shortcuts available in this viewer. */
+  .help-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:300;padding:20px}
+  .help-overlay.open{display:flex}
+  .help-card{background:var(--pnl);border:1px solid var(--bd);border-radius:10px;width:100%;max-width:420px;max-height:85vh;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+  .help-head{padding:14px 18px;border-bottom:1px solid var(--bd2);display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:700;color:var(--fg2)}
+  .help-close{background:none;border:0;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px}
+  .help-close:hover{color:var(--red)}
+  .help-body{padding:10px 18px;overflow:auto}
+  .help-row{display:flex;align-items:center;gap:12px;padding:7px 0;border-bottom:1px solid var(--bd2)}
+  .help-row:last-child{border-bottom:0}
+  .help-row .kbd{min-width:36px;text-align:center;font-size:10px;padding:2px 6px;border:1px solid var(--bd2);border-radius:3px;background:var(--pnl2);color:var(--dim);font-weight:700}
+  .help-row span:last-child{color:var(--fg);font-size:12px}
+  .help-foot{padding:10px 18px;border-top:1px solid var(--bd2);color:var(--dim);font-size:10px}
+</style></head><body>
+<header>
+  <span class="pulse"></span>
+  <h1>Capture Viewer</h1>
+  <a class="back" id="s2l-back" href="/__s2l_viewer__">← viewer</a>
+  <div class="kind-tabs" id="kind-tabs" title="switch between HTTP (Main) and WebSocket captures">
+    <button class="ktab active" data-kind="http">Main <span class="badge" id="ktab-http">0</span></button>
+    <button class="ktab" data-kind="ws">WS <span class="badge" id="ktab-ws">0</span></button>
+  </div>
+  <div class="stats">
+    <span>HTTP: <b id="t-http">0</b> (<b id="t-http-sz">0B</b>)</span>
+    <span>WS: <b id="t-ws">0</b> (<b id="t-ws-sz">0B</b>)</span>
+    <span>hosts: <b id="t-hosts">0</b></span>
+  </div>
+  <div class="search" id="cap-host-filter-wrap">
+    <input type="text" id="cap-host-filter" placeholder="Filter Hosts…" autocomplete="off" title="Filter Host Cards by Name (/ to Focus)">
+    <span class="count" id="cap-host-filter-count"></span>
+  </div>
+  <button class="btn" id="expand-all-btn" title="Expand All Host Cards">Expand All</button>
+  <button class="btn" id="collapse-all-btn" title="Collapse All Host Cards">Collapse All</button>
+  <button class="btn" id="refresh">Refresh</button>
+  <button class="btn" id="theme-btn" title="Toggle Theme">Theme</button>
+</header>
+<main><div id="cards"></div>
+<div class="empty" id="empty" style="display:none">
+  <div class="big" id="empty-big">No captures yet</div>
+  <div class="sub" id="empty-sub">Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>
+  Recorded HTTP request+response pairs and WebSocket messages will appear here, grouped by host.</div>
+  <button class="btn empty-clear" id="empty-clear" style="display:none;margin-top:14px">Clear Filter</button>
+</div>
+</main>
+<footer>
+  <span>Capture files under <b id="roots">—</b></span>
+  <span>Click a host to expand · Click a file to view · Auto-refreshes every 5 s (paused while a file is open)</span>
+</footer>
+<div class="modal-overlay" id="modal">
+  <div class="modal" id="modal-box">
+    <div class="modal-head">
+      <button class="nav-btn" id="modal-prev" title="Previous File (←)">‹</button>
+      <span class="title" id="modal-title">—</span>
+      <span class="fsize" id="modal-meta">—</span>
+      <span class="pos" id="modal-pos">—</span>
+      <button class="nav-btn" id="modal-next" title="Next File (→)">›</button>
+      <button class="action-btn" id="modal-curl" title="Copy as cURL Command (Replay This Request)" style="display:none">cURL</button>
+      <button class="action-btn" id="modal-copy-body" title="Copy the Response Body to Clipboard" style="display:none;border-color:var(--grn);color:var(--grn)">Body</button>
+      <button class="action-btn" id="modal-download" title="Download This Capture as a JSON File" style="border-color:var(--acc);color:var(--acc)">Save</button>
+      <button class="nav-btn" id="modal-expand" title="Toggle Full Screen (F)" style="font-size:13px">Expand</button>
+      <button class="close" id="modal-close">&times;</button>
+    </div>
+    <div class="modal-tabs" id="modal-tabs" style="display:none">
+      <button class="tab active" data-tab="full">Full</button>
+      <button class="tab" data-tab="request">Request</button>
+      <button class="tab" data-tab="response">Response</button>
+    </div>
+    <div class="modal-body"><pre id="modal-pre">loading…</pre></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<!-- Help overlay (? key) -->
+<div class="help-overlay" id="help-overlay">
+  <div class="help-card">
+    <div class="help-head"><span>S2L Captures — Keyboard Shortcuts</span><button class="help-close" id="help-close">&times;</button></div>
+    <div class="help-body">
+      <div class="help-row"><span class="kbd">/</span><span>Focus the Host Filter</span></div>
+      <div class="help-row"><span class="kbd">Esc</span><span>Clear Host Filter / Close Modal</span></div>
+      <div class="help-row"><span class="kbd">←</span><span>Previous Capture File (in Modal)</span></div>
+      <div class="help-row"><span class="kbd">→</span><span>Next Capture File (in Modal)</span></div>
+      <div class="help-row"><span class="kbd">F</span><span>Toggle Full-Screen Modal</span></div>
+      <div class="help-row"><span class="kbd">?</span><span>Toggle This Help Overlay</span></div>
+    </div>
+    <div class="help-foot">Click a host card to expand · Click a file to view its JSON · Click a column header to sort files · Check 2 files to diff</div>
+  </div>
+</div>
+<script>
+/* Server-injected config: lets the page hide the "← viewer" back-link when
+   the CDN viewer has been disabled server-side (WEB_CDNVIEWER). The sentinel
+   __S2L_CDN__ is replaced with true/false below. */
+var S2L_CFG = { viewer: __S2L_CDN__ };
+(function(){
+  function $(id){return document.getElementById(id);}
+  function fmtSize(n){if(n<1024)return n+"B";if(n<1048576)return (n/1024).toFixed(1)+"KB";return (n/1048576).toFixed(1)+"MB";}
+  // Hide the back-link to a viewer that's been turned off server-side.
+  (function(){ if(!S2L_CFG.viewer){ var b=$("s2l-back"); if(b) b.style.display="none"; } })();
+  function fmtTime(t){var d=new Date(t*1000);return d.toTimeString().slice(0,8);}
+  function showToast(msg){var t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(function(){t.classList.remove("show");},1500);}
+  // Theme persistence (shared with viewer via localStorage key)
+  if(localStorage.getItem("s2l-theme")==="light") document.documentElement.setAttribute("data-theme","light");
+  $("theme-btn").onclick=function(){var cur=document.documentElement.getAttribute("data-theme");var next=cur==="light"?"":"light";if(next)document.documentElement.setAttribute("data-theme",next);else document.documentElement.removeAttribute("data-theme");localStorage.setItem("s2l-theme",next||"dark");};
+
+  // ── View state ──────────────────────────────────────────────────────
+  var activeKind = "http";                 // global kind set by the Main/WS tabs
+  var activeKindRendered = null;           // last kind we fully rendered (tab-switch rebuilds)
+  var openHosts = new Set();               // hosts whose card-body is currently expanded
+  var cardEls  = Object.create(null);       // host -> {card, head, kcount, n}
+  var lastData = null;
+  var hostFilterText = "";                  // global host filter (header search input)
+  // Restore the persisted host filter from the previous session (so the
+  // user doesn't have to re-type it after a refresh). The input element is
+  // synced in the load() handler below (it doesn't exist at IIFE start).
+  (function restoreHostFilter(){
+    var saved = localStorage.getItem("s2l-cap-host-filter");
+    if(saved){ hostFilterText = saved; }
+  })();
+
+  // Main/WS tabs: switching kind re-filters the host list to that kind and
+  // re-opens any host that was already expanded (loading the new kind's files).
+  document.querySelectorAll(".kind-tabs .ktab").forEach(function(tab){
+    tab.onclick=function(){
+      var k=tab.dataset.kind;
+      if(k===activeKind) return;
+      activeKind=k;
+      document.querySelectorAll(".kind-tabs .ktab").forEach(function(t){
+        t.classList.toggle("active", t.dataset.kind===k);
+      });
+      if(lastData) renderCards(lastData, true);
+      activeKindRendered=activeKind;
+    };
+  });
+
+  function load(){
+    fetch("/__s2l_captures_data__",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+      lastData=d;
+      // Header totals (always show BOTH kinds' totals regardless of active tab).
+      $("t-http").textContent=d.http_total;$("t-http-sz").textContent=fmtSize(d.http_size);
+      $("t-ws").textContent=d.ws_total;$("t-ws-sz").textContent=fmtSize(d.ws_size);
+      $("ktab-http").textContent=d.http_total;
+      $("ktab-ws").textContent=d.ws_total;
+      $("t-hosts").textContent=d.hosts.length;
+      $("roots").textContent=[d.http_root,d.ws_root].filter(Boolean).join(" + ")||"—";
+      renderCards(d, activeKindRendered!==activeKind);
+      activeKindRendered=activeKind;
+    }).catch(function(e){
+      // Preserve the friendly "No captures yet" empty state instead of
+      // clobbering it with a raw JS exception string (which happened when the
+      // endpoint 404'd — e.g. viewer just turned off, or transient network).
+      // Show a short toast so a real failure is still surfaced, and keep the
+      // empty state's original structure intact for the next successful load.
+      if(!lastData){
+        // First load failed: show the empty state (it still has its original
+        // "No captures yet" HTML — we never overwrote it).
+        $("empty").style.display="block";
+      }
+      showToast("capture data unavailable — retrying…");
+    });
+  }
+
+  // Smart-merge render: preserves already-open cards AND their loaded file
+  // lists (scroll position, filter text, diff selection all survive the 5s
+  // auto-refresh), only touching the header counts. This is what stops the
+  // "modal / expanded card closes at every update" bug — the body of an open
+  // card is never touched by a refresh tick. A full rebuild is only done when
+  // the active kind (tab) actually changes.
+  function renderCards(d, fullRebuild){
+    var cards=$("cards");
+    // Hosts visible in the active tab = hosts that have at least one capture
+    // of the active kind AND match the global host filter (if any).
+    var f = hostFilterText.toLowerCase();
+    var visible = d.hosts.filter(function(h){
+      if((h[activeKind]||0) === 0) return false;
+      if(f && h.host.toLowerCase().indexOf(f) === -1) return false;
+      return true;
+    });
+    // Update the filter count badge in the header.
+    var fc=$("cap-host-filter-count");
+    if(fc) fc.textContent = f ? visible.length+"/"+d.hosts.length : "";
+    if(fullRebuild){
+      cards.innerHTML=""; cardEls=Object.create(null);
+    }
+    var seen=Object.create(null);
+    var frag=document.createDocumentFragment();
+    visible.forEach(function(h){
+      seen[h.host]=true;
+      var existing=cardEls[h.host];
+      if(existing && !fullRebuild){
+        // Update only the header counts/size/time — leave the body untouched.
+        existing.kcount.textContent=h[activeKind]||0;
+        existing.n.textContent=fmtSize(h.size)+' · '+fmtTime(h.last);
+        frag.appendChild(existing.card);
+        return;
+      }
+      var c=document.createElement("div");c.className="card";c.dataset.host=h.host;
+      var head=document.createElement("div");head.className="card-head";
+      var kcount=document.createElement("span");kcount.className="kcount";kcount.textContent=h[activeKind]||0;
+      var n=document.createElement("span");n.className="n";n.textContent=fmtSize(h.size)+' · '+fmtTime(h.last);
+      head.innerHTML='<span class="caret"></span> <span class="host"></span> ';
+      head.querySelector(".host").textContent=h.host;
+      head.appendChild(kcount); head.appendChild(n);
+      head.onclick=function(ev){ toggleCard(c, h.host); };
+      c.appendChild(head);
+      var body=document.createElement("div");body.className="card-body";
+      c.appendChild(body);
+      cardEls[h.host]={card:c, head:head, kcount:kcount, n:n};
+      frag.appendChild(c);
+    });
+    cards.appendChild(frag);
+    // Drop cards for hosts no longer visible (gone host, or the active tab
+    // no longer includes them). Close + forget them.
+    Object.keys(cardEls).forEach(function(host){
+      if(!seen[host]){
+        var e=cardEls[host]; if(e && e.card.parentNode) e.card.parentNode.removeChild(e.card);
+        delete cardEls[host]; openHosts.delete(host);
+      }
+    });
+    // On a tab switch (fullRebuild), re-open any host the user had expanded,
+    // now loading the *new* kind's files into its body.
+    if(fullRebuild){
+      var toReopen=Array.from(openHosts);
+      openHosts=new Set();
+      toReopen.forEach(function(host){ var e=cardEls[host]; if(e) openHost(e.card, host, activeKind); });
+    }
+    var visCount=Object.keys(cardEls).length;
+    // Filter-aware empty state (mirrors the CDN viewer): when the host filter
+    // narrows to 0 cards, show a "no match" message + Clear Filter button
+    // instead of the default "No captures yet" (which is misleading).
+    var hasData = d.hosts.length > 0;
+    var filteredEmpty = hasData && visCount === 0 && !!hostFilterText;
+    var showEmpty = !hasData || filteredEmpty;
+    $("empty").style.display = showEmpty ? "block" : "none";
+    var ebig=$("empty-big"), esub=$("empty-sub"), eclear=$("empty-clear");
+    if(filteredEmpty){
+      if(ebig) ebig.textContent = "No hosts match \""+hostFilterText+"\"";
+      if(esub) esub.innerHTML = "The filter returned 0 of "+d.hosts.length+" hosts on the "+activeKind.toUpperCase()+" tab.<br>Try a different search term, or clear the filter.";
+      if(eclear) eclear.style.display = "";
+    } else {
+      if(ebig) ebig.textContent = "No captures yet";
+      if(esub) esub.innerHTML = "Enable <code>CAPTURE</code> / <code>CAPTURE_WS</code> in s2l.py and browse the target site.<br>Recorded HTTP request+response pairs and WebSocket messages will appear here, grouped by host.";
+      if(eclear) eclear.style.display = "none";
+    }
+  }
+
+  function toggleCard(card, host){
+    var isOpen=card.classList.contains("open");
+    if(isOpen){
+      card.classList.remove("open");
+      openHosts.delete(host);
+      return;
+    }
+    openHost(card, host, activeKind);
+  }
+  function openHost(card, host, kind){
+    card.dataset.kind=kind;
+    card.classList.add("open");
+    openHosts.add(host);
+    var body=card.querySelector(".card-body");
+    body.innerHTML='<div class="loading">loading '+kind+' files…</div>';
+    fetch("/__s2l_captures_files__?host="+encodeURIComponent(host)+"&kind="+kind,{cache:"no-store"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.files || !d.files.length){ body.innerHTML='<div class="loading">No '+kind+' capture files for this host.</div>'; return; }
+        // Filter box above the file table — substring search on path/size/time.
+        var fbox=document.createElement("div");fbox.className="file-filter";
+        fbox.innerHTML='<input type="text" class="ff-input" placeholder="Filter '+kind+' files…" autocomplete="off"><span class="ff-count"></span>';
+        body.innerHTML=""; body.appendChild(fbox);
+        var t=document.createElement("table");t.className="files";
+        // Sortable file headers (path, size, time). Clicking toggles asc/desc.
+        // Default: server order (most-recent-first), matching the old behavior.
+        t.innerHTML="<thead><tr><th style='width:28px'></th>"
+          +"<th class='sortable' data-sort='path'>path<span class='caret'></span></th>"
+          +"<th class='sortable' data-sort='size' style='width:70px'>size<span class='caret'></span></th>"
+          +"<th class='sortable' data-sort='time' style='width:70px'>time<span class='caret'></span></th>"
+          +"</tr></thead>";
+        var tb=document.createElement("tbody");
+        var files=d.files;
+        // Per-card file sort state (default: no sort = server order).
+        var fileSortKey=null, fileSortDir="asc";
+        function renderFileRows(){
+          // Re-append rows in sorted order. Since the rows were created with
+          // data-fi attributes, we can sort the array of <tr> by the file's
+          // sort field and re-append them in order.
+          var rowsArr = Array.prototype.slice.call(tb.querySelectorAll("tr"));
+          if(fileSortKey){
+            rowsArr.sort(function(a,b){
+              var fa=files[parseInt(a.getAttribute("data-fi"),10)]||{};
+              var fb=files[parseInt(b.getAttribute("data-fi"),10)]||{};
+              var av, bv;
+              if(fileSortKey==="path"){ av=fa.path||""; bv=fb.path||""; }
+              else if(fileSortKey==="size"){ av=fa.size||0; bv=fb.size||0; }
+              else if(fileSortKey==="time"){ av=fa.mtime||0; bv=fb.mtime||0; }
+              var r = av<bv?-1:av>bv?1:0;
+              return fileSortDir==="asc"? r : -r;
+            });
+          }
+          var frag=document.createDocumentFragment();
+          rowsArr.forEach(function(tr){ frag.appendChild(tr); });
+          tb.innerHTML=""; tb.appendChild(frag);
+          // Update header caret classes.
+          var ths=t.querySelectorAll("th.sortable");
+          for(var i=0;i<ths.length;i++){
+            ths[i].classList.remove("sorted-asc","sorted-desc");
+            if(ths[i].getAttribute("data-sort")===fileSortKey){
+              ths[i].classList.add(fileSortDir==="asc"?"sorted-asc":"sorted-desc");
+            }
+          }
+        }
+        // Wire sortable header clicks.
+        (function(){
+          var ths=t.querySelectorAll("th.sortable");
+          for(var i=0;i<ths.length;i++){
+            ths[i].addEventListener("click", function(ev){
+              ev.stopPropagation();
+              var key=this.getAttribute("data-sort");
+              if(fileSortKey===key){ fileSortDir = fileSortDir==="asc"?"desc":"asc"; }
+              else { fileSortKey=key; fileSortDir="asc"; }
+              renderFileRows();
+            });
+          }
+        })();
+        // Diff selection state: track which file indices have their checkbox checked.
+        var diffSel=[];
+        var diffBtn=document.createElement("button"); diffBtn.className="btn diff-btn"; diffBtn.textContent="Diff selected"; diffBtn.style.display="none";
+        diffBtn.style.cssText="position:absolute;right:14px;margin-top:4px;border-color:var(--mag);color:var(--mag)";
+        function updateDiffBtn(){
+          diffSel = diffSel.filter(function(i){ return i>=0 && i<files.length; });
+          if(diffSel.length===2){ diffBtn.style.display=""; diffBtn.textContent="Diff "+diffSel.length+" selected"; }
+          else { diffBtn.style.display="none"; }
+        }
+        diffBtn.onclick=function(){
+          if(diffSel.length!==2) return;
+          // Fetch both captures, then open the diff modal.
+          var a=files[diffSel[0]], b=files[diffSel[1]];
+          Promise.all([
+            fetch(a.url,{cache:"no-store"}).then(function(r){return r.text();}),
+            fetch(b.url,{cache:"no-store"}).then(function(r){return r.text();})
+          ]).then(function(results){
+            openDiff(a, b, results[0], results[1]);
+          }).catch(function(e){ showToast("Diff fetch failed: "+e,"warn"); });
+        };
+        d.files.forEach(function(f, fi){
+          var tr=document.createElement("tr");
+          tr.setAttribute("data-fi", String(fi));
+          tr.innerHTML='<td class="fdiff"><input type="checkbox" class="diff-cb" data-fi="'+fi+'" title="select for diff"></td>'
+            +'<td class="fpath" title="'+f.path+'">'+f.path+'</td>'
+            +'<td class="fsize">'+fmtSize(f.size)+'</td>'
+            +'<td class="ftime">'+fmtTime(f.mtime)+'</td>';
+          // Checkbox: toggle diff selection (max 2). Stop propagation so the row click (open) doesn't fire.
+          var cb=tr.querySelector(".diff-cb");
+          cb.onclick=function(ev){ ev.stopPropagation();
+            if(cb.checked){
+              if(diffSel.length>=2){ cb.checked=false; showToast("Select at most 2 files to diff","warn"); return; }
+              diffSel.push(fi);
+            } else {
+              diffSel = diffSel.filter(function(i){return i!==fi;});
+            }
+            updateDiffBtn();
+          };
+          tr.onclick=function(){ openFileFromList(files, fi); };
+          tb.appendChild(tr);
+        });
+        t.appendChild(tb); body.appendChild(t);
+        // Footer row: note text on the left, Diff button on the right.
+        // Uses flexbox so the button stays anchored to the right edge of the
+        // table (VLM noted the old position:absolute made it "float awkwardly").
+        var footer=document.createElement("div");
+        footer.style.cssText="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;gap:10px";
+        var note=document.createElement("div");note.className="loading";
+        note.style.cssText="padding:0;text-align:left";
+        note.textContent=d.total+" file(s) · click a row to view · check 2 to diff";
+        footer.appendChild(note);
+        diffBtn.style.cssText="border-color:var(--mag);color:var(--mag);position:static;margin:0";
+        footer.appendChild(diffBtn);
+        body.appendChild(footer);
+        // Wire the filter: show only rows whose path/size/time matches the query.
+        var ff=fbox.querySelector(".ff-input"), fc=fbox.querySelector(".ff-count");
+        ff.addEventListener("input", function(){
+          var q=ff.value.toLowerCase().trim();
+          var visible=0;
+          Array.prototype.forEach.call(tb.querySelectorAll("tr"), function(tr){
+            // Use data-fi to get the correct file for this row — after
+            // sorting, the row's DOM position no longer matches its index
+            // in the files array (the old `files[i]` bug matched the wrong
+            // file's path/size/time when the table was sorted).
+            var fi=parseInt(tr.getAttribute("data-fi"),10);
+            var f=files[fi]||{};
+            var hay=(f.path+" "+f.size+" "+fmtTime(f.mtime)).toLowerCase();
+            var match = !q || hay.indexOf(q)!==-1;
+            tr.style.display = match ? "" : "none";
+            if(match) visible++;
+          });
+          fc.textContent = q ? visible+"/"+files.length : "";
+          note.textContent = (q?visible:files.length)+" file(s)"+(q?" matched":"")+" · click a row to view";
+        });
+        ff.focus();
+      })
+      .catch(function(e){ body.innerHTML='<div class="loading">Error: '+e+'</div>'; });
+  }
+  function syntaxHighlight(json){
+    // escaped + token-colored JSON for the modal
+    json = json.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function(m){
+      var cls="n";
+      if(/^"/.test(m)){ cls = /:$/.test(m) ? "k" : "s"; }
+      else if(/true|false/.test(m)){ cls="k"; }
+      else if(/null/.test(m)){ cls="dim"; }
+      return '<span class="'+cls+'">'+m+'</span>';
+    });
+  }
+  // Currently-open capture object (parsed) — used by the cURL builder + tabs.
+  var currentCapture=null;
+  var currentTab="full";   // "full" | "request" | "response"
+  var currentFileObj=null; // for the download button
+  function renderCaptureTab(){
+    if(!currentCapture) return;
+    var pre=$("modal-pre");
+    if(currentTab==="full"){
+      pre.innerHTML=syntaxHighlight(JSON.stringify(currentCapture,null,2));
+    } else if(currentTab==="request"){
+      var req=currentCapture.request||{};
+      pre.innerHTML=syntaxHighlight(JSON.stringify(req,null,2));
+    } else if(currentTab==="response"){
+      var resp=currentCapture.response||{};
+      pre.innerHTML=syntaxHighlight(JSON.stringify(resp,null,2));
+    }
+    // Update tab active states.
+    document.querySelectorAll(".modal-tabs .tab").forEach(function(t){
+      t.classList.toggle("active", t.dataset.tab===currentTab);
+    });
+  }
+  // ── Diff view: compare two captures side-by-side with line-level highlighting.
+  // Uses a simple LCS-based line diff (no deps) so it works under file://.
+  function lineDiff(a, b){
+    var al=a.split("\n"), bl=b.split("\n");
+    var n=al.length, m=bl.length;
+    // Build LCS table.
+    var dp=[];
+    for(var i=0;i<=n;i++){ dp.push(new Array(m+1).fill(0)); }
+    for(i=n-1;i>=0;i--){
+      for(var j=m-1;j>=0;j--){
+        dp[i][j] = (al[i]===bl[j]) ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+      }
+    }
+    // Backtrack to produce a unified-style diff.
+    var out=[];
+    i=0; var j=0;
+    while(i<n && j<m){
+      if(al[i]===bl[j]){ out.push({t:"eq", v:al[i]}); i++; j++; }
+      else if(dp[i+1][j] >= dp[i][j+1]){ out.push({t:"del", v:al[i]}); i++; }
+      else { out.push({t:"add", v:bl[j]}); j++; }
+    }
+    while(i<n){ out.push({t:"del", v:al[i]}); i++; }
+    while(j<m){ out.push({t:"add", v:bl[j]}); j++; }
+    return out;
+  }
+  function openDiff(fileA, fileB, txtA, txtB){
+    var modal=$("modal");
+    var pa=txtA, pb=txtB;
+    try { pa=JSON.stringify(JSON.parse(txtA),null,2); } catch(e){}
+    try { pb=JSON.stringify(JSON.parse(txtB),null,2); } catch(e){}
+    var diff=lineDiff(pa, pb);
+    var stats={eq:0, add:0, del:0};
+    diff.forEach(function(d){ stats[d.t]++; });
+    $("modal-title").textContent="Diff: "+fileA.path.split("/").pop()+" vs "+fileB.path.split("/").pop();
+    $("modal-meta").textContent="+"+stats.add+" / -"+stats.del+" / ="+stats.eq;
+    $("modal-curl").style.display="none";
+    $("modal-copy-body").style.display="none";
+    $("modal-tabs").style.display="none";
+    $("modal-download").style.display="none";
+    currentCapture=null;
+    modal.classList.add("open");
+    // Render diff as colored lines.
+    var html="";
+    diff.forEach(function(d){
+      var cls = d.t==="add"?"diff-add":d.t==="del"?"diff-del":"diff-eq";
+      var prefix = d.t==="add"?"+":d.t==="del"?"-":" ";
+      var line = (d.v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      html += '<div class="diff-line '+cls+'"><span class="diff-prefix">'+prefix+'</span><span class="diff-text">'+line+'</span></div>';
+    });
+    $("modal-pre").className="diff-view";
+    $("modal-pre").innerHTML = html || "(identical)";
+  }
+  function openFile(f){
+    var modal=$("modal");
+    currentFileObj=f;
+    $("modal-title").textContent=f.path;
+    $("modal-meta").textContent=fmtSize(f.size)+" · "+fmtTime(f.mtime);
+    $("modal-pre").innerHTML="loading…";
+    $("modal-pre").className="";   // reset from diff-view
+    $("modal-curl").style.display="none";   // hidden until we confirm it's an HTTP capture
+    $("modal-copy-body").style.display="none"; // hidden unless response has a body
+    $("modal-tabs").style.display="none";   // hidden unless it's a capture with req+resp
+    $("modal-download").style.display="";   // restore (openDiff hides it)
+    currentCapture=null;
+    currentTab="full";
+    modal.classList.add("open");
+    // Update position indicator + prev/next disabled state.
+    var list=currentFileList, idx=currentFileIdx;
+    if(list && idx>=0){
+      $("modal-pos").textContent=(idx+1)+"/"+list.length;
+      $("modal-prev").disabled = idx<=0;
+      $("modal-next").disabled = idx>=list.length-1;
+    } else {
+      $("modal-pos").textContent="—";
+      $("modal-prev").disabled=true; $("modal-next").disabled=true;
+    }
+    fetch(f.url,{cache:"no-store"}).then(function(r){return r.text();}).then(function(txt){
+      var parsed=null;
+      try { parsed=JSON.parse(txt); } catch(e){}
+      if(parsed){
+        currentCapture=parsed;
+        // Show the cURL button only for HTTP captures (have a request.method+url).
+        if(parsed.request && parsed.request.method && parsed.request.url){
+          $("modal-curl").style.display="";
+        }
+        // Show the tabs + copy-body button only for captures with request+response sections.
+        if(parsed.request && parsed.response){
+          $("modal-tabs").style.display="flex";
+          if(parsed.response.body){
+            $("modal-copy-body").style.display="";
+          }
+        }
+        renderCaptureTab();
+      } else {
+        $("modal-pre").textContent=txt;
+      }
+    }).catch(function(e){ $("modal-pre").textContent="Error: "+e; });
+  }
+  // Build a cURL command from the currently-open HTTP capture's request section.
+  // Replays the original method, URL, headers, and body so a developer can
+  // reproduce the exact captured request from a terminal.
+  function captureToCurl(cap){
+    if(!cap || !cap.request) return null;
+    var r=cap.request;
+    var method=(r.method||"GET").toUpperCase();
+    var url=r.url||"";
+    var parts=['curl -sS -D - -X '+method+' "'+url.replace(/"/g,'\\"')+'"'];
+    // Headers (skip Host/Content-Length — curl sets those itself).
+    var hdrs=r.headers||{};
+    for(var k in hdrs){
+      if(!hdrs.hasOwnProperty(k)) continue;
+      var kl=k.toLowerCase();
+      if(kl==="host"||kl==="content-length"||kl==="connection") continue;
+      parts.push('  -H "'+k+': '+String(hdrs[k]).replace(/"/g,'\\"')+'"');
+    }
+    // Body (only for methods that have one, and only if CAPTURE_BODIES was on).
+    if(r.body && method!=="GET" && method!=="HEAD"){
+      parts.push('  --data-raw \''+String(r.body).replace(/'/g,"'\\''")+'\'');
+    }
+    return parts.join(" \\\n");
+  }
+  $("modal-curl").onclick=function(){
+    if(!currentCapture){ showToast("No request to copy","warn"); return; }
+    var cmd=captureToCurl(currentCapture);
+    if(!cmd){ showToast("Capture has no replayable request","warn"); return; }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(cmd).then(function(){
+        showToast("Copied cURL command ("+currentCapture.request.method+" "+(currentCapture.request.url||"").slice(0,40)+"…)");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      var ta=document.createElement("textarea"); ta.value=cmd; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied cURL command");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
+  };
+  // Track the currently-open file list + index for prev/next navigation.
+  var currentFileList=[], currentFileIdx=-1;
+  function openFileFromList(list, idx){
+    currentFileList=list; currentFileIdx=idx;
+    if(idx>=0 && idx<list.length) openFile(list[idx]);
+  }
+  function navFile(delta){
+    if(!currentFileList.length) return;
+    var ni=currentFileIdx+delta;
+    if(ni<0 || ni>=currentFileList.length) return;
+    currentFileIdx=ni;
+    openFile(currentFileList[ni]);
+  }
+  $("modal-prev").onclick=function(){ navFile(-1); };
+  $("modal-next").onclick=function(){ navFile(1); };
+  $("modal-close").onclick=function(){$("modal").classList.remove("open");};
+  $("modal").onclick=function(e){if(e.target===this)$("modal").classList.remove("open");};
+  // Tab switching: Full / Request / Response.
+  document.querySelectorAll(".modal-tabs .tab").forEach(function(tab){
+    tab.onclick=function(){
+      currentTab=tab.dataset.tab;
+      renderCaptureTab();
+    };
+  });
+  // Copy response body to clipboard.
+  $("modal-copy-body").onclick=function(){
+    if(!currentCapture || !currentCapture.response || !currentCapture.response.body){
+      showToast("No response body to copy","warn"); return;
+    }
+    var body=currentCapture.response.body;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(body).then(function(){
+        showToast("Copied response body ("+body.length+" chars)");
+      }, function(){ showToast("Clipboard write failed","warn"); });
+    } else {
+      var ta=document.createElement("textarea"); ta.value=body; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand("copy"); showToast("Copied response body");}catch(e){showToast("Copy failed","warn");}
+      ta.remove();
+    }
+  };
+  // Download the capture JSON as a file.
+  $("modal-download").onclick=function(){
+    if(!currentCapture){ showToast("No data to download","warn"); return; }
+    var txt=JSON.stringify(currentCapture,null,2);
+    var blob=new Blob([txt],{type:"application/json"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a");
+    var fname=(currentFileObj && currentFileObj.path) ? currentFileObj.path.split("/").pop() : "capture.json";
+    a.href=url; a.download=fname;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    showToast("Downloaded "+fname);
+  };
+  // Full-screen expand toggle.
+  $("modal-expand").onclick=function(){
+    var box=$("modal-box");
+    box.classList.toggle("expanded");
+    this.textContent = box.classList.contains("expanded") ? "Restore" : "Expand";
+    this.title = box.classList.contains("expanded") ? "Restore (F)" : "Toggle Full Screen (F)";
+  };
+  document.addEventListener("keydown",function(e){
+    if(!$("modal").classList.contains("open")) return;
+    if(e.key==="Escape") $("modal").classList.remove("open");
+    else if(e.key==="ArrowLeft") navFile(-1);
+    else if(e.key==="ArrowRight") navFile(1);
+    else if(e.key==="f"||e.key==="F") $("modal-expand").click();
+  });
+  // Global keyboard shortcuts (only when the modal is NOT open — the modal
+  // has its own handler above). Mirrors the CDN viewer's shortcuts:
+  //   /  → focus the global host filter
+  //   Esc → clear the host filter (if active) or just defocus the input
+  document.addEventListener("keydown",function(e){
+    if($("modal").classList.contains("open")) return;
+    var helpOverlay=$("help-overlay");
+    // ? toggles the help overlay (Shift+/ also works for keyboards where ? is shifted).
+    if(e.key==="?" || (e.shiftKey && e.key==="/")){ e.preventDefault(); helpOverlay.classList.toggle("open"); return; }
+    // Esc closes the help overlay first, then clears the host filter.
+    if(e.key==="Escape" && helpOverlay.classList.contains("open")){ helpOverlay.classList.remove("open"); return; }
+    // Allow Escape through even when an input is focused (so Esc can clear
+    // the host filter while the cursor is in it). Block other shortcuts.
+    if(e.key!=="Escape" && (e.target.tagName==="INPUT" || e.target.tagName==="TEXTAREA")) return;
+    if(e.key==="/"){ e.preventDefault(); $("cap-host-filter").focus(); }
+    else if(e.key==="Escape"){
+      if(hostFilterText){
+        hostFilterText=""; $("cap-host-filter").value=""; $("cap-host-filter").blur();
+        localStorage.removeItem("s2l-cap-host-filter");
+        if(lastData) renderCards(lastData, true);
+        showToast("Host filter cleared");
+      }
+    }
+  });
+  // Help overlay close button + click-outside-to-close.
+  var helpOverlayEl=$("help-overlay");
+  if(helpOverlayEl){
+    $("help-close").onclick=function(){ helpOverlayEl.classList.remove("open"); };
+    helpOverlayEl.addEventListener("click", function(e){ if(e.target===this) helpOverlayEl.classList.remove("open"); });
+  }
+  $("refresh").onclick=load;
+  // Global host filter: filters the host cards by name (substring match).
+  // Re-renders on every keystroke (cheap — smart-merge preserves open cards).
+  // Persists to localStorage so it survives a page refresh.
+  var hfEl = $("cap-host-filter");
+  if(hfEl && hostFilterText){ hfEl.value = hostFilterText; }   // sync input from restored state
+  $("cap-host-filter").addEventListener("input", function(e){
+    hostFilterText = e.target.value.trim();
+    localStorage.setItem("s2l-cap-host-filter", hostFilterText);
+    if(lastData) renderCards(lastData, true);
+  });
+  // "Clear filter" button in the empty state — the recovery path when the
+  // host filter narrows to 0 cards. Mirrors the CDN viewer's empty-clear.
+  var capEmptyClear=$("empty-clear");
+  if(capEmptyClear) capEmptyClear.onclick=function(){
+    hostFilterText=""; $("cap-host-filter").value=""; $("cap-host-filter").blur();
+    localStorage.removeItem("s2l-cap-host-filter");
+    if(lastData) renderCards(lastData, true);
+    showToast("Host filter cleared");
+  };
+  // Expand-all / collapse-all: iterate the visible card elements and
+  // open/close each one. Uses the same openHost() / toggleCard() functions
+  // the user's individual clicks use, so the file-loading behavior is
+  // identical (expand loads files for the active kind).
+  $("expand-all-btn").onclick=function(){
+    if(!lastData) return;
+    var f = hostFilterText.toLowerCase();
+    var toExpand = lastData.hosts.filter(function(h){
+      if((h[activeKind]||0) === 0) return false;
+      if(f && h.host.toLowerCase().indexOf(f) === -1) return false;
+      return true;
+    });
+    toExpand.forEach(function(h){
+      if(!openHosts.has(h.host)){
+        var e=cardEls[h.host];
+        if(e) openHost(e.card, h.host, activeKind);
+      }
+    });
+    if(toExpand.length) showToast("Expanded "+toExpand.length+" card"+(toExpand.length===1?"":"s"));
+  };
+  $("collapse-all-btn").onclick=function(){
+    if(!openHosts.size){ return; }
+    var n=openHosts.size;
+    openHosts.forEach(function(host){
+      var e=cardEls[host]; if(e) e.card.classList.remove("open");
+    });
+    openHosts.clear();
+    showToast("Collapsed "+n+" card"+(n===1?"":"s"));
+  };
+  load();
+  // Auto-refresh every 5 s, but PAUSE while the file-detail modal is open so
+  // the user can click around (Response tab, copy-body, prev/next, diff)
+  // without the underlying list rebuilding under their cursor. Resumes the
+  // tick after the modal closes, picking up any captures written meanwhile.
+  setInterval(function(){
+    if($("modal").classList.contains("open")) return;
+    load();
+  }, 5000);
+})();
+</script></body></html>"""
+    # Inject the viewer-enabled flag so the page can hide its "← viewer"
+    # back-link when the CDN viewer has been disabled server-side.
+    page = page.replace("__S2L_CDN__", "true" if WEB_CDNVIEWER else "false")
+    resp = Response(page, content_type="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp
+
 
 # ── Main viewer data + page ──────────────────────────────────────────────────
 
@@ -9443,9 +10175,7 @@ def _s2l_viewer_data_endpoint() -> Response:
         "target":      MAIN_HOST,
         "proxy":       f"http://{HOST}:{PORT}",
         "uptime_s":    uptime_s,
-        # Client-aware URL: the viewer page may be opened from a phone/LAN
-        # device — build each CDN URL on the host the browser actually used.
-        "active":      [{"host": h, "port": p, "url": f"http://{_request_hostname()}:{p}",
+        "active":      [{"host": h, "port": p, "url": f"http://localhost:{p}",
                          "health": health.get(h)}
                         for h, p in snap],
         "pending":     pending,
@@ -9479,8 +10209,10 @@ def _s2l_viewer_data_endpoint() -> Response:
             "UDP_TUNNEL":        UDP_TUNNEL,
             "WS_DEFLATE":        WS_DEFLATE,
             "WS_AUTO_RECONNECT": WS_AUTO_RECONNECT,
-            # Web-UI master switch (lets the viewer be turned off server-side).
+            # Web-UI master switches (let the viewer hide the cross-link to a
+            # page that's been turned off server-side).
             "WEB_CDNVIEWER":     WEB_CDNVIEWER,
+            "WEB_CAPTUREVIEWER": WEB_CAPTUREVIEWER,
         },
     }
     resp = Response(json.dumps(payload), content_type="application/json")
@@ -9772,6 +10504,10 @@ def _s2l_viewer_endpoint() -> Response:
     <span id="copy-sel-label">Copy 0</span>
   </button>
   <span class="tb-sep" aria-hidden="true"></span>
+  <a class="btn" id="captures-btn" href="/__s2l_captures__" target="_blank" title="Browse Recorded HTTP/WS Captures" style="text-decoration:none">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25Z"/><path d="M5 5.75A.75.75 0 0 1 5.75 5h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 5.75Zm0 3A.75.75 0 0 1 5.75 8h6.5a.75.75 0 0 1 0 1.5h-6.5A.75.75 0 0 1 5 8.75Zm0 3a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1-.75-.75Z"/></svg>
+    Captures
+  </a>
   <button class="btn" id="reset-btn" title="Reset All Counters for a Clean Benchmark Window (R)" style="border-color:var(--warn);color:var(--warn)">
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 1 1-4.546 2.914.75.75 0 0 0-1.36-.632A6.5 6.5 0 1 0 8 1.5v-.994a.25.25 0 0 0-.382-.214L4.5 2.5l3.118 1.993A.25.25 0 0 0 8 4.279Z"/></svg>
     Reset
@@ -9826,7 +10562,7 @@ def _s2l_viewer_endpoint() -> Response:
       <div class="help-row"><span class="kbd">T</span><span>Toggle Dark / Light Theme</span></div>
       <div class="help-row"><span class="kbd">O</span><span>Open All CDN Ports in New Tabs</span></div>
       <div class="help-row"><span class="kbd">⇧A</span><span>Copy All CDN URLs to Clipboard</span></div>
-      <div class="help-row"><span class="kbd">Esc</span><span>Clear Filter / Selection / Close Overlay</span></div>
+      <div class="help-row" id="help-cap" style="display:none"></div>
       <div class="help-row"><span class="kbd">R</span><span>Reset All Counters (Benchmark Window)</span></div>
       <div class="help-row"><span class="kbd">/</span><span>Focus the CDN Host Filter</span></div>
       <div class="help-row"><span class="kbd">H</span><span>Sort by Health (Broken CDNs First)</span></div>
@@ -9842,6 +10578,10 @@ def _s2l_viewer_endpoint() -> Response:
   </div>
 </div>
 <script>
+/* Server-injected config: lets the page hide the cross-link to a viewer that
+   has been disabled server-side (WEB_CDNVIEWER / WEB_CAPTUREVIEWER). The
+   sentinels __S2L_CAP__ / __S2L_CDN__ are replaced with true/false below. */
+var S2L_CFG = { captures: __S2L_CAP__, viewer: __S2L_CDN__ };
 (function(){
   "use strict";
   var DEFAULT_REFRESH=50, rowsEl=document.getElementById("rows"), empty=document.getElementById("empty");
@@ -9901,6 +10641,16 @@ def _s2l_viewer_endpoint() -> Response:
 
   function $(id){return document.getElementById(id);}
   function setText(el,v){ if(el.textContent!==v) el.textContent=v; }
+  // ── Optional-viewer wiring ──────────────────────────────────────────
+  // Hide the cross-link to a viewer the server has turned off, so the user
+  // never sees a button that 404s. Runs once at init.
+  (function applyCfg(){
+    if(!S2L_CFG.captures){
+      var b=$("captures-btn"); if(b) b.style.display="none";
+      var f=$("ft-cap");       if(f) f.style.display="none";
+      var h=$("help-cap");     if(h) h.style.display="none";
+    }
+  })();
   function fmtUptime(s){
     if(s<60) return s+"s";
     if(s<3600) return Math.floor(s/60)+"m "+(s%60)+"s";
@@ -10022,7 +10772,7 @@ def _s2l_viewer_endpoint() -> Response:
   function renderFlags(flags){
     var el=$("flags"), order=["CAPTURE","CAPTURE_WS","HOOK_GUI","MULTIPORT","PROXY_CDN","CACHE_CDN",
                               "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
-                              "WEB_CDNVIEWER"];
+                              "WEB_CDNVIEWER","WEB_CAPTUREVIEWER"];
     var html=[];
     for(var i=0;i<order.length;i++){
       var k=order[i], on=!!flags[k];
@@ -10556,6 +11306,11 @@ def _s2l_viewer_endpoint() -> Response:
 </script>
 </body>
 </html>"""
+    # Replace the S2L_CFG sentinels with real booleans so the page hides the
+    # cross-link to any viewer that's been disabled server-side.
+    page = (page
+           .replace("__S2L_CAP__", "true" if WEB_CAPTUREVIEWER else "false")
+           .replace("__S2L_CDN__", "true" if WEB_CDNVIEWER else "false"))
     resp = Response(page, content_type="text/html; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     resp.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -11625,6 +12380,8 @@ def _banner() -> None:
             print(f"  {DIM}▶ MULTIPORT viewer{R} {DIM}disabled (WEB_CDNVIEWER=False){R}")
     elif PROXY_CDN:
         print(f"  {M}▶ CDN{R} {DIM}assets via {_EXT_PREFIX}/ (single port){R}")
+    if WEB_CAPTUREVIEWER:
+        print(f"  {C}▶ Capture Viewer{R} {DIM}open {C}http://localhost:{PORT}/__s2l_captures__{R} {DIM}(browse HTTP/WS captures){R}")
     if CAPTURE:
         skip   = "static skipped" if CAPTURE_SKIP_STATIC else "all captured"
         body   = "req body on" if CAPTURE_BODIES else "req body off"
@@ -11826,6 +12583,8 @@ if __name__ == "__main__":
     if PROXY_CDN and MULTIPORT:
         if WEB_CDNVIEWER:
             log(f"MULTIPORT web viewer → http://localhost:{PORT}/__s2l_viewer__ (50 ms live refresh)", "INFO")
+        if WEB_CAPTUREVIEWER:
+            log(f"Capture browser    → http://localhost:{PORT}/__s2l_captures__", "INFO")
 
     if HOOK_GUI:
         # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
