@@ -310,30 +310,17 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # When False, the matching /__s2l_*__ routes return 404 and their cross-links
 # are hidden from the other page, so the proxy runs headless with zero web
 # surface. Flip either on to expose the corresponding self-contained viewer.
-WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CDNVIEWER    = False            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-WS_PING_INTERVAL    = 0        # seconds between WS keepalive pings (0 = off).
-                                # OFF by default (was 20 — caused constant drops in
-                                # realtime apps like Discord voice calls):
-                                #   1) on the curl_cffi upstream path, send(PING)
-                                #      from this thread races a blocked recv() on
-                                #      the SAME easy handle → internal buffer
-                                #      corruption → zlib-stream gateways (Discord
-                                #      IS zlib-stream) desync with "invalid stored
-                                #      block lengths" → the app closes the socket;
-                                #   2) the pong-window check tears tunnels down on
-                                #      false positives when a pong is auto-consumed
-                                #      or merged with other frames.
-                                # Realtime apps drive their own app-level
-                                # heartbeats (Discord ≈ every 41s), which keep NAT
-                                # mappings warm AND detect real death — the proxy
-                                # relay sees the close and tears down cleanly.
-                                # Opt-in only for apps with NO heartbeat at all.
+WS_PING_INTERVAL    = 20       # seconds between WS keepalive pings (0 = off).
+                                # ON by default: without pings a half-open upstream
+                                # (network drop, NAT timeout) leaves a zombie tunnel
+                                # — the game/app freezes with no error and the relay
+                                # threads leak until the tab is closed.
 WS_PONG_TIMEOUT     = 15       # seconds to wait for a pong after a ping before
-                                # declaring the upstream dead (only used when
-                                # WS_PING_INTERVAL > 0; must be < WS_PING_INTERVAL
+                                # declaring the upstream dead (must be < WS_PING_INTERVAL
                                 # to keep detection meaningful; clamped at runtime)
 WS_AUTO_RECONNECT   = False     # transparently re-establish dropped WS upstreams
 WS_DEFLATE          = False    # negotiate permessage-deflate (RFC 7692)
@@ -3182,16 +3169,7 @@ def decompress_body(data: bytes, encoding: str) -> bytes:
     if not data:
         return data
     enc = (encoding or "").lower().strip()
-    return _decompress_body_impl(data, enc)
 
-
-def _decompress_body_impl(data: bytes, enc: str) -> bytes:
-    """Guts of decompress_body — pure decode logic, no logging.
-
-    `enc` is the lower-cased, stripped Content-Encoding value ("" or
-    "identity" for plain, "gzip"/"deflate"/"br"/"zstd" or a comma-separated
-    stack like "gzip, br"). Stacked encodings decode right-to-left.
-    """
     # Stacked encodings: "gzip, br" → decode br first, then gzip
     if enc and "," in enc:
         parts = [e.strip() for e in enc.split(",") if e.strip()]
@@ -3351,36 +3329,6 @@ def guess_mime(path: str) -> str:
     path = path.split("?", 1)[0].split("#", 1)[0]
     mt, _ = mimetypes.guess_type(path)
     return mt or "application/octet-stream"
-
-
-def _ensure_wasm_content_type(ct: str, path: str) -> str:
-    """Override Content-Type to application/wasm for WASM resources.
-
-    WebAssembly.instantiateStreaming() REQUIRES the response to have
-    Content-Type: application/wasm — if the server sends application/octet-
-    stream (or anything else), streaming compilation fails with a TypeError
-    that manifests as "Failed to fetch" or "Decompression failed" in the
-    client app. Many CDNs serve .wasm files as application/octet-stream
-    because their MIME config predates the WASM spec; Eaglercraft and other
-    WASM-threaded games hit this on every launch.
-
-    We override when:
-      • The path ends in .wasm (canonical case), OR
-      • The path contains /wasm/ or /eagle-wasm/ (Eaglercraft CDN pattern
-        where the WASM bundle has no file extension), OR
-      • The upstream Content-Type is application/wasm already (passthrough)
-
-    For any other path, we return the upstream Content-Type unchanged.
-    """
-    if not ct:
-        ct = "application/octet-stream"
-    ct_base = ct.split(";")[0].strip().lower()
-    if ct_base == "application/wasm":
-        return ct  # already correct
-    p = (path or "").lower()
-    if p.endswith(".wasm") or "/wasm/" in p or "eagle-wasm" in p:
-        return "application/wasm"
-    return ct
 
 # ── Dynamic MIME detection ────────────────────────────────────────────────
 # We rely on Python's stdlib `mimetypes.guess_type()` (which reads
@@ -3621,194 +3569,6 @@ def _cors_origin_pair() -> tuple[str, str | None]:
         return origin, "true"
     return "*", None
 
-def _pna_allow_header() -> dict:
-    """Return {"Access-Control-Allow-Private-Network": "true"} when the
-    browser's preflight requested Private Network Access, else {}.
-
-    Chrome's Private Network Access (PNA) spec (WICG): a public-context page
-    making a fetch() to localhost / a private IP sends a CORS preflight with
-    `Access-Control-Request-Private-Network: true`. The preflight response
-    MUST include `Access-Control-Allow-Private-Network: true` or the request
-    is blocked with an opaque "CORS error" / "policy violation" — the most
-    common PNA failure mode for a localhost proxy. Since S2L listens on
-    localhost, ANY public-context fetch() triggers PNA; without this header
-    the user sees a flood of CORS errors in the devtools console.
-
-    We only echo the header when the request asked for it (spec-compliant).
-    Sending it unconditionally is harmless in practice but produces console
-    warnings on some browsers, so we gate it on the request header.
-    """
-    try:
-        if flask_request and flask_request.headers.get(
-                "Access-Control-Request-Private-Network", "").lower() == "true":
-            return {"Access-Control-Allow-Private-Network": "true"}
-    except (RuntimeError, AttributeError):
-        pass
-    return {}
-
-
-# Concrete expose list used for credentialed CORS responses. The CORS spec
-# forbids the wildcard "*" for Access-Control-Expose-Headers when the request
-# carries credentials (cookies / Authorization) — browsers silently strip the
-# headers listed here (Authorization, Content-Encoding, WWW-Authenticate, …)
-# from the response, which manifests as opaque "CORS error" failures on cross-
-# origin (MULTIPORT CDN port) fetches that read those headers. The concrete
-# list echoes what filter_resp() already sets inline; use _apply_cors_headers()
-# in any cache-hit / manually-built response path so the same list survives.
-_CORS_CONCRETE_EXPOSE = (
-    "Content-Type, Content-Length, Content-Range, Content-Disposition, "
-    "Date, ETag, Last-Modified, Location, Range, Set-Cookie, "
-    "Content-Encoding, Vary, WWW-Authenticate, Authorization"
-)
-
-def _ci_header_keys(out) -> set:
-    """Return a set of lower-cased header key names from a plain dict OR a
-    werkzeug Headers object.
-
-    This is the CRITICAL compatibility shim: `for k in out` on a plain dict
-    yields key strings, but on a werkzeug Headers object `__iter__` yields
-    (key, value) TUPLES in many Werkzeug versions — so `{k.lower() for k in
-    out}` crashes with `AttributeError: 'tuple' object has no attribute
-    'lower'` when `out` is `resp.headers`. Using `.keys()` instead of bare
-    `__iter__` is version-stable: both `dict.keys()` and `Headers.keys()`
-    yield key strings.
-    """
-    try:
-        return {k.lower() for k in out.keys()}
-    except (AttributeError, TypeError):
-        # Last-resort fallback for unusual containers / lists-of-tuples.
-        return {(k[0] if isinstance(k, tuple) else k).lower() for k in out}
-
-
-def _ci_get_header(out, name: str, default: str = "") -> str:
-    """Case-insensitive header value lookup for a plain dict OR werkzeug
-    Headers object.
-
-    werkzeug's Headers.get() is already case-insensitive, but dict.get() is
-    NOT — so a dict carrying "vary" (lowercase, as curl_cffi sometimes
-    produces) would be missed by `out.get("Vary")`. This helper scans keys
-    case-insensitively on both container types.
-    """
-    _name_lower = name.lower()
-    try:
-        for _k in out.keys():
-            if _k.lower() == _name_lower:
-                # out[_k] works on both dict (exact key match) and Headers
-                # (case-insensitive). Use .get() to avoid KeyError on edge cases.
-                _val = out.get(_k, "")
-                return _val if _val is not None else default
-    except (AttributeError, TypeError):
-        pass
-    return default
-
-
-def _ci_remove_header(out, name: str) -> None:
-    """Remove a header case-insensitively from a plain dict OR werkzeug
-    Headers object. On a dict this removes the differently-cased key so a
-    subsequent `out["Name"] = value` doesn't leave a stale duplicate. On
-    werkzeug Headers, `del out[name]` is already case-insensitive.
-    """
-    if isinstance(out, dict):
-        _name_lower = name.lower()
-        for _k in list(out.keys()):
-            if _k.lower() == _name_lower:
-                del out[_k]
-    else:
-        try:
-            del out[name]
-        except (KeyError, TypeError):
-            pass
-
-
-def _apply_cors_headers(out: dict) -> None:
-    """Set CORS + CORP headers on a response dict OR werkzeug Headers object,
-    correctly handling the credentialed-request case. Use this in cache-hit /
-    manually-built response paths INSTEAD of inlining `Access-Control-Allow-
-    Origin` / `Expose-Headers` / `Cross-Origin-Resource-Policy` — it
-    guarantees:
-
-      • Access-Control-Allow-Origin echoes the request Origin (or "*" when
-        there's no Origin, e.g. same-origin / direct navigation).
-      • Access-Control-Allow-Credentials: true is paired with the echoed
-        origin so credentialed fetches (credentials:"include") aren't rejected.
-      • Access-Control-Expose-Headers is the CONCRETE list (not "*") when
-        credentialed — the wildcard does NOT expose Authorization /
-        Content-Encoding / WWW-Authenticate for credentialed responses per
-        the CORS spec, which is the most common "policy violation" seen on
-        cross-origin CDN-port fetches that read those headers.
-      • Vary: Origin is merged (case-insensitively) so caches don't pin one
-        origin's response for another — and no duplicate Vary entries are
-        left behind when the existing key had different casing.
-      • Cross-Origin-Resource-Policy: cross-origin so the resource is visible
-        inside cross-origin iframes / COEP contexts.
-
-    filter_resp() already does all of the above via this helper; this is also
-    for paths that build a Response without going through filter_resp() (cache
-    hits, 304s, 206s, error fallbacks).
-
-    NOTE: `out` may be a plain dict (from filter_resp / out_headers) or a
-    werkzeug Headers object (resp.headers). The _ci_* helpers above handle
-    the case-sensitivity differences between the two.
-    """
-    _aco, _acc = _cors_origin_pair()
-    out["Access-Control-Allow-Origin"] = _aco
-    if _acc:
-        out["Access-Control-Allow-Credentials"] = _acc
-        # Case-insensitive Vary merge: dict.get is case-sensitive, so use the
-        # _ci_get_header / _ci_remove_header helpers to find and remove any
-        # existing Vary (regardless of casing) before setting a single
-        # canonical "Vary" entry. Without this, a dict carrying "vary"
-        # (lowercase) would end up with BOTH "vary: ..." and "Vary: ..., Origin".
-        _old_vary = _ci_get_header(out, "Vary", "")
-        _ci_remove_header(out, "Vary")
-        out["Vary"] = (_old_vary + ", Origin").lstrip(", ")
-        out["Access-Control-Expose-Headers"] = _CORS_CONCRETE_EXPOSE
-    else:
-        out["Access-Control-Expose-Headers"] = "*"
-    out["Cross-Origin-Resource-Policy"] = "cross-origin"
-
-
-def _apply_security_headers(out, body: bytes = b"",
-                            is_top_level_html: bool = False) -> None:
-    """Add safe HTTP security headers in addition to COOP/COEP.
-
-    These complement the cross-origin isolation headers (COOP/COEP/CORP) that
-    filter_resp() already sets. Each header is only added when the response
-    doesn't already carry one (case-insensitive key check via _ci_header_keys),
-    so an origin that sent its own value through the passive path keeps its
-    choice. The headers added here are universally safe for a local proxy —
-    they harden the response without blocking any proxy feature:
-
-      • X-Content-Type-Options: nosniff — prevents MIME-sniffing attacks where
-        a browser interprets a text/plain response as HTML/JS. Universal best
-        practice; never breaks a legitimate use case.
-      • Referrer-Policy: strict-origin-when-cross-origin — the modern browser
-        default. Sends the full URL for same-origin requests, origin-only for
-        cross-origin (HTTPS→HTTPS), and no Referer for HTTPS→HTTP. Safe to set
-        explicitly so sites that rely on a specific referrer behavior get a
-        predictable one even when their own header was stripped.
-      • Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy — left to
-        filter_resp()'s existing _needs_isolation() heuristic.
-
-    Headers deliberately NOT added here (they would break proxy functionality):
-      • Content-Security-Policy — would block our injected service-worker
-        clearer and URL-rewriting inline scripts.
-      • X-Frame-Options — would prevent the proxy from being iframed by
-        dashboards / the S2L viewer.
-      • Strict-Transport-Security — pointless on localhost HTTP and would
-        pin the browser to a TLS cert we don't serve.
-
-    NOTE: `out` may be a plain dict (from filter_resp / out_headers) or a
-    werkzeug Headers object (resp.headers). _ci_header_keys() handles the
-    iteration difference (Headers.__iter__ yields tuples in some versions).
-    """
-    _existing = _ci_header_keys(out)
-    if "x-content-type-options" not in _existing:
-        out["X-Content-Type-Options"] = "nosniff"
-    if "referrer-policy" not in _existing:
-        out["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
-
 def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
     # Strip security headers that block our local proxy, plus hop-by-hop headers.
     # NOTE: Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy are
@@ -3836,15 +3596,37 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
         "access-control-max-age",
     }
     out = {k: v for k, v in headers.items() if k.lower() not in skip}
-    # CORS + CORP — centralized in _apply_cors_headers() so every response path
-    # (filter_resp here, cache-hit helpers, 304/206/error fallbacks) gets the
-    # identical concrete Access-Control-Expose-Headers list for credentialed
-    # requests. With MULTIPORT, CDN assets are served on different ports — a
-    # fetch() from the main page to a CDN port is cross-origin and needs
-    # Access-Control-Allow-Credentials if the SPA sends credentials:"include".
-    # Wildcard "*" blocks credentialed requests, so _apply_cors_headers only
-    # uses it when no Origin header is present.
-    _apply_cors_headers(out)
+    # CORS: if the browser sent an Origin header, echo it back specifically
+    # (not "*") so credentialed cross-origin requests work. With MULTIPORT,
+    # CDN assets are served on different ports — a fetch() from the main page
+    # to a CDN port is cross-origin and needs Access-Control-Allow-Credentials
+    # if the SPA sends credentials:"include". Wildcard "*" blocks credentialed
+    # requests, so we only use it when no Origin header is present.
+    _req_origin = ""
+    try:
+        _req_origin = flask_request.headers.get("Origin", "") if flask_request else ""
+    except RuntimeError:
+        pass
+    if _req_origin:
+        out["Access-Control-Allow-Origin"] = _req_origin
+        out["Access-Control-Allow-Credentials"] = "true"
+        out["Vary"] = (out.get("Vary", "") + ", Origin").lstrip(", ")
+        # Concrete expose list: the wildcard "*" does NOT expose Authorization
+        # (and a few others) for credentialed responses per the CORS spec, so
+        # SPAs that read response headers cross-origin would silently get null.
+        out["Access-Control-Expose-Headers"] = (
+            "Content-Type, Content-Length, Content-Range, Content-Disposition, "
+            "Date, ETag, Last-Modified, Location, Range, Set-Cookie, "
+            "Content-Encoding, Vary, WWW-Authenticate, Authorization"
+        )
+    else:
+        out["Access-Control-Allow-Origin"]  = "*"
+        out["Access-Control-Expose-Headers"] = "*"
+    # Cross-Origin-Resource-Policy: cross-origin — required so that resources served
+    # through S2L (images, scripts, fonts from CDN) can be consumed by cross-origin HTML
+    # pages also going through S2L (cross-origin iframes, etc.). Without this, when COEP is
+    # active any resource without CORP is blocked by the browser.
+    out["Cross-Origin-Resource-Policy"] = "cross-origin"
     # COOP/COEP are PASSIVE: the origin's own headers (kept above, since they're
     # not in `skip`) flow through untouched. The one thing we add proactively
     # is a safety net for the top-level HTML document: if the origin needed
@@ -3856,10 +3638,6 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
     if is_top_level_html and not (has_coop or has_coep) and _needs_isolation(body):
         out["Cross-Origin-Opener-Policy"]   = "same-origin"
         out["Cross-Origin-Embedder-Policy"] = "credentialless"
-    # Additional safe security headers (X-Content-Type-Options, Referrer-Policy)
-    # — added when not already present. See _apply_security_headers() docstring
-    # for the rationale on which headers are/aren't safe to set on a proxy.
-    _apply_security_headers(out, body, is_top_level_html)
     if "Set-Cookie" in out:
         # Determine if the request came in over HTTPS or from localhost.
         # Secure cookies require HTTPS except on localhost (per browser specs).
@@ -4252,21 +4030,7 @@ def _build_s2l_injector() -> bytes:
               'var args=Array.prototype.slice.call(arguments).map(function(u){'
                 'if(typeof u!=="string")return u;'
                 'if(/^(?:https?|wss?|blob|data|file|ftp):/i.test(u))return rw(u);'
-                # Resolve relative URLs against the PROXY origin (PX+"/"), NOT
-                # against the worker's blob: URL — a relative URL like
-                # "./next/static/chunks/5376.js" resolves against "blob:..." which
-                # is invalid and throws "The URL '...' is invalid" in the worker.
-                # The new URL() call should handle this, but if it throws (edge
-                # case), the fallback MUST produce a valid absolute URL — the old
-                # `PX+u` produced "http://localhost:8080./next/..." (missing /).
-                'try{return new URL(u,PX+"/").href;}catch(e){'
-                  # Fallback: manually construct an absolute URL. Strip leading
-                  # "./" and "../" (one or more) so the path is clean, then
-                  # prepend PX + "/". The old `PX+u` produced an invalid URL
-                  # like "http://localhost:8080./next/..." (missing /).
-                  'var cu=u.replace(/^(?:\\.\\.?\\/)+/,"");'
-                  'return PX+"/"+cu;'
-                '}'
+                'try{return new URL(u,PX+"/").href;}catch(e){return PX+u;}'
               '});'
               'return _is.apply(self,args);'
             '};'
@@ -4422,24 +4186,8 @@ def _build_s2l_injector() -> bytes:
         # Workers have their own global scope and don't inherit window.fetch —
         # without wrapping, their network calls bypass the proxy and hit the
         # real host (hung because hosts file points it at us). Worse, WASM-thread
-        # apps that Atomics.wait() on a worker freeze the whole tab.
-        #
-        # BLOB WRAPPER ISSUE: The original approach wrapped every Worker in a
-        # blob: URL to inject __s2l_core (fetch/XHR/URL rewriting). But a
-        # blob: URL worker loses the original script's base URL, so relative
-        # importScripts() calls (e.g. webpack's "./5376.js" for chunk loading)
-        # can't be resolved — the browser throws "The URL '...' is invalid"
-        # and the app freezes. This is exactly the Eaglercraft freeze bug.
-        #
-        # FIX: For SAME-ORIGIN scripts (already on localhost:PORT), skip the
-        # blob wrapper and create the Worker directly with the rewritten URL.
-        # Relative importScripts URLs then resolve against the script's real
-        # URL (e.g. /_next/static/chunks/7065.js → ./5376.js resolves to
-        # /_next/static/chunks/5376.js — correct). The trade-off is that
-        # same-origin workers don't get __s2l_core's fetch/XHR patches, but
-        # same-origin requests already go through the proxy by default (the
-        # browser sends them to localhost:PORT). Cross-origin workers still
-        # get the blob wrapper + __s2l_core + importScripts URL resolution.
+        # apps that Atomics.wait() on a worker freeze the whole tab. Fix: inject
+        # __s2l_core as a prelude via a same-origin blob: URL wrapping importScripts().
         '[["Worker","__s2l__worker_orig"],["SharedWorker","__s2l__sharedworker_orig"]].forEach(function(pair){'
           'var Ctor=window[pair[0]];if(!Ctor)return;'
           'function Wrapped(scriptURL,opts){'
@@ -4451,24 +4199,6 @@ def _build_s2l_injector() -> bytes:
             # WASM/audio worker failed to start.
             # v8.1: whitelist real URL schemes — same fix as importScripts.
             'if(typeof ru==="string"&&!/^(?:https?|wss?|blob|data|file|ftp):/i.test(ru))ru=PX+ru;'
-            # Same-origin check: if the rewritten URL is on the proxy origin
-            # (http://localhost:PORT/...), create the Worker directly WITHOUT
-            # a blob wrapper. This preserves the script's real URL so relative
-            # importScripts() calls (webpack chunk loading) resolve correctly.
-            # The importScripts patch in __s2l_core resolved relative URLs
-            # against PX+"/" (proxy root), which produced WRONG paths for
-            # chunk-relative URLs like "./5376.js" → "/5376.js" instead of
-            # "/_next/static/chunks/5376.js". Creating the Worker directly
-            # fixes this because the browser resolves relative URLs against
-            # the script's actual URL.
-            'if(typeof ru==="string"&&ru.indexOf(PX+"/")===0){'
-              'return new Ctor(ru,opts);'
-            '}'
-            # Cross-origin worker: use blob wrapper to inject __s2l_core.
-            # The importScripts patch inside __s2l_core handles relative URLs
-            # by resolving them against PX+"/" (proxy root) — this is correct
-            # for cross-origin workers because their chunks are typically
-            # served from the proxy root, not from a sub-path.
             'try{'
               'var prelude="("+__s2l_core.toString()+")("+JSON.stringify(M)+","+JSON.stringify(HP)+","+'
                 'JSON.stringify(EXT)+","+JSON.stringify(location.hostname)+","+JSON.stringify(MP)+","+JSON.stringify(DNR_RE)+");\\n"'
@@ -5730,8 +5460,6 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 "Access-Control-Max-Age": "86400",
                 "Vary": "Origin",
             })
-            # Private Network Access: allow public-context fetches to localhost.
-            r.headers.update(_pna_allow_header())
             r.headers = {k: v for k, v in r.headers.items() if v is not None}
             return r
 
@@ -5759,8 +5487,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                     if _val:
                         resp.headers["ETag"] = _val[0]
                         resp.headers["Last-Modified"] = _val[1]
-                _apply_cors_headers(resp.headers)
-                _apply_security_headers(resp.headers)
+                _aco, _acc = _cors_origin_pair()
+                resp.headers["Access-Control-Allow-Origin"] = _aco
+                if _acc:
+                    resp.headers["Access-Control-Allow-Credentials"] = _acc
+                resp.headers["Access-Control-Expose-Headers"] = "*"
+                resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                 return resp
 
         if OFFLINE:
@@ -5786,46 +5518,19 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if _REQ_HOOKS:
                 stats.inc("hooks_run", _run_hooks(_REQ_HOOKS, ctx))
 
-            # NOTE: we deliberately do NOT force Accept-Encoding: identity here
-            # (unlike _do_upstream). Our decompress_body() + the streaming
-            # decompressor in _stream_resp handle every encoding (gzip/deflate/
-            # br/zstd) correctly, so letting the upstream negotiate compression
-            # is safe and avoids the round-trip through identity decoding.
-
-            # Decide streaming BEFORE building kwargs so we can use the longer
-            # TIMEOUT_STREAM_READ for streamed (large/binary) CDN responses.
-            # The CDN path used to hardcode TIMEOUT_READ=12s for ALL requests,
-            # which truncated large WASM/asset downloads (>5MB) on slow CDNs
-            # and produced "Failed to fetch" errors in the browser.
-            _has_range_c = bool(flask_request.headers.get("Range", ""))
-            _guess_ct_c = guess_mime("/" + p)
-            # Also force-stream paths that look like large binary assets even
-            # when they have no file extension (e.g. /objects/builds/.../2026-05-10).
-            # guess_mime returns application/octet-stream for extensionless paths,
-            # and _should_stream returns False for octet-stream when Content-Length
-            # is unknown (cl=0) — so a 14.4MB WASM bundle with no extension would
-            # be fully buffered in memory with a 12s timeout. The path-level check
-            # below catches "wasm" / "builds" / "objects" patterns common to game
-            # CDNs so these always stream.
-            _path_lower = "/" + p.lower()
-            _looks_large_binary = (
-                "wasm" in _path_lower
-                or "/builds/" in _path_lower
-                or "/objects/" in _path_lower
-                or "/assets/" in _path_lower
-            )
-            _do_stream_c = method in _SAFE_METHODS and (
-                _has_range_c or _should_stream(_guess_ct_c) or _looks_large_binary)
-            _read_timeout_c = TIMEOUT_STREAM_READ if _do_stream_c else TIMEOUT_READ
-
             kw: dict = {
                 "headers":         ctx.req_headers,
-                "timeout":         (TIMEOUT_CONN, _read_timeout_c),
+                "timeout":         (TIMEOUT_CONN, TIMEOUT_READ),
                 "allow_redirects": True,
                 "verify":          False,
             }
             if method in _BODY_METHODS:
                 kw["data"] = ctx.req_body
+            # Streaming support: video/audio from CDN hosts (MULTIPORT) must
+            # stream, otherwise they buffer in memory and stall after ~30-40s.
+            _has_range_c = bool(flask_request.headers.get("Range", ""))
+            _do_stream_c = method in _SAFE_METHODS and (
+                _has_range_c or _should_stream(guess_mime("/" + p)))
             kw["stream"] = _do_stream_c
             r    = _get_client_session().request(method, cdn_url, **kw)
             # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
@@ -5835,9 +5540,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if _do_stream_c:
                 return _stream_resp(r, method, cdn_url)
             body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
-            ct   = _ensure_wasm_content_type(
-                r.headers.get("Content-Type", "application/octet-stream"),
-                "/" + p.lstrip("/"))
+            ct   = r.headers.get("Content-Type", "application/octet-stream")
             # Empty-body recovery: curl_cffi's HTTP/2 mode sometimes returns
             # empty content for small images/avatars on CDN hosts. Without
             # this, the browser gets a 200 with 0 bytes — a "phantom" image
@@ -5876,12 +5579,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 save_queue.put((cdn_url, body, ct, _effective_device()))
                 stats.inc("cdn_fetched")
             out_headers = filter_resp(_resp_headers_dict(r))
-            # CORS + CORP are already set correctly by filter_resp() — including
-            # the concrete Access-Control-Expose-Headers list for credentialed
-            # requests. Do NOT re-set them here: a bare `Access-Control-Expose-
-            # Headers: "*"` would overwrite the concrete list and break
-            # credentialed cross-origin fetches that read Authorization /
-            # Content-Encoding / etc. (opaque "CORS error" in the console).
+            _aco, _acc = _cors_origin_pair()
+            out_headers["Access-Control-Allow-Origin"]  = _aco
+            if _acc:
+                out_headers["Access-Control-Allow-Credentials"] = _acc
+            out_headers["Access-Control-Expose-Headers"] = "*"
+            out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
             if method in _SAFE_METHODS:
                 _apply_freshness(out_headers, ct)
             # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
@@ -6624,11 +6327,7 @@ def _fetch_external_asset(u: str) -> None:
         if _is_host_dead(netloc):
             return
         try:
-            # Use TIMEOUT_STREAM_READ (120s) — background CDN fetches may
-            # download large WASM/asset bundles that timeout at 12s.
-            r    = _get_proxy_session().get(u,
-                                             timeout=(TIMEOUT_CONN, TIMEOUT_STREAM_READ),
-                                             verify=False)
+            r    = _get_proxy_session().get(u, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
             body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
             # Never cache bot/CAPTCHA pages — they would poison the asset cache
             if _is_bot_page(body, r.status_code, urlparse(u).path):
@@ -7282,17 +6981,14 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     so upstream may return gzip/br bytes even when we asked for identity.
     """
     ct    = upstream_r.headers.get("Content-Type", "application/octet-stream")
-    # Ensure WASM resources are served with Content-Type: application/wasm —
-    # WebAssembly.instantiateStreaming() requires it, and many CDNs serve .wasm
-    # as application/octet-stream which causes "Failed to fetch" in WASM-threaded
-    # clients like Eaglercraft.
-    ct    = _ensure_wasm_content_type(ct, urlparse(target).path or "")
     sc    = upstream_r.status_code
     enc   = (upstream_r.headers.get("Content-Encoding", "") or "").lower().strip()
     out_h = filter_resp(_resp_headers_dict(upstream_r))
-    # CORS + CORP are already set correctly by filter_resp() — do NOT re-set
-    # them with a bare Access-Control-Expose-Headers: "*" here, that would
-    # overwrite the concrete list filter_resp set for credentialed requests.
+    _aco, _acc = _cors_origin_pair()
+    out_h["Access-Control-Allow-Origin"]   = _aco
+    if _acc:
+        out_h["Access-Control-Allow-Credentials"] = _acc
+    out_h["Access-Control-Expose-Headers"] = "*"
     out_h["Cache-Control"] = "no-cache, no-transform"
     # We decompress before yielding (see _gen below), so strip the header.
     # Also strip Content-Length when we're decompressing — the decompressed
@@ -8416,13 +8112,6 @@ class _CffiUpstreamWS:
                 except Exception: pass
             raise RuntimeError("active session backend has no WS support")
         try:
-            # timeout=15 caps ONLY the connect+handshake phase. Empirically
-            # proven (WS probe, curl_cffi 0.16.3): CURLOPT_TIMEOUT_MS is NOT
-            # enforced on post-handshake ws_recv() — neither with constant
-            # traffic nor on a fully idle connection — so this does NOT kill
-            # long-lived tunnels. It just fails fast when a host is
-            # unreachable. Do NOT raise it "to fix dropped connections";
-            # drops come from elsewhere (e.g. the keepalive thread).
             self._ws = sess.ws_connect(ws_url, headers=hdrs, timeout=15)
         except Exception as exc:
             # A rejected/failed handshake (403 from a WAF, refused upgrade,
@@ -9419,38 +9108,11 @@ def _is_sw_path(path: str) -> bool:
 # hangs the SPA init indefinitely (blank page). The no-op SW just claims clients
 # and passes fetch events through without interception, so the SPA's own fetch
 # patches (injected by _inject_sw_clear) handle URL rewriting.
-#
-# The SW also patches self.importScripts so that relative URLs (e.g.
-# "./next/static/chunks/5376.js") are resolved against the proxy origin
-# (http://localhost:PORT/) instead of the SW's own scope URL. Without this,
-# webpack chunk loading inside a SW throws "The URL '...' is invalid" because
-# the SW scope is http://localhost:PORT/sw.js and relative URLs resolve
-# against /sw.js — which works for /next/... but NOT for ./next/... when the
-# SW was registered from a sub-path. The patch normalizes all relative URLs
-# to absolute proxy-relative URLs before calling the original importScripts.
 _SW_NOOP = (
     b"/* S2L no-op SW: claims clients, does not intercept fetch or delete caches */\n"
     b"self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));\n"
     b"self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));\n"
     b"self.addEventListener('fetch', () => {});\n"  # don't intercept — pass through
-    # Patch importScripts to resolve relative URLs against the proxy origin.
-    b"try{\n"
-    b"  var _origIS=self.importScripts;\n"
-    b"  if(typeof _origIS==='function'){\n"
-    b"    var _px=self.location.origin;\n"
-    b"    self.importScripts=function(){\n"
-    b"      var args=Array.prototype.slice.call(arguments).map(function(u){\n"
-    b"        if(typeof u!=='string')return u;\n"
-    b"        if(/^(?:https?|wss?|blob|data|file|ftp):/i.test(u))return u;\n"
-    b"        try{return new URL(u,_px+'/').href;}catch(e){\n"
-    b"          var cu=u.replace(/^(?:\\.\\.?\\/)+/,'');\n"
-    b"          return _px+'/'+cu;\n"
-    b"        }\n"
-    b"      });\n"
-    b"      return _origIS.apply(self,args);\n"
-    b"    };\n"
-    b"  }\n"
-    b"}catch(e){}\n"
 )
 
 def _do_upstream(method: str, target: str, ctx: HookContext,
@@ -9683,16 +9345,18 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
 
     resp = Response(body, status=ctx.resp_status,
                     headers=clean_headers, content_type=ctx.resp_ct)
-    # CORS + CORP — use the helper so credentialed requests get the concrete
-    # Access-Control-Expose-Headers list (not "*"), and so a cache-hit refresh
-    # never silently drops these. That mismatch is what makes cross-origin-
+    _aco, _acc = _cors_origin_pair()
+    resp.headers["Access-Control-Allow-Origin"] = _aco
+    if _acc:
+        resp.headers["Access-Control-Allow-Credentials"] = _acc
+    # Always set here (not just on the live-fetch path) so a cache-hit refresh
+    # never silently drops these — that mismatch is what makes cross-origin-
     # isolated apps (SharedArrayBuffer/WASM threads) report missing headers
     # only after the first reload.
-    _apply_cors_headers(resp.headers)
+    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
     # COOP/COEP are passive now (see filter_resp) — whatever ctx.resp_headers
     # already carries (origin's own choice, or the top-level-HTML heuristic
     # fallback) is the final answer; no flag to re-check here.
-    _apply_security_headers(resp.headers)
 
     is_html_resp = "text/html" in ctx.resp_ct
     is_hooked    = bool(ctx.resp_headers.get("_hooked"))
@@ -9807,8 +9471,11 @@ def _conditional_304(lp: str, ct: str) -> Response | None:
     resp.headers["Last-Modified"] = last_mod
     # A 304 updates the stored response's freshness — keep revalidating.
     resp.headers["Cache-Control"] = "no-cache"
-    _apply_cors_headers(resp.headers)
-    _apply_security_headers(resp.headers)
+    _aco, _acc = _cors_origin_pair()
+    resp.headers["Access-Control-Allow-Origin"] = _aco
+    if _acc:
+        resp.headers["Access-Control-Allow-Credentials"] = _acc
+    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
     return resp
 
 
@@ -9879,8 +9546,11 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = str(len(_slice))
-    _apply_cors_headers(resp.headers)
-    _apply_security_headers(resp.headers)
+    _aco, _acc = _cors_origin_pair()
+    resp.headers["Access-Control-Allow-Origin"] = _aco
+    if _acc:
+        resp.headers["Access-Control-Allow-Credentials"] = _acc
+    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
     log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
     _gui_push_raw(method, req_path, 206, ct, _slice,
                   origin=MAIN_HOST,
@@ -9941,9 +9611,6 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
     except OSError:
         return None
     ct = guess_mime(lp)
-    # Ensure WASM files served from disk cache also have the correct Content-Type
-    # — critical for WebAssembly.instantiateStreaming() after a cache hit.
-    ct = _ensure_wasm_content_type(ct, lp)
     # Rewrite external URLs inside cached CSS files so images/fonts load through the proxy
     if PROXY_CDN and (lp.endswith(".css") or "css" in ct):
         data = _rewrite_ext_urls(data, html_doc=False)
@@ -10022,8 +9689,10 @@ def _s2l_hp_endpoint() -> Response:
         hp = {h: p for h, p in _cdn_host_port.items() if p > 0}
     resp = Response(json.dumps(hp), content_type="application/json")
     resp.headers["Cache-Control"]               = "no-store"
-    _apply_cors_headers(resp.headers)
-    _apply_security_headers(resp.headers)
+    _aco, _acc = _cors_origin_pair()
+    resp.headers["Access-Control-Allow-Origin"] = _aco
+    if _acc:
+        resp.headers["Access-Control-Allow-Credentials"] = _acc
     return resp
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -10048,24 +9717,15 @@ def _viewer_cors_headers(origin: str) -> dict:
     h = {
         "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
         "Access-Control-Allow-Headers": _cors_allow_headers(),
+        "Access-Control-Expose-Headers": "*",
         "Access-Control-Max-Age": "86400",
         "Vary": "Origin",
     }
     if origin:
         h["Access-Control-Allow-Origin"] = origin
         h["Access-Control-Allow-Credentials"] = "true"
-        # Concrete expose list (not "*") so credentialed dashboard embeds can
-        # read Authorization / Content-Encoding / etc. from the viewer's JSON
-        # responses — the wildcard is spec-forbidden for credentialed responses
-        # and silently strips those headers, breaking cross-origin dashboards.
-        h["Access-Control-Expose-Headers"] = _CORS_CONCRETE_EXPOSE
     else:
         h["Access-Control-Allow-Origin"] = "*"
-        h["Access-Control-Expose-Headers"] = "*"
-    # Private Network Access: allow public-context fetches to localhost so an
-    # embedding dashboard served from a real https origin can still poll the
-    # viewer's data endpoint without a CORS policy violation.
-    h.update(_pna_allow_header())
     return h
 
 def _viewer_disabled_response() -> Response:
@@ -11290,14 +10950,10 @@ def ext_asset(extpath: str) -> Response:
             "Access-Control-Allow-Origin":  _aco,
             "Access-Control-Allow-Credentials": _acc,
             "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
-            # Concrete list (never bare "*") so credentialed preflights pass.
-            "Access-Control-Allow-Headers": _cors_allow_headers(),
-            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Allow-Headers": flask_request.headers.get(
+                "Access-Control-Request-Headers", "*"),
             "Access-Control-Max-Age": "86400",
-            "Vary": "Origin",
         })
-        # Private Network Access: allow public-context fetches to localhost.
-        r.headers.update(_pna_allow_header())
         r.headers = {k: v for k, v in r.headers.items() if v is not None}
         return r
 
@@ -11325,8 +10981,11 @@ def ext_asset(extpath: str) -> Response:
                 if _val:
                     resp.headers["ETag"] = _val[0]
                     resp.headers["Last-Modified"] = _val[1]
-            _apply_cors_headers(resp.headers)
-            _apply_security_headers(resp.headers)
+            _aco, _acc = _cors_origin_pair()
+            resp.headers["Access-Control-Allow-Origin"] = _aco
+            if _acc:
+                resp.headers["Access-Control-Allow-Credentials"] = _acc
+            resp.headers["Access-Control-Expose-Headers"] = "*"
             return resp
     if OFFLINE:
         log(f"EXT {method} 404 {_fmt_host(ext_host)}{ext_path} (not cached)", "CDN")
@@ -11349,35 +11008,26 @@ def ext_asset(extpath: str) -> Response:
         if _REQ_HOOKS:
             stats.inc("hooks_run", _run_hooks(_REQ_HOOKS, ctx))
 
-        # NOTE: do NOT force Accept-Encoding: identity here — see the matching
-        # comment in _cdn_serve. Our decompress_body() / the streaming
-        # decompressor handle every encoding correctly.
-
-        # Decide streaming BEFORE building kwargs so we can use the longer
-        # TIMEOUT_STREAM_READ for streamed (large/binary) responses. See the
-        # matching comment in _cdn_serve for why extensionless large binary
-        # paths (common on game CDNs) need the path-level heuristic.
-        _has_range = bool(flask_request.headers.get("Range", ""))
-        _guess_ct_e = guess_mime(ext_path)
-        _path_lower_e = ext_path.lower()
-        _looks_large_binary_e = (
-            "wasm" in _path_lower_e
-            or "/builds/" in _path_lower_e
-            or "/objects/" in _path_lower_e
-            or "/assets/" in _path_lower_e
-        )
-        _do_stream_ext = method in _SAFE_METHODS and (
-            _has_range or _should_stream(_guess_ct_e) or _looks_large_binary_e)
-        _read_timeout_e = TIMEOUT_STREAM_READ if _do_stream_ext else TIMEOUT_READ
-
         kw: dict = {
             "headers":         ctx.req_headers,
-            "timeout":         (TIMEOUT_CONN, _read_timeout_e),
+            "timeout":         (TIMEOUT_CONN, TIMEOUT_READ),
             "allow_redirects": True,
             "verify":          False,
         }
         if method in _BODY_METHODS:
             kw["data"] = ctx.req_body
+        # Per-client session — see the matching comment in _cdn_serve. This is
+        # the exact path a brand-new per-host CDN (e.g. a freshly-seen
+        # <uuid>.cdn.example.com) goes through on its first request, before it
+        # has its own MULTIPORT port, so it's the one most likely to need
+        # whatever session/consent state the main page already established.
+        # Decide whether to stream based on Range header and path extension.
+        # Without this, video/audio from external CDNs (e.g. video
+        # streaming CDNs) is fully buffered in memory with a 12s read
+        # timeout, causing playback to stall after ~30-40s.
+        _has_range = bool(flask_request.headers.get("Range", ""))
+        _do_stream_ext = method in _SAFE_METHODS and (
+            _has_range or _should_stream(guess_mime(ext_path)))
         kw["stream"] = _do_stream_ext
         r    = _get_client_session().request(method, real_url, **kw)
         # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
@@ -11389,8 +11039,7 @@ def ext_asset(extpath: str) -> Response:
         if _do_stream_ext:
             return _stream_resp(r, method, real_url)
         body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
-        ct   = _ensure_wasm_content_type(
-            r.headers.get("Content-Type", "application/octet-stream"), ext_path)
+        ct   = r.headers.get("Content-Type", "application/octet-stream")
         # Only save real 200 responses with content — 304 has empty body and saving
         # it would corrupt any existing cached file.
         if r.status_code == 200 and body and method in _SAFE_METHODS and CACHE_CDN:
@@ -11401,9 +11050,12 @@ def ext_asset(extpath: str) -> Response:
             # CACHE_CDN=False: still register host so URL rewriting works next time
             _register_cdn_host(ext_host)
         out_headers = filter_resp(_resp_headers_dict(r))
-        # CORS + CORP are already set correctly by filter_resp() — including
-        # the concrete Access-Control-Expose-Headers list for credentialed
-        # requests. Do NOT re-set them here (see _cdn_serve for rationale).
+        _aco, _acc = _cors_origin_pair()
+        out_headers["Access-Control-Allow-Origin"]  = _aco
+        if _acc:
+            out_headers["Access-Control-Allow-Credentials"] = _acc
+        out_headers["Access-Control-Expose-Headers"] = "*"
+        out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         if method in _SAFE_METHODS:
             _apply_freshness(out_headers, ct)
         # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
@@ -11537,8 +11189,6 @@ def proxy(path: str) -> Response:
             "Access-Control-Max-Age": "86400",
             "Vary": "Origin",
         })
-        # Private Network Access: allow public-context fetches to localhost.
-        r.headers.update(_pna_allow_header())
         # Remove None values (Credential header when no Origin)
         r.headers = {k: v for k, v in r.headers.items() if v is not None}
         return r
@@ -11736,21 +11386,23 @@ def proxy(path: str) -> Response:
         log(f"{method} {urlparse(target).path} — {_short_exc(exc)}", "ERROR")
         stats.inc("conn_errors")
         _r502 = Response(f"Upstream error: {_short_exc(exc)}", status=502)
-        _apply_cors_headers(_r502.headers)
-        _apply_security_headers(_r502.headers)
+        _aco, _acc = _cors_origin_pair()
+        _r502.headers["Access-Control-Allow-Origin"] = _aco
+        if _acc:
+            _r502.headers["Access-Control-Allow-Credentials"] = _acc
         return _r502
     if hasattr(upstream_r, 'history') and upstream_r.history:
         for hist_resp in upstream_r.history:
             hist_url = hist_resp.url
-            hist_path = urlparse(hist_url).path or "/"
             try:
                 hist_body = decompress_body(
                     hist_resp.content,
-                    hist_resp.headers.get("Content-Encoding", ""),
+                    hist_resp.headers.get("Content-Encoding", "")
                 )
             except Exception:
                 hist_body = b""
 
+            hist_path = urlparse(hist_url).path or "/"
             hist_ct = hist_resp.headers.get("Content-Type", "application/octet-stream")
             _hist_origin = _fmt_host(urlparse(hist_url).netloc)
             _gui_push_raw(
@@ -12039,8 +11691,11 @@ def proxy(path: str) -> Response:
                         stats.inc("cache_304")
                         return _c304
                     resp = Response(cdn_data, content_type=_cdn_ct)
-                    _apply_cors_headers(resp.headers)
-                    _apply_security_headers(resp.headers)
+                    _aco, _acc = _cors_origin_pair()
+                    resp.headers["Access-Control-Allow-Origin"]  = _aco
+                    if _acc:
+                        resp.headers["Access-Control-Allow-Credentials"] = _acc
+                    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
                     if _cdn_ct.startswith("text/html") or "json" in _cdn_ct:
                         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
                     else:
@@ -12051,23 +11706,20 @@ def proxy(path: str) -> Response:
                             resp.headers["Last-Modified"] = _val[1]
                     return resp
             try:
-                # Use TIMEOUT_STREAM_READ (120s) — CDN fallback may download large
-                # WASM/asset bundles that would timeout at TIMEOUT_READ=12s.
-                cdn_r    = _get_proxy_session().get(cdn_url,
-                                                     timeout=(TIMEOUT_CONN, TIMEOUT_STREAM_READ),
-                                                     verify=False)
+                cdn_r    = _get_proxy_session().get(cdn_url, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
                 cdn_body = decompress_body(cdn_r.content, cdn_r.headers.get("Content-Encoding", ""))
-                ct       = _ensure_wasm_content_type(
-                    cdn_r.headers.get("Content-Type", "application/octet-stream"),
-                    req_path_cdn)
+                ct       = cdn_r.headers.get("Content-Type", "application/octet-stream")
                 if cdn_r.status_code < 400:
                     save_queue.put((cdn_url, cdn_body, ct, _effective_device()))
                     stats.inc("cdn_fetched")
                     log(f"CDN fallback {_fmt_host(cdn_host)}{req_path_cdn} {cdn_r.status_code}", "CDN")
                     out = filter_resp(_resp_headers_dict(cdn_r))
                     _apply_freshness(out, ct)
-                    # CORS + CORP are already set correctly by filter_resp() —
-                    # do NOT re-set them here (see _cdn_serve for rationale).
+                    _aco, _acc = _cors_origin_pair()
+                    out["Access-Control-Allow-Origin"]  = _aco
+                    if _acc:
+                        out["Access-Control-Allow-Credentials"] = _acc
+                    out["Cross-Origin-Resource-Policy"]  = "cross-origin"
                     return Response(cdn_body, status=cdn_r.status_code, headers=out, content_type=ct)
             except Exception as exc:
                 log(f"CDN fetch failed: {cdn_url} — {_short_exc(exc)}", "WARN")
@@ -12080,11 +11732,7 @@ def proxy(path: str) -> Response:
     # while the editable disk mirror went stale-invisible for months.
     _apply_freshness(ctx.resp_headers, _resp_ct_raw or ctx.resp_ct)
     ctx.resp_body    = body
-    # Ensure WASM resources on the MAIN host are also served with the correct
-    # Content-Type (same rationale as the CDN/ext paths — see _ensure_wasm_content_type).
-    ctx.resp_ct      = _ensure_wasm_content_type(
-        upstream_r.headers.get("Content-Type", "application/octet-stream"),
-        urlparse(target).path or "")
+    ctx.resp_ct      = upstream_r.headers.get("Content-Type", "application/octet-stream")
     platform         = detect_platform(dict(upstream_r.headers), body)
     set_last_platform(platform)   # surface in the web viewer header
 
