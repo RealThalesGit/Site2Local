@@ -31,7 +31,6 @@ import zlib
 import gc
 import hashlib
 import mimetypes
-import email.utils
 import logging
 import threading
 import warnings
@@ -2728,30 +2727,6 @@ def _effective_device() -> str:
     except RuntimeError:
         return "macintosh"
 
-def _device_variant(device: str) -> str:
-    """Map a device class → cache-variant tag ('' = canonical/desktop).
-
-    Sites that server-side sniff the User-Agent ship different files per
-    device family — HTML documents, CSS/JS bundles, JSON APIs, media
-    manifests, even image formats. The cache keeps ONE file per URL, so
-    whichever device fetched first dictated the bytes for everyone (phone
-    sees desktop, desktop sees phone). Variants split that single file
-    into device families instead:
-      • ""          — desktop-class (desktop, macintosh, bot): the CANONICAL
-                      file, unchanged paths, and the home of the user's
-                      hand edits (mods) — device fetches never overwrite it
-      • "mobile"    — phones (mobile / iphone / symbian)
-      • "tablet"    — tablets (ipad / android tablet)
-    Phones and tablets are collapsed per family: UA-sniffed sites almost
-    never differentiate deeper than this, and one file per family keeps
-    fetch/disk duplication near zero for responsive (identical-HTML) sites.
-    """
-    if device in ("mobile", "iphone", "symbian"):
-        return "mobile"
-    if device in ("ipad", "tablet"):
-        return "tablet"
-    return ""
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Session factory  (per-thread, Cloudflare-aware)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4436,19 +4411,7 @@ def _safe_seg(name: str) -> str:
     h = hashlib.sha1(name.encode()).hexdigest()[:12]
     return f"{base[:32]}_{h}{ext}"
 
-def local_path(u: str, device: str = "") -> str:
-    """Map a URL → its on-disk cache path.
-
-    `device` is a VARIANT TAG from _device_variant() ("", "mobile",
-    "tablet"). Non-empty tags suffix the filename (index.html →
-    index__s2l_mobile.html, bundle.css → bundle__s2l_mobile.css) so each
-    device family caches its own copy of EVERY file type — UA-sniffing
-    sites serve different HTML, CSS/JS bundles, JSON payloads, manifest
-    lists and even images (WebP vs JPEG) per device. The canonical
-    (unsuffixed) file stays the desktop-family copy AND the home of the
-    user's hand edits ("mods" — the host has full filesystem access),
-    which device fetches can never overwrite.
-    """
+def local_path(u: str) -> str:
     p = urlparse(normalize_url(u))
     path = p.path or "/"
     if path.endswith("/") or not os.path.splitext(path)[1]:
@@ -4462,11 +4425,6 @@ def local_path(u: str, device: str = "") -> str:
         base, ext = os.path.splitext(last)
         ext = ext or ".html"
         parts[-1] = f"{base}_q{qs_hash}{ext}"
-    # Device-variant suffix — applied AFTER the query hash, to EVERY file
-    # type (the __s2l_ prefix avoids colliding with real files).
-    if device and parts:
-        base, ext = os.path.splitext(parts[-1])
-        parts[-1] = f"{base}__s2l_{device}{ext}"
     # Strip the port and only the "www." PREFIX (not all occurrences) from netloc.
     # Using .replace("www.", "") would mangle hosts like "mywww.example.com".
     # Stripping the port avoids ":" in directory names (invalid on Windows).
@@ -5176,7 +5134,7 @@ class _Stats:
     """
     __slots__ = ("_lock", "crawled", "saved", "proxied",
                  "conn_errors", "http_errors", "hooks_run", "revealed", "cdn_fetched", "captured",
-                 "ws_captured", "cache_304",
+                 "ws_captured",
                  "_events")
 
     def __init__(self) -> None:
@@ -5469,24 +5427,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         # should still be served when offline.
         lp = local_path(cdn_url)
         if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
-            _c304 = _conditional_304(lp, guess_mime(lp))
-            if _c304 is not None:
-                stats.inc("cache_304")
-                log(f"CDN {method} HIT 304 {_fmt_host(cdn_host)}/{p}", "CDN")
-                return _c304
             result = _serve_cached(lp)
             if result is not None:
                 data, ct = result
                 log(f"CDN {method} HIT {_fmt_host(cdn_host)}/{p} {_fmt_size(len(data))}", "CDN")
                 resp = Response(data, content_type=ct)
-                if ct.startswith("text/html") or "json" in ct:
-                    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                else:
-                    resp.headers["Cache-Control"] = "no-cache"
-                    _val = _disk_validators(lp)
-                    if _val:
-                        resp.headers["ETag"] = _val[0]
-                        resp.headers["Last-Modified"] = _val[1]
+                resp.headers["Cache-Control"] = "public, max-age=86400"
                 _aco, _acc = _cors_origin_pair()
                 resp.headers["Access-Control-Allow-Origin"] = _aco
                 if _acc:
@@ -5576,7 +5522,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             # Only save on real 200 responses with content — 304 has an empty body and
             # saving it would corrupt/truncate a previously-good cached file.
             if r.status_code == 200 and body and method in _SAFE_METHODS and CACHE_CDN:
-                save_queue.put((cdn_url, body, ct, _effective_device()))
+                save_queue.put((cdn_url, body, ct))
                 stats.inc("cdn_fetched")
             out_headers = filter_resp(_resp_headers_dict(r))
             _aco, _acc = _cors_origin_pair()
@@ -5586,19 +5532,19 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             out_headers["Access-Control-Expose-Headers"] = "*"
             out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
             if method in _SAFE_METHODS:
-                _apply_freshness(out_headers, ct)
+                out_headers["Cache-Control"] = "public, max-age=86400"
             # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
             # through the proxy (critical for cross-origin iframes served from CDN hosts).
             _ct_base_c = ct.split(";")[0].strip().lower()
             if r.status_code < 400 and PROXY_CDN:
                 if "text/html" in _ct_base_c:
-                    body = _rewrite_ext_urls(body, html_doc=True)
+                    body = _rewrite_ext_urls(body)
                     body = rewrite_abs_urls(body)
                     body = _inject_sw_clear(body)
                     out_headers.pop("content-length", None)
                     out_headers.pop("Content-Length", None)
                 elif "text/css" in _ct_base_c:
-                    body = _rewrite_ext_urls(body, html_doc=False)
+                    body = _rewrite_ext_urls(body)
                     out_headers.pop("content-length", None)
                     out_headers.pop("Content-Length", None)
                 elif "json" in _ct_base_c:
@@ -5835,14 +5781,8 @@ def _is_dont_rewrite_host(host: str) -> bool:
                 return True
     return False
 
-def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
-    """Rewrite ALL external https:// URLs in HTML attributes, srcset, and CSS url().
-
-    html_doc=True marks HTML *documents* (vs standalone .css files): inline
-    style="..." attributes are then rewritten by a quote-preserving pass (see
-    below) instead of the generic url() rewriter, whose double-quote output
-    is only safe inside a stylesheet file.
-    """
+def _rewrite_ext_urls(html_bytes: bytes) -> bytes:
+    """Rewrite ALL external https:// URLs in HTML attributes, srcset, and CSS url()."""
     if not PROXY_CDN or not html_bytes:
         return html_bytes
     try:
@@ -5926,20 +5866,6 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
     #    _clean_url_match).
     # Rewritten values are always re-quoted with double quotes — valid CSS in
     # every context and immune to parens/commas in the proxied path.
-    #
-    # ⚠ EXCEPT inside inline style="..." attributes: there the value lives
-    # INSIDE an HTML attribute delimited by " or ', so re-quoting with "
-    # CLOSES the attribute mid-URL. Real-world pattern (SVG icons exposed as
-    # a CSS custom property, common in icon systems):
-    #   style="--icon-src: url('https://cdn.example.com/icons/ui/icon.svg');"
-    # became
-    #   style="--icon-src: url("http://.../icon.svg");"
-    # The parser ended the attribute at the inserted quote and turned the rest
-    # of the URL into garbage attributes (http:, localhost:8081, icons, ui,
-    # icon.svg");") — the custom property lost its value and every --icon-src
-    # icon vanished. HTML documents therefore extract style attributes first,
-    # rewrite their url() tokens PRESERVING the original quote character, and
-    # hide the results behind placeholders until every generic pass is done.
     def _css_url_from(u: str) -> str | None:
         p = urlparse(u)
         if not p.netloc or _is_dont_rewrite_host(p.netloc):
@@ -5948,59 +5874,6 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
         if not tail:
             return None
         return _proxy_target(p.netloc, tail)
-
-    _style_bodies: list[str] = []
-
-    def _rw_style_body(body: str, delim: str) -> str:
-        # 1. Quoted url('...') / url("...") — keep the ORIGINAL quote char.
-        def _q(m: re.Match) -> str:
-            r = _css_url_from(m.group(2))
-            return f'url({m.group(1)}{r}{m.group(1)})' if r else m.group(0)
-        body = re.sub(
-            r'url\(\s*([\'"])(https?://[a-zA-Z0-9\-._]+(?::\d+)?/[^\'"]*)\1\s*\)',
-            _q, body, flags=re.IGNORECASE)
-        # 2. Entity-quoted url(&quot;...) / url(&#39;...) — SSR frameworks
-        #    escape quotes inside style attributes instead of mixing them;
-        #    rewrite back into the SAME entity form.
-        def _ent(m: re.Match) -> str:
-            r = _css_url_from(m.group(2))
-            return f'url({m.group(1)}{r}{m.group(1)})' if r else m.group(0)
-        body = re.sub(
-            r'url\(\s*(&(?:quot|#39|#x27);?)((?:[^&]|&(?!quot;|#39;|#x27;))*?)\1\s*\)',
-            _ent, body, flags=re.IGNORECASE)
-        # 3. Unquoted url(https://...) — stay unquoted while the rewritten URL
-        #    is attribute-safe; once it contains parens/quotes/whitespace,
-        #    quote it with the character that is NOT the attribute delimiter
-        #    (always valid inside the attribute and valid CSS).
-        _STYLE_UNSAFE = re.compile(r'[()"\'\s]')
-        def _u(m: re.Match) -> str:
-            u = m.group(1)
-            while u and u.count("(") < u.count(")"):
-                u = u[:-1]
-            if not u:
-                return m.group(0)
-            r = _css_url_from(u)
-            if not r:
-                return m.group(0)
-            if not _STYLE_UNSAFE.search(r):
-                return f"url({r})"
-            alt = "'" if delim == '"' else '"'
-            return f"url({alt}{r}{alt})"
-        body = re.sub(
-            r'url\(\s*(https?://[a-zA-Z0-9\-._]+(?::\d+)?/?(?:[^()\s]|\([^()\s]*\))*)\s*\)',
-            _u, body, flags=re.IGNORECASE)
-        return body
-
-    def _style_attr_rep(m: re.Match) -> str:
-        pre, delim, body = m.group(1), m.group(2), m.group(3)
-        _style_bodies.append(_rw_style_body(body, delim))
-        return f"{pre}{delim}\x00S2LSTYLE{len(_style_bodies) - 1}\x00{delim}"
-
-    if html_doc:
-        # (?<!...[-]) keeps data-style / *-style look-alikes out of scope.
-        html = re.sub(
-            r'((?<![A-Za-z0-9_.$-])style\s*=\s*)(["\'])(.*?)\2',
-            _style_attr_rep, html, flags=re.IGNORECASE | re.DOTALL)
 
     def _css_quoted_rep(m):
         r = _css_url_from(m.group(2))
@@ -6157,12 +6030,6 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
         flags=re.DOTALL | re.IGNORECASE,
     )
 
-    # Restore the protected style attribute bodies (placeholders survive every
-    # pass above untouched; a placeholder inside a tag that a strip-pass
-    # removed simply no longer exists — replace() is a no-op there).
-    for _i, _body in enumerate(_style_bodies):
-        html = html.replace(f"\x00S2LSTYLE{_i}\x00", _body)
-
     return html.encode("utf-8")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6173,11 +6040,7 @@ visited:        set = set()
 _VISITED_MAX = 100000  # cap to prevent unbounded memory growth
 saved_paths:    set = set()
 _SAVED_PATHS_MAX = 50000  # cap to prevent unbounded memory growth
-# sha1(body) → FIRST on-disk path that received those bytes. Used by the
-# save worker to materialize duplicate-content URLs as HARDLINKS instead of
-# skipping them (see _save_worker) — zero extra disk, and every fetched URL
-# still gets its own cache path (variants + OFFLINE correctness).
-content_hashes: dict = {}
+content_hashes: set = set()
 _CONTENT_HASHES_MAX = 50000  # cap to prevent unbounded memory growth
 
 visited_lock = threading.Lock()
@@ -6336,7 +6199,7 @@ def _fetch_external_asset(u: str) -> None:
                 return
             if r.status_code < 400:
                 if CACHE_CDN:
-                    save_queue.put((u, body, r.headers.get("Content-Type", ""), _effective_device()))
+                    save_queue.put((u, body, r.headers.get("Content-Type", "")))
                 _register_cdn_host(netloc)
                 stats.inc("cdn_fetched")
                 log(f"CDN-bg fetch GET {r.status_code} {_fmt_host(netloc)}{urlparse(u).path} {_fmt_size(len(body))}", "CDN")
@@ -6372,13 +6235,7 @@ def _save_worker() -> None:
     last_flush: float = time.time()
     while True:
         try:
-            # Items are (url, body, content-type) or (url, body, content-type,
-            # device_class). The optional 4th element carries the device class
-            # of the request that fetched the body — the worker maps it to an
-            # HTML cache-variant tag so a phone's fetch lands in
-            # index__s2l_mobile.html instead of overwriting/occupying the
-            # canonical desktop file (where the user's hand edits live).
-            u, data, ctype, *rest = save_queue.get(timeout=SAVE_INTERVAL)
+            u, data, ctype = save_queue.get(timeout=SAVE_INTERVAL)
         except queue.Empty:
             pass
         else:
@@ -6393,32 +6250,16 @@ def _save_worker() -> None:
                 if _is_bot_page(data):
                     log(f"Bot page detected — NOT caching {urlparse(u).netloc}{urlparse(u).path}", "WARN")
                     continue
-                _dev_tag = _device_variant(rest[0]) if rest and rest[0] else ""
-                p = local_path(u, _dev_tag)
+                p = local_path(u)
                 h = hashlib.sha1(data).hexdigest()
-                _link_src: str | None = None
                 with content_lock:
-                    _first = content_hashes.get(h)
-                    if _first is not None:
-                        # Identical bytes were already saved for another path.
-                        # DON'T drop this file — every fetched URL must
-                        # materialize at its own cache path, otherwise:
-                        #   (a) a device variant whose content equals the
-                        #       canonical copy would never be written → the
-                        #       device would re-fetch this URL on EVERY
-                        #       request (cache can never hit), and
-                        #   (b) OFFLINE mode would 404 any second URL whose
-                        #       content duplicates the first.
-                        # Hardlink to the first copy: zero extra disk. The
-                        # flush falls back to a plain write if linking is
-                        # impossible (cross-device, exotic filesystem).
-                        _link_src = _first
-                    else:
-                        content_hashes[h] = p
+                    if h in content_hashes:
+                        continue
+                    content_hashes.add(h)
                     # Cap memory — clear if too large (prevents OOM on long runs)
                     if len(content_hashes) > _CONTENT_HASHES_MAX:
                         content_hashes.clear()
-                        content_hashes[h] = p
+                        content_hashes.add(h)
                 # NOTE: we track saved_paths by the ORIGINAL path here. If the
                 # write later remaps p to p/index.html (directory collision),
                 # _save_worker updates saved_paths with the final write path
@@ -6427,15 +6268,6 @@ def _save_worker() -> None:
                 # uncacheable for the rest of the run).
                 original_p = p
                 with save_lock:
-                    # Cache self-heal: the path is tracked as already
-                    # saved, but the FILE ITSELF is gone from disk (the user
-                    # deleted it while the server runs). Forget the dedup
-                    # entry so the freshly fetched body re-materializes the
-                    # file instead of being silently dropped — otherwise a
-                    # deleted-then-re-fetched file would serve live ONCE and
-                    # never return to the disk mirror.
-                    if original_p in saved_paths and not os.path.isfile(original_p):
-                        saved_paths.discard(original_p)
                     if original_p in saved_paths:
                         continue
                     # Tentatively mark as in-progress; removed on write failure.
@@ -6444,34 +6276,18 @@ def _save_worker() -> None:
                     if len(saved_paths) > _SAVED_PATHS_MAX:
                         saved_paths.clear()
                         saved_paths.add(original_p)
-                batch.append((original_p, p, data, _link_src))
+                batch.append((original_p, p, data))
             except Exception as e:
                 log(f"Save-worker item error: {u} — {e}", "ERROR")
             finally:
                 save_queue.task_done()
         now = time.time()
         if batch and (len(batch) >= SAVE_BATCH or now - last_flush >= SAVE_INTERVAL):
-            for original_p, p, data, link_src in batch:
+            for original_p, p, data in batch:
                 try:
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     if os.path.isdir(p):
                         p = os.path.join(p, "index.html")
-                    # Duplicate-content materialization: prefer a hardlink to
-                    # the first copy (zero extra disk). Fall back to writing
-                    # the bytes when the source is gone (purged) or the
-                    # filesystem refuses links (cross-device, FAT/exFAT).
-                    if link_src and not os.path.isfile(p):
-                        try:
-                            if os.path.isfile(link_src):
-                                os.link(link_src, p)
-                                if p != original_p:
-                                    with save_lock:
-                                        saved_paths.discard(original_p)
-                                        saved_paths.add(p)
-                                stats.inc("saved")
-                                continue
-                        except OSError:
-                            pass   # fall through to a plain byte write
                     with open(p, "wb") as f:
                         f.write(data)
                     # Write succeeded — record the FINAL write path in saved_paths
@@ -6744,7 +6560,7 @@ def _crawl(u: str) -> None:
     if r.status_code >= 400:
         stats.inc("http_errors")
         if SAVE_ERRORS:
-            save_queue.put((u, data, ct, _effective_device()))
+            save_queue.put((u, data, ct))
         return
 
     if SHOW_HIDDEN and is_html(data, ct):
@@ -6757,7 +6573,7 @@ def _crawl(u: str) -> None:
         return
 
     # Save original (never rewritten) so cached files stay clean
-    save_queue.put((u, data, ct, _effective_device()))
+    save_queue.put((u, data, ct))
 
     if is_html(data, ct):
         soup = BeautifulSoup(data.decode("utf-8", "ignore"), "lxml")
@@ -6989,7 +6805,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     if _acc:
         out_h["Access-Control-Allow-Credentials"] = _acc
     out_h["Access-Control-Expose-Headers"] = "*"
-    out_h["Cache-Control"] = "no-cache, no-transform"
+    out_h["Cache-Control"] = "public, max-age=86400"
     # We decompress before yielding (see _gen below), so strip the header.
     # Also strip Content-Length when we're decompressing — the decompressed
     # size differs from the compressed Content-Length, and a mismatch causes
@@ -7101,7 +6917,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                 full  = b"".join(raw_chunks)
                 plain = decompress_body(full, enc)
                 if not _is_wire_payload(plain) and not _is_bot_page(plain, sc):
-                    save_queue.put((target, plain, ct, _effective_device()))
+                    save_queue.put((target, plain, ct))
                     stats.inc("saved")
             # Single consolidated stream log line. Include "not cached" note
             # when the stream was too large or didn't complete — previously
@@ -9403,161 +9219,6 @@ def _parse_range_header(range_hdr: str, file_size: int) -> tuple[int, int] | Non
     except (ValueError, AttributeError):
         return None
 
-def _disk_validators(lp: str) -> tuple[str, str] | None:
-    """(ETag, Last-Modified) derived from the file's CURRENT on-disk state.
-
-    mtime_ns + size — a hand edit (user "mods") or a re-save always moves at
-    least one of them, so the validator changes the moment the file changes.
-    Deliberately NOT a body hash: revalidation happens for every asset on
-    every reload, and stat() is ~free while hashing every WASM/video on each
-    request is not.
-    """
-    try:
-        st = os.stat(lp)
-    except OSError:
-        return None
-    etag = f'"s2l:{st.st_size}:{st.st_mtime_ns}"'
-    return etag, email.utils.formatdate(st.st_mtime, usegmt=True)
-
-
-def _conditional_304(lp: str, ct: str) -> Response | None:
-    """Answer If-None-Match / If-Modified-Since from the CURRENT disk state.
-
-    The mirror is editable by design ("mods"): the browser must revalidate
-    assets instead of trusting its copy, and the server must judge against
-    what is on disk RIGHT NOW — a modified file yields a new ETag (200 with
-    the new bytes on the next request), a deleted file yields no 304 at all
-    (the request falls through to the refetch/404 path). HTML/JSON are served
-    no-store, so browsers never send conditionals for them — skipped here to
-    keep the semantics consistent.
-    """
-    if ct.startswith("text/html") or "json" in ct:
-        return None
-    val = _disk_validators(lp)
-    if val is None:
-        return None
-    etag, last_mod = val
-    try:
-        inm = flask_request.headers.get("If-None-Match", "")
-    except RuntimeError:
-        return None
-    hit = False
-    if inm.strip():
-        if inm.strip() == "*":
-            hit = True
-        else:
-            for tok in inm.split(","):
-                tok = tok.strip()
-                # W/"..." (weak) prefixes compare equal for our purposes
-                if tok == etag or (tok.startswith("W/") and tok[2:] == etag):
-                    hit = True
-                    break
-    else:
-        try:
-            ims = flask_request.headers.get("If-Modified-Since", "")
-        except RuntimeError:
-            return None
-        if ims.strip():
-            try:
-                st = os.stat(lp)
-                hit = int(st.st_mtime) <= int(
-                    email.utils.parsedate_to_datetime(ims).timestamp())
-            except Exception:
-                hit = False
-    if not hit:
-        return None
-    resp = Response(status=304)
-    resp.headers["ETag"] = etag
-    resp.headers["Last-Modified"] = last_mod
-    # A 304 updates the stored response's freshness — keep revalidating.
-    resp.headers["Cache-Control"] = "no-cache"
-    _aco, _acc = _cors_origin_pair()
-    resp.headers["Access-Control-Allow-Origin"] = _aco
-    if _acc:
-        resp.headers["Access-Control-Allow-Credentials"] = _acc
-    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-    return resp
-
-
-def _apply_freshness(out: dict, ct: str) -> None:
-    """Normalize browser-side freshness so the EDITABLE disk mirror stays the
-    source of truth.
-
-    Upstream lifetimes (max-age=31536000, immutable, Expires:+1y) used to
-    pass through on live responses: the browser then froze its copy for
-    months and never re-contacted S2L — hand edits and deletions on disk
-    were invisible (“removed the assets folder and the game still loaded”).
-    HTML/JSON → no-store (always re-downloaded, SPA state must stay live);
-    everything else → no-cache (store, but revalidate before every use —
-    validators turn that check into a fast 304).
-
-    Case-safe: upstream header dicts may carry 'Cache-Control' in any casing
-    (curl_cffi lower-cases, requests does not) — only one spelling survives.
-    """
-    _lc = (ct or "").lower()
-    _is_doc = "text/html" in _lc or "json" in _lc
-    _cc_key = None
-    for k in out:
-        if k.lower() == "cache-control":
-            _cc_key = k
-            break
-    _cur = out.get(_cc_key, "") if _cc_key else ""
-    if _is_doc or not any(t in _cur for t in ("no-cache", "no-store", "max-age=0")):
-        if _cc_key is not None:
-            del out[_cc_key]
-        out["Cache-Control"] = ("no-store, no-cache, must-revalidate, max-age=0"
-                                if _is_doc else "no-cache")
-    # Expires predates Cache-Control but some browsers still peek at it when
-    # revalidating; a future-Expires must not resurrect old bodies.
-    for k in [k for k in out if k.lower() == "expires"]:
-        del out[k]
-
-
-def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> Response | None:
-    """206 Partial Content served straight from a disk-cached file.
-
-    Shared range-serving seam (currently the OFFLINE branch of the main
-    proxy). Range requests must never be answered with a full 200 — HTML5
-    <video>/<audio> interpret that as a truncated stream and loop/stall —
-    and when there is no upstream (OFFLINE) the file on disk is the only
-    possible source. Returns None when the Range header is absent or
-    unparseable, or the read fails, so the caller can fall back to a
-    full-file serve (the policy this branch always had).
-    """
-    rng = flask_request.headers.get("Range", "")
-    if not rng:
-        return None
-    try:
-        file_size = os.path.getsize(lp)
-    except OSError:
-        return None
-    rng_parsed = _parse_range_header(rng, file_size)
-    if rng_parsed is None:
-        return None
-    start, end = rng_parsed
-    try:
-        with open(lp, "rb") as _rf:
-            _rf.seek(start)
-            _slice = _rf.read(end - start + 1)
-    except OSError:
-        return None
-    ct = resolve_mime(lp)
-    resp = Response(_slice, status=206, content_type=ct)
-    resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Content-Length"] = str(len(_slice))
-    _aco, _acc = _cors_origin_pair()
-    resp.headers["Access-Control-Allow-Origin"] = _aco
-    if _acc:
-        resp.headers["Access-Control-Allow-Credentials"] = _acc
-    resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-    log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
-    _gui_push_raw(method, req_path, 206, ct, _slice,
-                  origin=MAIN_HOST,
-                  _skip_log=True)   # caller already logged
-    return resp
-
-
 def _serve_cached(lp: str) -> tuple[bytes, str] | None:
     """Load a cached file from disk and apply HTML/CSS/JSON rewrites as needed."""
     # No more .s2l-ctype sidecar — we trust the on-disk path extension
@@ -9596,7 +9257,7 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
                     pass
                 return None
         if PROXY_CDN:
-            data = _rewrite_ext_urls(data, html_doc=True)
+            data = _rewrite_ext_urls(data)
         data = rewrite_abs_urls(data)   # strip absolute MAIN_HOST URLs → proxy-relative
         # Always inject the S2L JS runtime — it patches fetch/XHR/WebSocket/
         # Worker/innerHTML so JS-initiated requests go through the proxy instead
@@ -9613,34 +9274,19 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
     ct = guess_mime(lp)
     # Rewrite external URLs inside cached CSS files so images/fonts load through the proxy
     if PROXY_CDN and (lp.endswith(".css") or "css" in ct):
-        data = _rewrite_ext_urls(data, html_doc=False)
+        data = _rewrite_ext_urls(data)
     elif PROXY_CDN and (lp.endswith((".json", ".webmanifest")) or "json" in ct):
         data = _rewrite_json_urls(data)
     return data, ct
 
 def _cached_response(lp: str, target: str, method: str, req_path: str) -> Response | None:
     """Build a Flask Response from a cached file on disk."""
-    # Conditional requests FIRST — a 304 skips the file read entirely, and the
-    # validators come from the CURRENT disk state: a hand edit immediately
-    # stops matching the old ETag (fresh 200 next request) and a deleted file
-    # never 304s (the request falls through to refetch/404).
-    _probe_ct = guess_mime(lp)
-    _c304 = _conditional_304(lp, _probe_ct)
-    if _c304 is not None:
-        stats.inc("cache_304")
-        log(f"{method} HIT 304 {_fmt_host(urlparse(target).netloc)}{req_path}", "←")
-        _gui_push_raw(method, req_path, 304, _probe_ct, b"",
-                      origin=MAIN_HOST, _skip_log=True)
-        return _c304
-
     result = _serve_cached(lp)
     if result is None:
         return None
 
     data, ct = result
     log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} {_fmt_size(len(data))}", "←")
-    _is_static = not (ct.startswith("text/html") or "json" in ct)
-    _val = _disk_validators(lp) if _is_static else None
     ctx = HookContext(
         method       = method,
         url          = target,
@@ -9653,16 +9299,10 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
             # HTML + JSON: never cache at browser level (multi-site on same origin,
             # and JSON API responses must always be fresh — caching them for 24h
             # freezes SPA data and causes stale-state render failures).
-            # Static assets (JS/CSS/images/fonts): STORE but always REVALIDATE —
-            # the old "public, max-age=86400" let the browser serve its own copy
-            # for 24h without contacting S2L, so user edits/deletions of the
-            # mirrored files were invisible (“game still loads after the assets
-            # folder was deleted”). With no-cache + ETag/Last-Modified the check
-            # is a fast 304 and disk edits go live on the next reload.
+            # Static assets (JS/CSS/images/fonts): allow long caching.
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
-                             if not _is_static
-                             else "no-cache",
-            **({"ETag": _val[0], "Last-Modified": _val[1]} if _val else {}),
+                             if ct.startswith("text/html") or "json" in ct
+                             else "public, max-age=86400"
         },
         resp_body    = data,
         resp_ct      = ct,
@@ -10959,13 +10599,6 @@ def ext_asset(extpath: str) -> Response:
 
     lp = local_path(real_url)
     if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
-        _c304 = _conditional_304(lp, guess_mime(lp))
-        if _c304 is not None:
-            stats.inc("cache_304")
-            log(f"EXT {method} HIT 304 {_fmt_host(ext_host)}{ext_path}", "CDN")
-            _gui_push_raw(method, ext_path, 304, guess_mime(lp), b"",
-                          display_tag="[CDN]", origin=ext_host, _skip_log=True)
-            return _c304
         result = _serve_cached(lp)
         if result is not None:
             data, ct = result
@@ -10973,14 +10606,7 @@ def ext_asset(extpath: str) -> Response:
             _gui_push_raw("GET", ext_path, 200, ct, data,
                           display_tag="[CDN]", origin=ext_host)
             resp = Response(data, content_type=ct)
-            if ct.startswith("text/html") or "json" in ct:
-                resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            else:
-                resp.headers["Cache-Control"] = "no-cache"
-                _val = _disk_validators(lp)
-                if _val:
-                    resp.headers["ETag"] = _val[0]
-                    resp.headers["Last-Modified"] = _val[1]
+            resp.headers["Cache-Control"] = "public, max-age=86400"
             _aco, _acc = _cors_origin_pair()
             resp.headers["Access-Control-Allow-Origin"] = _aco
             if _acc:
@@ -11043,7 +10669,7 @@ def ext_asset(extpath: str) -> Response:
         # Only save real 200 responses with content — 304 has empty body and saving
         # it would corrupt any existing cached file.
         if r.status_code == 200 and body and method in _SAFE_METHODS and CACHE_CDN:
-            save_queue.put((real_url, body, ct, _effective_device()))
+            save_queue.put((real_url, body, ct))
             _register_cdn_host(ext_host)
             stats.inc("cdn_fetched")
         elif r.status_code < 400 and method in _SAFE_METHODS:
@@ -11057,19 +10683,19 @@ def ext_asset(extpath: str) -> Response:
         out_headers["Access-Control-Expose-Headers"] = "*"
         out_headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         if method in _SAFE_METHODS:
-            _apply_freshness(out_headers, ct)
+            out_headers["Cache-Control"] = "public, max-age=86400"
         # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
         # through the proxy (critical for cross-origin iframes served via /__s2l_ext__/).
         _ct_base_e = ct.split(";")[0].strip().lower()
         if r.status_code < 400 and PROXY_CDN:
             if "text/html" in _ct_base_e:
-                body = _rewrite_ext_urls(body, html_doc=True)
+                body = _rewrite_ext_urls(body)
                 body = rewrite_abs_urls(body)
                 body = _inject_sw_clear(body)
                 out_headers.pop("content-length", None)
                 out_headers.pop("Content-Length", None)
             elif "text/css" in _ct_base_e:
-                body = _rewrite_ext_urls(body, html_doc=False)
+                body = _rewrite_ext_urls(body)
                 out_headers.pop("content-length", None)
                 out_headers.pop("Content-Length", None)
             elif "json" in _ct_base_e:
@@ -11195,37 +10821,48 @@ def proxy(path: str) -> Response:
 
     if OFFLINE:
         if method in _SAFE_METHODS:
-            # DEVICE-AWARE LOOKUP (OFFLINE): try the device's cached variant
-            # first, then fall back to the canonical file — offline there is
-            # no upstream, so a desktop-shaped document still beats a 404.
-            _dev_tag = _device_variant(_effective_device())
-            lp = local_path(target, _dev_tag) if _dev_tag else local_path(target)
-            if not os.path.isfile(lp):
-                lp = local_path(target)
+            lp = local_path(target)
             if os.path.isfile(lp):
                 # Range request support in OFFLINE mode — critical for
                 # video/audio playback. Without 206 Partial Content, HTML5
                 # <video> players interpret a full 200 as a truncated stream
                 # and loop/stall indefinitely.
-                if flask_request.headers.get("Range", ""):
-                    _rng_resp = _serve_range_from_disk(lp, target, method, req_path)
-                    if _rng_resp is not None:
-                        return _rng_resp
-                    # Range read failed — fall through to full-file serve below
+                rng = flask_request.headers.get("Range", "")
+                if rng:
+                    try:
+                        file_size = os.path.getsize(lp)
+                    except OSError:
+                        file_size = 0
+                    rng_parsed = _parse_range_header(rng, file_size)
+                    if rng_parsed is not None:
+                        start, end = rng_parsed
+                        _range_ok = True
+                        try:
+                            with open(lp, "rb") as _rf:
+                                _rf.seek(start)
+                                _slice = _rf.read(end - start + 1)
+                        except OSError:
+                            _range_ok = False
+                        if _range_ok:
+                            ct_off = resolve_mime(lp)
+                            _rng_resp = Response(_slice, status=206, content_type=ct_off)
+                            _rng_resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+                            _rng_resp.headers["Accept-Ranges"] = "bytes"
+                            _rng_resp.headers["Content-Length"] = str(len(_slice))
+                            _aco, _acc = _cors_origin_pair()
+                            _rng_resp.headers["Access-Control-Allow-Origin"] = _aco
+                            if _acc:
+                                _rng_resp.headers["Access-Control-Allow-Credentials"] = _acc
+                            _rng_resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+                            log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
+                            _gui_push_raw(method, req_path, 206, ct_off, _slice,
+                                          origin=MAIN_HOST,
+                                          _skip_log=True)   # caller already logged
+                            return _rng_resp
+                        # Range read failed — fall through to full-file serve below
                 r = _cached_response(lp, target, method, req_path)
                 if r is not None:
                     return r
-                # The variant file existed but failed validation (stale RSC /
-                # bot page → purged). OFFLINE has no second chance at a
-                # fetch — try the canonical desktop file before giving up.
-                if _dev_tag:
-                    _canon_lp = local_path(target)
-                    if _canon_lp != lp and os.path.isfile(_canon_lp):
-                        r = _cached_response(_canon_lp, target, method, req_path)
-                        if r is not None:
-                            log(f"Device variant invalid — canonical fallback "
-                                f"{_fmt_host(urlparse(target).netloc)}{req_path}", "WARN")
-                            return r
             # Fallback: try alternate CDN hosts that may have this path cached.
             # In OFFLINE mode the main-host 404 fallback below never runs, so
             # without this an asset cached on a CDN host but requested
@@ -11255,28 +10892,13 @@ def proxy(path: str) -> Response:
         return Response("Offline — not cached", status=404)
 
     if method in _SAFE_METHODS:
-        # DEVICE-AWARE CACHE LOOKUP (ONLINE): a phone/tablet is served its own
-        # cached variant when one exists. When it does NOT exist yet, the
-        # canonical (desktop) file is deliberately SKIPPED so the live fetch
-        # below serves AND caches the device's own document — this is what
-        # stops "phone access changes the PC's page" (the old single-file
-        # cache let whichever device fetched first dictate the layout for
-        # everyone). The canonical file itself is never written by a device
-        # fetch, so the user's hand edits in it survive forever. If the
-        # upstream then fails, the 502 handler falls back to the canonical
-        # file instead of erroring out.
-        _dev_tag = _device_variant(_effective_device())
-        lp = local_path(target, _dev_tag) if _dev_tag else local_path(target)
-        if not (_dev_tag and os.path.isfile(lp)):
-            lp = local_path(target)
-            if _dev_tag and not OFFLINE and os.path.isfile(lp):
-                lp = None   # force the live fetch — the device must get ITS copy.
+        lp = local_path(target)
         # IMPORTANT: Range requests MUST always hit upstream.
         # Serving a full file from disk cache in response to "Range: bytes=X-Y"
         # causes the browser to receive a 200 instead of 206 Partial Content —
         # video players (HTML5 <video>) interpret this as a truncated
         # stream and loop / stall indefinitely.
-        if lp is not None and os.path.isfile(lp) and not _has_range:
+        if os.path.isfile(lp) and not _has_range:
             cached = _cached_response(lp, target, method, req_path)
             if cached is not None:
                 return cached
@@ -11358,22 +10980,6 @@ def proxy(path: str) -> Response:
         if upstream_r is None:
             short2 = _short_exc(last_exc)
             log(f"All retries failed: {urlparse(target).path} — {short2}", "ERROR")
-            # GRACEFUL CACHE FALLBACK: upstream is unreachable right now —
-            # serve the cached document instead of a bare 502 (same
-            # philosophy as OFFLINE: irreplaceable cache beats an error
-            # page). Canonical file only: it exists for every desktop fetch
-            # and holds the user's mods; a missing device variant has
-            # obviously never been fetched, so there is nothing newer to try.
-            if method in _SAFE_METHODS and not _has_range:
-                try:
-                    _flp = local_path(target)
-                    if os.path.isfile(_flp):
-                        _fc = _cached_response(_flp, target, method, req_path)
-                        if _fc is not None:
-                            log(f"Upstream down — serving cached copy: {req_path}", "WARN")
-                            return _fc
-                except Exception:
-                    pass
             err_body = (f"Connection error: {short}\n"
                         f"Retry: {short2}\n\n"
                         f"This may be caused by:\n"
@@ -11529,16 +11135,8 @@ def proxy(path: str) -> Response:
     if upstream_r.status_code == 304:
         # Upstream returned 304 despite us not sending If-None-Match.
         # Serve from local cache if available, otherwise force a clean fetch.
-        # Device-aware: a phone whose variant isn't cached yet skips the
-        # canonical file (online) so the forced re-fetch below populates the
-        # device's own variant instead of re-serving the desktop document.
-        _dev_tag = _device_variant(_effective_device())
-        lp = local_path(target, _dev_tag) if _dev_tag else local_path(target)
-        if not (_dev_tag and os.path.isfile(lp)):
-            lp = local_path(target)
-            if _dev_tag and not OFFLINE and os.path.isfile(lp):
-                lp = None
-        if lp and os.path.isfile(lp):
+        lp = local_path(target)
+        if os.path.isfile(lp):
             cached = _cached_response(lp, target, method, req_path)
             if cached is not None:
                 return cached
@@ -11685,36 +11283,23 @@ def proxy(path: str) -> Response:
                     log(f"CDN disk hit unreadable: {cdn_lp} — {_short_exc(e)}", "WARN")
                 else:
                     log(f"CDN hit {_fmt_host(cdn_host)}{req_path_cdn}", "CDN")
-                    _cdn_ct = resolve_mime(cdn_lp)
-                    _c304 = _conditional_304(cdn_lp, _cdn_ct)
-                    if _c304 is not None:
-                        stats.inc("cache_304")
-                        return _c304
-                    resp = Response(cdn_data, content_type=_cdn_ct)
+                    resp = Response(cdn_data, content_type=resolve_mime(cdn_lp))
                     _aco, _acc = _cors_origin_pair()
                     resp.headers["Access-Control-Allow-Origin"]  = _aco
                     if _acc:
                         resp.headers["Access-Control-Allow-Credentials"] = _acc
                     resp.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-                    if _cdn_ct.startswith("text/html") or "json" in _cdn_ct:
-                        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                    else:
-                        resp.headers["Cache-Control"] = "no-cache"
-                        _val = _disk_validators(cdn_lp)
-                        if _val:
-                            resp.headers["ETag"] = _val[0]
-                            resp.headers["Last-Modified"] = _val[1]
+                    resp.headers["Cache-Control"] = "public, max-age=86400"
                     return resp
             try:
                 cdn_r    = _get_proxy_session().get(cdn_url, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
                 cdn_body = decompress_body(cdn_r.content, cdn_r.headers.get("Content-Encoding", ""))
                 ct       = cdn_r.headers.get("Content-Type", "application/octet-stream")
                 if cdn_r.status_code < 400:
-                    save_queue.put((cdn_url, cdn_body, ct, _effective_device()))
+                    save_queue.put((cdn_url, cdn_body, ct))
                     stats.inc("cdn_fetched")
                     log(f"CDN fallback {_fmt_host(cdn_host)}{req_path_cdn} {cdn_r.status_code}", "CDN")
                     out = filter_resp(_resp_headers_dict(cdn_r))
-                    _apply_freshness(out, ct)
                     _aco, _acc = _cors_origin_pair()
                     out["Access-Control-Allow-Origin"]  = _aco
                     if _acc:
@@ -11727,10 +11312,6 @@ def proxy(path: str) -> Response:
     ctx.resp_status  = upstream_r.status_code
     ctx.resp_headers = filter_resp(_resp_headers_dict(upstream_r), body,
                                     is_top_level_html="text/html" in _resp_ct_raw)
-    # Browser freshness normalization (see _apply_freshness) — without this,
-    # upstream lifetimes (immutable / max-age=1y) froze the BROWSER's copy
-    # while the editable disk mirror went stale-invisible for months.
-    _apply_freshness(ctx.resp_headers, _resp_ct_raw or ctx.resp_ct)
     ctx.resp_body    = body
     ctx.resp_ct      = upstream_r.headers.get("Content-Type", "application/octet-stream")
     platform         = detect_platform(dict(upstream_r.headers), body)
@@ -11824,11 +11405,7 @@ def proxy(path: str) -> Response:
         and (ctx.resp_status < 400 or SAVE_ERRORS)
     )
     if _should_save:
-        # 4th element = device class of THIS request → the save worker maps
-        # it to the HTML variant tag, so a phone's first visit caches
-        # index__s2l_mobile.html and leaves the canonical desktop file
-        # (and any user mods in it) untouched.
-        save_queue.put((target, ctx.resp_body, ctx.resp_ct, _effective_device()))
+        save_queue.put((target, ctx.resp_body, ctx.resp_ct))
         # Mark this URL as visited so the crawler doesn't fetch it again.
         # The proxy already fetched it — re-fetching is wasteful and creates
         # duplicate log entries. enqueue() still runs for link extraction
@@ -11857,7 +11434,7 @@ def proxy(path: str) -> Response:
     if _is_html or _is_css:
         _body = ctx.resp_body
         if PROXY_CDN:
-            _body = _rewrite_ext_urls(_body, html_doc=_is_html)
+            _body = _rewrite_ext_urls(_body)
         if _is_html:
             _body = rewrite_abs_urls(_body)
             _body = _inject_sw_clear(_body)
