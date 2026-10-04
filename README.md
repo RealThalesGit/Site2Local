@@ -1,6 +1,7 @@
 # Site2Local
 > **Mildly Powerful and IT'S FREE!!**
- A **Vibe-coded** python project which makes a existent website running on localhost known as 127.0.0.1!
+
+A **Vibe-coded** python project which makes a existent website running on localhost known as 127.0.0.1!
 
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
 
