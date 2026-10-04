@@ -257,7 +257,7 @@ def log(msg: str, level: str = "INFO") -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-SITE = "tiktok.com"   # target domain or URL
+SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
@@ -272,14 +272,14 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = 256 * 1024        # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = False                   # crawl at startup; False = proxy-on-demand only
+CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = True                # PyQt6 traffic inspector + live hook editor (Fusion theme)
+HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
@@ -3361,13 +3361,13 @@ def _ensure_wasm_content_type(ct: str, path: str) -> str:
     stream (or anything else), streaming compilation fails with a TypeError
     that manifests as "Failed to fetch" or "Decompression failed" in the
     client app. Many CDNs serve .wasm files as application/octet-stream
-    because their MIME config predates the WASM spec; WASM-threaded games
-    and apps hit this on every launch.
+    because their MIME config predates the WASM spec; Eaglercraft and other
+    WASM-threaded games hit this on every launch.
 
     We override when:
       • The path ends in .wasm (canonical case), OR
-      • The path contains /wasm/ (generic CDN directory pattern for WASM
-        bundles that have no file extension), OR
+      • The path contains /wasm/ or /eagle-wasm/ (Eaglercraft CDN pattern
+        where the WASM bundle has no file extension), OR
       • The upstream Content-Type is application/wasm already (passthrough)
 
     For any other path, we return the upstream Content-Type unchanged.
@@ -3378,7 +3378,7 @@ def _ensure_wasm_content_type(ct: str, path: str) -> str:
     if ct_base == "application/wasm":
         return ct  # already correct
     p = (path or "").lower()
-    if p.endswith(".wasm") or "/wasm/" in p:
+    if p.endswith(".wasm") or "/wasm/" in p or "eagle-wasm" in p:
         return "application/wasm"
     return ct
 
@@ -3573,12 +3573,11 @@ def _flatten_cookiejar(cookies_obj, prefer_host: str = "") -> dict:
 def _needs_isolation(body: bytes) -> bool:
     """Heuristic: does this HTML look like it needs Cross-Origin isolation?
 
-    Sites that use SharedArrayBuffer / WASM threads (browser-based game
-    clients are the canonical case) need COOP+COEP on the top-level document
-    or the browser silently refuses to hand them a working SharedArrayBuffer
-    — the app initializes just far enough to paint its background/canvas and
-    then hangs forever waiting on a threading primitive that was never
-    granted.
+    Sites that use SharedArrayBuffer / WASM threads (eaglercraft-style clients
+    are the canonical case) need COOP+COEP on the top-level document or the
+    browser silently refuses to hand them a working SharedArrayBuffer — the
+    app initializes just far enough to paint its background/canvas and then
+    hangs forever waiting on a threading primitive that was never granted.
     A real, unproxied deployment of such a site sends these headers itself
     (from its own server config); scan for the tell-tale APIs so we can
     reproduce that even when the origin's own header choice didn't survive
@@ -4430,7 +4429,7 @@ def _build_s2l_injector() -> bytes:
         # blob: URL worker loses the original script's base URL, so relative
         # importScripts() calls (e.g. webpack's "./5376.js" for chunk loading)
         # can't be resolved — the browser throws "The URL '...' is invalid"
-        # and the app freezes. This is the WASM-game freeze bug.
+        # and the app freezes. This is exactly the Eaglercraft freeze bug.
         #
         # FIX: For SAME-ORIGIN scripts (already on localhost:PORT), skip the
         # blob wrapper and create the Worker directly with the rewritten URL.
@@ -7286,7 +7285,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     # Ensure WASM resources are served with Content-Type: application/wasm —
     # WebAssembly.instantiateStreaming() requires it, and many CDNs serve .wasm
     # as application/octet-stream which causes "Failed to fetch" in WASM-threaded
-    # clients.
+    # clients like Eaglercraft.
     ct    = _ensure_wasm_content_type(ct, urlparse(target).path or "")
     sc    = upstream_r.status_code
     enc   = (upstream_r.headers.get("Content-Encoding", "") or "").lower().strip()
