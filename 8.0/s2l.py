@@ -257,11 +257,6 @@ def log(msg: str, level: str = "INFO") -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-# The user's TARGET site. Edit this to mirror a different origin — every fix
-# in this file is universal (no site-specific patches), so any HTTPS site
-# should work out of the box. May be a bare domain ("example.com"), a full
-# URL ("https://example.com/path"), or a 2nd-level domain whose subdomains
-# are also proxied (e.g. "github.io" covers user-pages + assets CDN).
 SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
