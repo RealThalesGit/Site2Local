@@ -257,11 +257,6 @@ def log(msg: str, level: str = "INFO") -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-# The user's TARGET site. Edit this to mirror a different origin — every fix
-# in this file is universal (no site-specific patches), so any HTTPS site
-# should work out of the box. May be a bare domain ("example.com"), a full
-# URL ("https://example.com/path"), or a 2nd-level domain whose subdomains
-# are also proxied (e.g. "github.io" covers user-pages + assets CDN).
 SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
@@ -354,13 +349,6 @@ POOL_CONNECTIONS    = 32       # per-session connection pool slots
 DEAD_HOST_TTL       = 60       # seconds to remember a dead upstream host
 STATS_WINDOW        = 60       # seconds for rolling stats window
 GRACEFUL_SHUTDOWN   = True     # drain in-flight requests on SIGTERM
-# Maximum raw (compressed) body size (bytes) we'll accumulate in RAM while
-# streaming a response so it can ALSO be cached to disk after the stream
-# finishes. Bodies larger than this are still streamed to the browser, but
-# NOT cached to disk — prevents OOM on huge video/download streams.
-# Default: 64 MB. Set to 0 to disable stream-to-disk caching entirely
-# (every stream is forwarded and forgotten, never written to site_src).
-STREAM_CACHE_MAX_BYTES = 64 * 1024 * 1024   # 64 MB
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Filters / constants
@@ -3602,21 +3590,13 @@ def _needs_isolation(body: bytes) -> bool:
     has_sab = b"SharedArrayBuffer" in head
     has_atomics = b"Atomics.wait" in head
     has_worker = b"new Worker(" in head and b"postMessage" in head
-    # v8.3 — also detect EXPLICIT cross-origin-isolation checks. Many
-    # WASM-threaded web clients gate their boot on
-    # `if (!self.crossOriginIsolated) throw new Error("Cross-origin isolation
-    # is required...")`. The check itself is the most reliable marker that
-    # the page NEEDS the headers — better signal than SAB/Atomics (which
-    # usually live in a lazy-loaded chunk that's NOT in the first 64KB of
-    # the HTML, so the heuristic misses them on real-world SPAs).
-    has_xorigin_check = b"crossOriginIsolated" in head
     # A bare .wasm reference is NOT a strong enough signal — many sites load
     # WASM without needing threads/cross-origin isolation. Requiring COEP for
     # them blocks all cross-origin sub-resources (analytics, fonts, ads) that
     # don't send CORP headers. Only trigger if WASM co-occurs with a threading
     # primitive, or if SAB/Atomics/Worker+postMessage is present on its own.
     has_wasm = b".wasm" in head
-    return (has_sab or has_atomics or has_xorigin_check
+    return (has_sab or has_atomics
             or (has_worker and (has_wasm or has_sab)))
 
 def _cors_origin_pair() -> tuple[str, str | None]:
@@ -3830,78 +3810,6 @@ def _apply_security_headers(out, body: bytes = b"",
         out["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
 
-def _is_worker_request() -> bool:
-    """Detect if the current request is fetching a Worker script.
-
-    Browsers tag Worker script fetches with `Sec-Fetch-Dest: worker` (classic
-    dedicated worker) or `Sec-Fetch-Dest: sharedworker` (SharedWorker).
-    Module workers also use `Sec-Fetch-Dest: worker`. This is the most
-    reliable "on-demand" signal: when this header is present, we know the
-    page is using Workers and the script response needs COEP for the
-    Worker to inherit `crossOriginIsolated === true` from the parent.
-
-    Returns False if no Flask request context is active (background threads,
-    tests) so callers can safely default to "don't apply".
-    """
-    try:
-        if not flask_request:
-            return False
-        _dest = (flask_request.headers.get("Sec-Fetch-Dest", "") or "").lower()
-        return _dest in ("worker", "sharedworker", "serviceworker")
-    except (RuntimeError, AttributeError):
-        return False
-
-
-def _apply_isolation_headers(out, body: bytes = b"",
-                             is_top_level_html: bool = False,
-                             is_worker_script: bool = False) -> None:
-    """Inject COOP/COEP on responses, on-demand.
-
-    COOP/COEP are delivered ONLY when the response actually needs them —
-    not on every response. Two detection paths (both checked here):
-
-      1. Top-level HTML whose body has SAB / Atomics / Worker+WASM /
-         `crossOriginIsolated` markers (heuristic in _needs_isolation).
-         Catches SPAs that inline the cross-origin-isolation check in
-         their HTML entry point.
-
-      2. Worker script responses — detected via the `is_worker_script`
-         parameter, set by callers that inspect Sec-Fetch-Dest: worker.
-         Whenever the browser fetches a Worker script, we know the page
-         is using Workers and the script needs COEP for the Worker to
-         inherit crossOriginIsolated from the parent. Sites that don't
-         use Workers pay zero overhead.
-
-    COEP value is hardcoded to `require-corp` — the value game clients
-    explicitly check for. S2L already serves CORP: cross-origin on every
-    response, so `require-corp` works without per-site config.
-
-    Idempotent — preserves origin's own COOP/COEP values verbatim.
-
-    Centralized here so the SAME behavior applies on every response path
-    (online filter_resp, cache-hit _cached_response, _make_flask_resp
-    safety net, _stream_resp, CDN mini-server, ext_asset route).
-    """
-    # On-demand mode: only apply when detection fires.
-    _should_apply = False
-    if is_top_level_html and body and _needs_isolation(body):
-        # Path 1: HTML body has explicit isolation markers.
-        _should_apply = True
-    if is_worker_script:
-        # Path 2: request carries Sec-Fetch-Dest: worker / sharedworker.
-        # The browser is fetching a Worker script — apply COEP so the
-        # Worker can inherit crossOriginIsolated from its parent.
-        _should_apply = True
-    if not _should_apply:
-        return
-    _existing = _ci_header_keys(out)
-    if ("cross-origin-opener-policy" in _existing
-            or "cross-origin-embedder-policy" in _existing):
-        return
-    out["Cross-Origin-Opener-Policy"]   = "same-origin"
-    out["Cross-Origin-Embedder-Policy"] = "require-corp"
-
-
 def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
     # Strip security headers that block our local proxy, plus hop-by-hop headers.
     # NOTE: Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy are
@@ -3944,17 +3852,11 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
     # isolation but didn't send the headers (common when the isolation was
     # coming from a static host's own server config rather than the app
     # itself), auto-apply the least-disruptive pair only there.
-    # v8.2: extracted to _apply_isolation_headers() so the SAME heuristic can
-    # be re-applied on cache-hit paths (offline mode, dead upstream) — without
-    # it, the cached 200 silently loses COOP/COEP, SharedArrayBuffer goes
-    # missing on reload, and the page freezes (the user's "delete site_src/"
-    # workaround). filter_resp() here is the online path; cache hits call
-    # the helper from _cached_response() / _make_flask_resp().
-    # v8.6: on-demand isolation. COOP/COEP applied only when:
-    #   - top-level HTML body has SAB/crossOriginIsolated markers, OR
-    #   - this is a Worker script fetch (Sec-Fetch-Dest: worker).
-    _apply_isolation_headers(out, body, is_top_level_html,
-                             is_worker_script=_is_worker_request())
+    has_coop = any(k.lower() == "cross-origin-opener-policy"   for k in out)
+    has_coep = any(k.lower() == "cross-origin-embedder-policy" for k in out)
+    if is_top_level_html and not (has_coop or has_coep) and _needs_isolation(body):
+        out["Cross-Origin-Opener-Policy"]   = "same-origin"
+        out["Cross-Origin-Embedder-Policy"] = "credentialless"
     # Additional safe security headers (X-Content-Type-Options, Referrer-Policy)
     # — added when not already present. See _apply_security_headers() docstring
     # for the rationale on which headers are/aren't safe to set on a proxy.
@@ -4281,26 +4183,8 @@ def _build_s2l_injector() -> bytes:
         # Workers. proxyPort is always the TRUE main port (MP), never the
         # current document's location.port — CDN sub-iframes run on :8087 etc.,
         # but /__s2l_ext__/ only exists on the main app.
-        # v8.4 — signature now takes DNR (string source) instead of DNR_RE
-        # (RegExp object) because JSON.stringify(RegExp) returns "{}" —
-        # the worker then receives a truthy empty object, and DNR_RE.test()
-        # throws TypeError. We compile the RegExp INSIDE the worker. Also
-        # added scriptBase (7th arg): the original script's URL, used as
-        # the base for resolving relative importScripts() args so
-        # "./chunks/5376.js" from a script at /sub/worker.js resolves to
-        # /sub/chunks/5376.js (NOT /chunks/5376.js at proxy root).
-        'function __s2l_core(M,HP,EXT,proxyHost,proxyPort,DNR,scriptBase){'
+        'function __s2l_core(M,HP,EXT,proxyHost,proxyPort,DNR_RE){'
           'var PX="http://"+proxyHost+":"+proxyPort;'
-          # Recompile DNR_RE INSIDE the worker — DNR comes in as a source
-          # string (or null), so this survives JSON serialization. The old
-          # approach passed DNR_RE (a RegExp object) and JSON.stringify
-          # turned it into "{}" → DNR_RE.test() threw inside rw().
-          'var DNR_RE=(typeof DNR==="string"&&DNR.length>0)?new RegExp(DNR,"i"):null;'
-          # scriptBase: the URL of the actual worker script (only meaningful
-          # inside workers reached via the blob-prelude path — same-origin
-          # workers skip the prelude and use native importScripts which
-          # already resolves against self.location.href). null in main page.
-          'var SB=typeof scriptBase==="string"&&scriptBase?scriptBase:null;'
           'function rw(u){'
           # Protocol-relative URLs (//cdn.host/path) → prepend https: BEFORE the
           # guard check, or they'd bypass the proxy and hit the real CDN.
@@ -4358,32 +4242,25 @@ def _build_s2l_injector() -> bytes:
           '}}catch(e){}'
           # importScripts() inside workers: schemeless args (webpack chunks)
           # were resolved against the blob: URL → "invalid URL". Resolve them
-          # against scriptBase (the actual script's URL — preserves directory
-          # context so "./5376.js" from /sub/worker.js → /sub/chunks/5376.js
-          # NOT /chunks/5376.js at proxy root); schemed args go through rw().
+          # against PX instead; schemed args go through rw() as usual.
           # v8.1 fix: the generic /^[a-z][a-z0-9+.\-]*:/ regex matched
           # "localhost:8080/..." as if "localhost:" were a URL scheme, sending
           # a schemeless-but-ported string through rw() which then mis-parsed
           # it as a host → produced "/__s2l_ext__/localhost:8080/__s2l_ext__/..."
           # (double-rewrite). Whitelist the real URL schemes instead.
-          # v8.4 fix: use SB (scriptBase) as base for relative URLs — fixes
-          # the 404 → "worker sent an error! undefined:undefined" symptom on
-          # WASM-threaded web clients where cross-origin workers served from
-          # a CDN port (http://localhost:8087/worker.js) did
-          # importScripts("./chunks/5376.js") and got back
-          # http://localhost:8080/chunks/5376.js (wrong port, 404 HTML
-          # response, worker aborts).
           'try{var _is=self.importScripts;if(typeof _is==="function"){'
             'self.importScripts=function(){'
               'var args=Array.prototype.slice.call(arguments).map(function(u){'
                 'if(typeof u!=="string")return u;'
                 'if(/^(?:https?|wss?|blob|data|file|ftp):/i.test(u))return rw(u);'
-                # Resolve relative URLs against scriptBase (the actual
-                # worker script's URL — preserves directory context).
-                # Only fall back to PX+"/" when SB is null (main-page call
-                # to __s2l_core, where there's no enclosing script).
-                'var base=SB||PX+"/";'
-                'try{return new URL(u,base).href;}catch(e){'
+                # Resolve relative URLs against the PROXY origin (PX+"/"), NOT
+                # against the worker's blob: URL — a relative URL like
+                # "./next/static/chunks/5376.js" resolves against "blob:..." which
+                # is invalid and throws "The URL '...' is invalid" in the worker.
+                # The new URL() call should handle this, but if it throws (edge
+                # case), the fallback MUST produce a valid absolute URL — the old
+                # `PX+u` produced "http://localhost:8080./next/..." (missing /).
+                'try{return new URL(u,PX+"/").href;}catch(e){'
                   # Fallback: manually construct an absolute URL. Strip leading
                   # "./" and "../" (one or more) so the path is clean, then
                   # prepend PX + "/". The old `PX+u` produced an invalid URL
@@ -4397,7 +4274,7 @@ def _build_s2l_injector() -> bytes:
           '}}catch(e){}'
           'return rw;'
         '}'
-        'var rw=__s2l_core(M,HP,EXT,location.hostname,MP,DNR,null);'
+        'var rw=__s2l_core(M,HP,EXT,location.hostname,MP,DNR_RE);'
         # ── location.protocol / origin override ────────────────────────────────
         # Forces location.protocol="https:" so SPAs building URLs like
         # `"wss://"+location.host` or `location.protocol+"//"+host` don't produce
@@ -4575,34 +4452,6 @@ def _build_s2l_injector() -> bytes:
             # WASM/audio worker failed to start.
             # v8.1: whitelist real URL schemes — same fix as importScripts.
             'if(typeof ru==="string"&&!/^(?:https?|wss?|blob|data|file|ftp):/i.test(ru))ru=PX+ru;'
-            # v8.2 — BLOB/DATA workers: pass through directly, do NOT wrap in
-            # a blob prelude. importScripts() refuses blob:/data: URLs in
-            # Chrome/Firefox (only http/https/same-origin supported), so the
-            # prelude's `importScripts("blob:...")` throws a NetworkError
-            # BEFORE the worker's own code runs. The parent's worker.onerror
-            # then receives an Event with no message/filename/lineno (the
-            # classic "worker sent an error! undefined:undefined: undefined"
-            # symptom that breaks WASM-threaded web clients that build
-            # workers from inline Blob sources).
-            # The blob's code was already constructed by the (patched) main
-            # page, so its URLs went through rw() at construction time.
-            'if(typeof ru==="string"&&/^(?:blob|data):/i.test(ru)){'
-              'return new Ctor(ru,opts);'
-            '}'
-            # v8.4 — MODULE workers: `new Worker(url, {type:"module"})`.
-            # Module workers use ES module semantics — they import via
-            # `import` statements, NOT importScripts(). The blob prelude
-            # below uses importScripts() which THROWS TypeError in module
-            # workers → worker aborts with empty onerror Event → the same
-            # "worker sent an error! undefined:undefined" symptom. Skip
-            # the prelude entirely for module workers — they fetch their
-            # own imports through the proxy (the browser's import
-            # resolution uses URLs that go through rw() via fetch patch
-            # on the main page; module workers fetch cross-origin via
-            # CORS-mode which S2L already supports).
-            'if(opts&&typeof opts==="object"&&typeof opts.type==="string"&&opts.type.toLowerCase()==="module"){'
-              'return new Ctor(ru,opts);'
-            '}'
             # Same-origin check: if the rewritten URL is on the proxy origin
             # (http://localhost:PORT/...), create the Worker directly WITHOUT
             # a blob wrapper. This preserves the script's real URL so relative
@@ -4617,19 +4466,13 @@ def _build_s2l_injector() -> bytes:
               'return new Ctor(ru,opts);'
             '}'
             # Cross-origin worker: use blob wrapper to inject __s2l_core.
-            # The importScripts patch inside __s2l_core resolves relative
-            # URLs against scriptBase (the worker's own URL, passed as 7th
-            # arg to __s2l_core) so "./chunks/5376.js" from a script at
-            # http://localhost:8087/worker.js resolves to
-            # http://localhost:8087/chunks/5376.js (CORRECT port + path),
-            # NOT http://localhost:8080/chunks/5376.js (wrong port, 404).
-            # v8.4 fix: pass DNR (string source) instead of DNR_RE (RegExp
-            # object) — JSON.stringify(RegExp) returns "{}" which broke
-            # the worker's DNR short-circuit. The worker recompiles DNR
-            # into a RegExp via new RegExp(DNR, "i") inside __s2l_core.
+            # The importScripts patch inside __s2l_core handles relative URLs
+            # by resolving them against PX+"/" (proxy root) — this is correct
+            # for cross-origin workers because their chunks are typically
+            # served from the proxy root, not from a sub-path.
             'try{'
               'var prelude="("+__s2l_core.toString()+")("+JSON.stringify(M)+","+JSON.stringify(HP)+","+'
-                'JSON.stringify(EXT)+","+JSON.stringify(location.hostname)+","+JSON.stringify(MP)+","+JSON.stringify(DNR)+","+JSON.stringify(ru)+");\\n"'
+                'JSON.stringify(EXT)+","+JSON.stringify(location.hostname)+","+JSON.stringify(MP)+","+JSON.stringify(DNR_RE)+");\\n"'
                 '+"importScripts("+JSON.stringify(ru)+");";'
               'var blob=new Blob([prelude],{type:"application/javascript"});'
               'var blobURL=URL.createObjectURL(blob);'
@@ -5865,24 +5708,6 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         _raw_rest = _raw_path_after("/")
         if _raw_rest is not None:
             p = _raw_rest
-        # v8.8 — defensive: if a request reaches this CDN mini-server with
-        # the /__s2l_ext__/<host>/ prefix still in the path, strip it.
-        # This happens when a stale (cached) HTML response carries a URL
-        # that was rewritten by an older _proxy_target() that incorrectly
-        # used the current Host header (so it pointed to localhost:8085
-        # instead of localhost:8080). The CDN mini-server would then
-        # construct cdn_url = "https://{cdn_host}/__s2l_ext__/{cdn_host}/..."
-        # which 400s at upstream. Stripping the prefix recovers gracefully.
-        # NOTE: Werkzeug's <path:p> route converter strips the leading "/",
-        # so we compare against the prefix without it.
-        _ext_prefix_rel = _EXT_PREFIX.lstrip("/")
-        if p.startswith(_ext_prefix_rel + "/"):
-            _after = p[len(_ext_prefix_rel) + 1:]
-            _slash = _after.find("/")
-            if _slash != -1:
-                p = _after[_slash:]
-            else:
-                p = "/"
         cdn_url = f"https://{cdn_host}/{p.lstrip('/')}"
         qs      = flask_request.query_string.decode("utf-8", "ignore")
         if qs:
@@ -5936,13 +5761,6 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                         resp.headers["ETag"] = _val[0]
                         resp.headers["Last-Modified"] = _val[1]
                 _apply_cors_headers(resp.headers)
-                # v8.5 — CDN cache-hit responses also need COOP/COEP for
-                # Workers to be crossOriginIsolated (Workers inherit from
-                # the SCRIPT response, not the parent document).
-                # v8.6: on-demand — only when HTML body has markers OR
-                # this is a Worker script request (Sec-Fetch-Dest: worker).
-                _apply_isolation_headers(resp.headers,
-                                         is_worker_script=_is_worker_request())
                 _apply_security_headers(resp.headers)
                 return resp
 
@@ -6240,21 +6058,19 @@ def _proxy_target(host: str, tail: str) -> str | None:
             port = _cdn_host_port.get(host_no_port, 0)
     if port > 0 and MULTIPORT:
         return f"http://{_request_hostname()}:{port}{tail}"
-    # MUST be absolute AND point to the MAIN port (PORT=8080), NOT the
-    # current request's port. /__s2l_ext__/<host>/<path> is only routed
-    # by the main Flask app on PORT — CDN mini-servers (port 8084, 8085,
-    # etc.) only proxy their own single CDN host, not arbitrary third
-    # parties. The previous version used _proxy_base() which returned the
-    # current Host header — when this function ran while serving a CDN
-    # port's HTML/CSS/JSON response (e.g. an iframe parent on
-    # localhost:8085), that produced "http://localhost:8085/__s2l_ext__/
-    # other-cdn.com/..." which 400'd because port 8085's Flask only
-    # proxies its own host. Symptom: nested iframe games (Poki's CDN
-    # d9916997-...gdn.poki.com iframe-parented from play.poki.com on
-    # another CDN port) returned "400 BAD REQUEST" / "invalid game"
-    # because the game's index.html fetch landed on the wrong Flask
-    # instance with the /__s2l_ext__/ prefix still in the path.
-    return f"http://{_request_hostname()}:{PORT}{_EXT_PREFIX}/{host}{tail}"
+    # MUST be absolute (see docstring above) — this exact line was previously
+    # returning a bare "/__s2l_ext__/host/path" relative reference. On the
+    # main-port page that happens to resolve correctly by coincidence, but the
+    # SAME rewritten HTML/JSON is also served verbatim on every CDN sub-port
+    # (MULTIPORT) and via /__s2l_ext__/ itself — there the browser resolves
+    # the relative path against THAT origin instead, e.g. an index.html
+    # served from :8084 turned "/__s2l_ext__/other-cdn.com/x" into
+    # "http://localhost:8084/__s2l_ext__/other-cdn.com/x", which 400'd because
+    # port 8084's Flask instance only knows how to proxy its own single CDN
+    # host, not arbitrary third parties. That 400 was exactly what broke
+    # loading the next item from the real CDN (error-style body) — the
+    # failed request was the app's own manifest/config fetch.
+    return f"{_proxy_base()}{_EXT_PREFIX}/{host}{tail}"
 
 def _rewrite_json_urls(data: bytes) -> bytes:
     """Rewrite absolute https?://host/path URLs embedded as JSON string values.
@@ -6864,10 +6680,7 @@ def _save_worker() -> None:
             # HTML cache-variant tag so a phone's fetch lands in
             # index__s2l_mobile.html instead of overwriting/occupying the
             # canonical desktop file (where the user's hand edits live).
-            # Content-type is currently unused here — the cache derives MIME
-            # from the URL via guess_mime() — but producers still push it so
-            # the tuple contract stays stable. Bound with _ to flag intent.
-            u, data, _unused_ctype, *rest = save_queue.get(timeout=SAVE_INTERVAL)
+            u, data, ctype, *rest = save_queue.get(timeout=SAVE_INTERVAL)
         except queue.Empty:
             pass
         else:
@@ -7454,9 +7267,7 @@ def _should_stream(ct: str, cl: int = 0) -> bool:
 # Maximum raw (compressed) body size we'll accumulate in RAM for disk caching
 # during streaming. Bodies larger than this are streamed to the browser but
 # NOT cached to disk (avoids OOM on huge video/download streams).
-# Defined publicly as STREAM_CACHE_MAX_BYTES in the Layer 2 CONFIG block above;
-# this alias keeps the internal references stable without forcing a global rename.
-_STREAM_CACHE_MAX_BYTES = STREAM_CACHE_MAX_BYTES
+_STREAM_CACHE_MAX_BYTES = 64 * 1024 * 1024  # 64 MB
 
 def _stream_resp(upstream_r, method: str, target: str) -> Response:
     """Stream a large upstream response (fetched with stream=True) to the browser.
@@ -8628,14 +8439,19 @@ class _CffiUpstreamWS:
             raise
         self._sess = sess
         self._should_close = should_close
-        # curl_cffi's WebSocket object is NOT thread-safe for concurrent
-        # sends — two send() calls from the keepalive and relay threads
-        # corrupt internal buffers, producing garbled data that desyncs
-        # the browser's application-level decompressor (e.g. zlib-stream:
-        # "invalid stored block lengths"). _send_lock serializes send_frame
-        # calls across threads; recv_frame is intentionally lock-free to
-        # avoid deadlock on the blocking recv() call (see recv_frame
-        # docstring for the rationale).
+        # curl_cffi's WebSocket object is NOT thread-safe. Concurrent
+        # send() (from keepalive thread) and recv() (from relay thread) corrupt
+        # internal buffers, producing garbled data that desyncs the browser's
+        # application-level decompressor (e.g. zlib-stream: "invalid stored
+        # block lengths"). This lock serializes ALL access to self._ws.
+        # Note: recv() is a blocking call — while it holds the lock, send()
+        # will block until recv() returns. This means keepalive pings only fire
+        # BETWEEN messages, not at precise intervals. That's acceptable because
+        # WS_PING_INTERVAL defaults to 0 (disabled) — most apps have their own
+        # application-level heartbeats that keep the connection alive.
+        self._ws_lock = threading.Lock()
+        # Dedicated send-lock: serialize sends from the keepalive thread and
+        # the relay thread. recv stays lock-free (see recv_frame docstring).
         self._send_lock = threading.Lock()
 
     def recv_frame(self):
@@ -8764,47 +8580,6 @@ def _is_sse_response(ct: str) -> bool:
     return (base.startswith("text/event-stream")
             or base.startswith("application/x-event-stream")
             or base.startswith("application/stream+json"))
-def _sse_iter(upstream_r, chunk_size: int = 4096):
-    """Yield raw bytes from an upstream response, regardless of whether
-    it was fetched with stream=True or stream=False.
-
-    When stream=True was used, response.iter_content() is the natural API
-    and yields bytes lazily as they arrive on the wire.
-
-    When stream=False was used (curl_cffi already loaded response.content
-    into memory), iter_content() raises a "stream mode is not enabled"
-    error on the first call. Detect that and fall back to yielding
-    response.content as a single chunk so the SSE reassembler still
-    gets the data instead of emitting a noisy WARN on every request.
-    """
-    try:
-        # Calling iter_content() returns an iterator without raising —
-        # the error is raised lazily on the first __next__. So we must
-        # actually iterate once inside the try block to catch it.
-        _it = upstream_r.iter_content(chunk_size=chunk_size, decode_unicode=False)
-        for chunk in _it:
-            yield chunk
-        return
-    except Exception as exc:
-        _msg = str(exc).lower()
-        # curl_cffi raises roughly: "stream mode is not enabled"
-        # requests/urllib3 raise: "stream mode not enabled" or similar.
-        # Match loosely so we don't swallow unrelated errors silently.
-        if ("stream" in _msg and "not" in _msg
-                and ("enabl" in _msg or "open" in _msg)):
-            # Fall back to the already-buffered body. If that's also
-            # empty, just stop — nothing else we can do.
-            body = b""
-            try:
-                body = upstream_r.content or b""
-            except Exception:
-                body = b""
-            if body:
-                yield body
-            return
-        # Unrelated error — re-raise so the caller can log it.
-        raise
-
 def _sse_stream_generator(upstream_r, target: str):
     """Yield complete SSE events from upstream_r, reassembling chunks that
     cross event boundaries.
@@ -8815,7 +8590,7 @@ def _sse_stream_generator(upstream_r, target: str):
     """
     buf = b""
     try:
-        for chunk in _sse_iter(upstream_r, chunk_size=4096):
+        for chunk in upstream_r.iter_content(chunk_size=4096, decode_unicode=False):
             if not chunk:
                 continue
             buf += chunk
@@ -9915,23 +9690,9 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
     # isolated apps (SharedArrayBuffer/WASM threads) report missing headers
     # only after the first reload.
     _apply_cors_headers(resp.headers)
-    # v8.2 — Re-run the COOP/COEP heuristic on the final response object as a
-    # safety net. filter_resp() and _cached_response() already call the
-    # helper on their header dicts, but a few response paths (WAF retry
-    # fallback, last-resort re-fetch, hook-set bodies) build ctx.resp_headers
-    # without going through filter_resp — this catch-all guarantees the
-    # isolation headers reach the wire on EVERY top-level HTML response,
-    # regardless of how the body was produced. Idempotent: a response that
-    # already carries COOP/COEP (origin's own choice) is left untouched.
-    # v8.5 — Apply on EVERY response (not just top-level HTML). Workers
-    # inherit crossOriginIsolated from the SCRIPT RESPONSE's COEP, not
-    # the parent document — so JS responses served via this catch-all
-    # (WAF-retry bodies, hook-set JS, etc) also need COEP.
-    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker. The is_top_level_html=True is
-    # safe to pass for non-HTML responses too: the heuristic inside
-    # _apply_isolation_headers checks body content, not just the flag.
-    _apply_isolation_headers(resp.headers, body, is_top_level_html=True,
-                             is_worker_script=_is_worker_request())
+    # COOP/COEP are passive now (see filter_resp) — whatever ctx.resp_headers
+    # already carries (origin's own choice, or the top-level-HTML heuristic
+    # fallback) is the final answer; no flag to re-check here.
     _apply_security_headers(resp.headers)
 
     is_html_resp = "text/html" in ctx.resp_ct
@@ -10048,12 +9809,6 @@ def _conditional_304(lp: str, ct: str) -> Response | None:
     # A 304 updates the stored response's freshness — keep revalidating.
     resp.headers["Cache-Control"] = "no-cache"
     _apply_cors_headers(resp.headers)
-    # v8.5: 304 responses for Workers still need COOP/COEP — the Worker's
-    # crossOriginIsolated flag is set from the response headers, which
-    # for a 304 means the cached copy + the headers carried by the 304.
-    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
-    _apply_isolation_headers(resp.headers,
-                             is_worker_script=_is_worker_request())
     _apply_security_headers(resp.headers)
     return resp
 
@@ -10126,11 +9881,6 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = str(len(_slice))
     _apply_cors_headers(resp.headers)
-    # v8.5: range responses (Workers fetching partial script bytes) also
-    # need COOP/COEP for the Worker to be crossOriginIsolated.
-    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
-    _apply_isolation_headers(resp.headers,
-                             is_worker_script=_is_worker_request())
     _apply_security_headers(resp.headers)
     log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} 206 [{_fmt_size(len(_slice))}]", "←")
     _gui_push_raw(method, req_path, 206, ct, _slice,
@@ -10225,34 +9975,6 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
     log(f"{method} HIT {_fmt_host(urlparse(target).netloc)}{req_path} {_fmt_size(len(data))}", "←")
     _is_static = not (ct.startswith("text/html") or "json" in ct)
     _val = _disk_validators(lp) if _is_static else None
-    _is_html_cached = ct.startswith("text/html")
-    _hdrs: dict = {
-        # HTML + JSON: never cache at browser level (multi-site on same origin,
-        # and JSON API responses must always be fresh — caching them for 24h
-        # freezes SPA data and causes stale-state render failures).
-        # Static assets (JS/CSS/images/fonts): STORE but always REVALIDATE —
-        # the old "public, max-age=86400" let the browser serve its own copy
-        # for 24h without contacting S2L, so user edits/deletions of the
-        # mirrored files were invisible (“game still loads after the assets
-        # folder was deleted”). With no-cache + ETag/Last-Modified the check
-        # is a fast 304 and disk edits go live on the next reload.
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
-                         if not _is_static
-                         else "no-cache",
-        **({"ETag": _val[0], "Last-Modified": _val[1]} if _val else {}),
-    }
-    # v8.2 — COOP/COEP must be present on cached HTML responses too, or
-    # cross-origin-isolated apps (SharedArrayBuffer/WASM-threaded game
-    # clients) lose SAB on the very first reload from disk and freeze
-    # — the user's "delete site_src to fix" symptom. filter_resp()
-    # applies this on the online path; we mirror it here for cache hits.
-    # v8.5 — also apply on non-HTML cached responses (JS/CSS/etc).
-    # Workers inherit crossOriginIsolated from the script response's
-    # COEP, not from the parent document — so cached JS files need
-    # COEP too, or Workers can't use SharedArrayBuffer.
-    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
-    _apply_isolation_headers(_hdrs, data, is_top_level_html=_is_html_cached,
-                             is_worker_script=_is_worker_request())
     ctx = HookContext(
         method       = method,
         url          = target,
@@ -10261,7 +9983,21 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
         req_headers  = filter_fwd(dict(flask_request.headers)),
         req_body     = b"",
         resp_status  = 200,
-        resp_headers = _hdrs,
+        resp_headers = {
+            # HTML + JSON: never cache at browser level (multi-site on same origin,
+            # and JSON API responses must always be fresh — caching them for 24h
+            # freezes SPA data and causes stale-state render failures).
+            # Static assets (JS/CSS/images/fonts): STORE but always REVALIDATE —
+            # the old "public, max-age=86400" let the browser serve its own copy
+            # for 24h without contacting S2L, so user edits/deletions of the
+            # mirrored files were invisible (“game still loads after the assets
+            # folder was deleted”). With no-cache + ETag/Last-Modified the check
+            # is a fast 304 and disk edits go live on the next reload.
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                             if not _is_static
+                             else "no-cache",
+            **({"ETag": _val[0], "Last-Modified": _val[1]} if _val else {}),
+        },
         resp_body    = data,
         resp_ct      = ct,
     )
@@ -11591,12 +11327,6 @@ def ext_asset(extpath: str) -> Response:
                     resp.headers["ETag"] = _val[0]
                     resp.headers["Last-Modified"] = _val[1]
             _apply_cors_headers(resp.headers)
-            # v8.5 — ext_asset cache-hit responses also need COOP/COEP for
-            # Workers to be crossOriginIsolated.
-            # v8.6: on-demand — only when HTML body has markers OR
-            # Sec-Fetch-Dest: worker.
-            _apply_isolation_headers(resp.headers,
-                                     is_worker_script=_is_worker_request())
             _apply_security_headers(resp.headers)
             return resp
     if OFFLINE:
@@ -11909,42 +11639,19 @@ def proxy(path: str) -> Response:
         stats.inc("hooks_run", _run_hooks(_REQ_HOOKS, ctx))
 
     # Decide whether to use stream=True for the upstream request.
-    # stream=True is needed for: Range requests (audio/video 206), URLs
-    # whose extension suggests streamable content (video/audio/wasm/large bin),
-    # AND Server-Sent Events endpoints (text/event-stream).
-    #
-    # SSE is enabled by default: the browser's EventSource() always sends
-    # "Accept: text/event-stream" on the request — that's a perfect pre-flight
-    # signal that we MUST use stream=True, otherwise curl_cffi refuses to
-    # iterate ("stream mode is not enabled") and the SSE streamer emits the
-    # "SSE upstream stream error ... stream mode is not enabled" warning on
-    # every request. We also catch common SSE URL patterns for clients that
-    # omit the Accept header (older polyfills, fetch()-based consumers).
+    # stream=True is needed for: Range requests (audio/video 206), and URLs
+    # whose extension suggests streamable content (video/audio/wasm/large bin).
+    # For everything else (HTML/CSS/JS/JSON/fonts/images), stream=False is
+    # more reliable — curl_cffi's HTTP/2 stream mode can return empty bytes
+    # for small static files, causing the "Stream-mode empty body" warnings
+    # and forcing an expensive re-fetch.
     _req_ext = os.path.splitext(urlparse(target).path)[1].lower()
     _looks_streamable = _req_ext in (
         ".mp4", ".webm", ".ogg", ".ogv", ".mpeg", ".mp2t", ".m3u8",
         ".mp3", ".m4a", ".aac", ".wav", ".opus",
         ".wasm", ".zip", ".tar", ".gz", ".tgz", ".bz2",
     )
-    # Pre-detect SSE so stream=True is used on the FIRST request, avoiding
-    # the "stream mode is not enabled" warning + a re-fetch round-trip.
-    _browser_accept = (flask_request.headers.get("Accept", "") or "").lower()
-    _req_path_lower = (urlparse(target).path or "").lower()
-    _url_looks_sse = (
-        _req_path_lower.endswith((
-            "/sse", "/events", "/event-stream", "/eventstream",
-            "/stream", "/live", "/updates", "/subscribe",
-            "/realtime", "/push", "/listen", "/feed",
-        ))
-        or any(_seg in _req_path_lower for _seg in (
-            "/sse/", "/events/", "/stream/", "/live/",
-            "/realtime/", "/updates/",
-        ))
-        or _req_ext in (".sse", ".event-stream", ".eventstream")
-    )
-    _looks_sse = ("text/event-stream" in _browser_accept) or _url_looks_sse
-    _do_stream = (method in _SAFE_METHODS
-                  and (_has_range or _looks_streamable or _looks_sse))
+    _do_stream = method in _SAFE_METHODS and (_has_range or _looks_streamable)
 
     try:
         upstream_r = _do_upstream(method, target, ctx, stream=_do_stream)
@@ -12065,35 +11772,6 @@ def proxy(path: str) -> Response:
     # SSE: detect text/event-stream and use the dedicated SSE streamer
     # which re-buffers to event boundaries and injects keepalives.
     if SSE_PROXY and _is_sse_response(_real_ct) and method in _SAFE_METHODS:
-        # Safety net: if the upstream request was made with stream=False
-        # (URL didn't match SSE heuristics but upstream still returned
-        # text/event-stream), iter_content() would refuse to iterate and the
-        # SSE streamer would emit "stream mode is not enabled" warnings.
-        # Re-fetch once with stream=True so the SSE streamer has a real
-        # stream to consume. Guarded by a thread-local flag to prevent
-        # recursion if the re-fetch also returns SSE.
-        if not _do_stream and not getattr(_proxy_local, "in_sse_refetch", False):
-            try:
-                _proxy_local.in_sse_refetch = True
-                _sse_r = _do_upstream(method, target, ctx, stream=True)
-                if (_sse_r is not None
-                        and _sse_r.status_code == upstream_r.status_code):
-                    log(f"SSE re-fetch with stream=True OK: {req_path}", "INFO")
-                    try: upstream_r.close()
-                    except Exception: pass
-                    upstream_r = _sse_r
-                else:
-                    if _sse_r is not None:
-                        try: _sse_r.close()
-                        except Exception: pass
-                    log(f"SSE re-fetch returned unexpected status "
-                        f"(got {_sse_r.status_code if _sse_r is not None else 'None'}, "
-                        f"expected {upstream_r.status_code}) on {req_path} — "
-                        f"keeping non-streamed response", "WARN")
-            except Exception as e:
-                log(f"SSE re-fetch failed on {req_path}: {_short_exc(e)}", "WARN")
-            finally:
-                _proxy_local.in_sse_refetch = False
         return _stream_sse_resp(upstream_r, method, target)
     # Streaming hand-off: if we fetched with stream=True AND the response is
     # streamable content (audio/video/large binary) OR a 206 Partial Content
@@ -12363,12 +12041,6 @@ def proxy(path: str) -> Response:
                         return _c304
                     resp = Response(cdn_data, content_type=_cdn_ct)
                     _apply_cors_headers(resp.headers)
-                    # v8.5 — CDN cache-hit (main proxy route) needs COOP/COEP
-                    # for Workers to be crossOriginIsolated.
-                    # v8.6: on-demand — only when HTML body has markers OR
-                    # Sec-Fetch-Dest: worker.
-                    _apply_isolation_headers(resp.headers,
-                                             is_worker_script=_is_worker_request())
                     _apply_security_headers(resp.headers)
                     if _cdn_ct.startswith("text/html") or "json" in _cdn_ct:
                         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -12657,10 +12329,6 @@ def _banner() -> None:
     if WS_AUTO_RECONNECT:     flags.append(f"{G}ws-reconnect{R}")
     if SSE_PROXY:             flags.append(f"{C}sse{R}")
     if SSE_HEARTBEAT > 0:     flags.append(f"{C}sse-hb:{SSE_HEARTBEAT}s{R}")
-    if STREAM_CACHE_MAX_BYTES > 0:
-        flags.append(f"{C}stream-cache:{_fmt_size(STREAM_CACHE_MAX_BYTES)}{R}")
-    else:
-        flags.append(f"{Y}stream-cache:off{R}")
     if _CURL_CFFI_OK:         flags.append(f"{C}h2{R}")
     if TCP_TUNNEL:            flags.append(f"{M}tcp-tunnel{R}")
     if UDP_TUNNEL:            flags.append(f"{M}udp-tunnel{R}")
