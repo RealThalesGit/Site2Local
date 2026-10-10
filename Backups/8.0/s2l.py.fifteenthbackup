@@ -159,7 +159,6 @@ _LEVEL_COLOR: dict[str, str] = {
     # Style.RESET_ALL in log() still clears it at the end of the line.
     "CAPTURE": "\x1b[38;2;119;41;83m",       # HTTP capture written to disk
 }
-_CACHE_HIT_MARKER = f"{_LEVEL_COLOR['←']}[←]{Style.RESET_ALL}"
 
 def _lolcat_internal(text: str) -> str:
     """Palette-cycling fallback used when the real `lolcat` binary isn't
@@ -258,7 +257,7 @@ def log(msg: str, level: str = "INFO") -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-SITE = "poki.com"   # target domain or URL
+SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
@@ -273,10 +272,10 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = 256 * 1024        # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = False                   # crawl at startup; False = proxy-on-demand only
+CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
-DUMP_ALL = True               # extract + crawl every URL found in any response body
+DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
@@ -316,12 +315,22 @@ WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /_
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 WS_PING_INTERVAL    = 0        # seconds between WS keepalive pings (0 = off).
-                                # Sending a ping can race with a blocked receive
-                                # on the same curl_cffi handle and corrupt its
-                                # internal buffers. Pong timeouts can also close
-                                # tunnels when a pong is auto-consumed or merged
-                                # with other frames. Keep disabled by default;
-                                # enable only if the application has no heartbeat.
+                                # OFF by default (was 20 — caused constant drops in
+                                # realtime apps like Discord voice calls):
+                                #   1) on the curl_cffi upstream path, send(PING)
+                                #      from this thread races a blocked recv() on
+                                #      the SAME easy handle → internal buffer
+                                #      corruption → zlib-stream gateways (Discord
+                                #      IS zlib-stream) desync with "invalid stored
+                                #      block lengths" → the app closes the socket;
+                                #   2) the pong-window check tears tunnels down on
+                                #      false positives when a pong is auto-consumed
+                                #      or merged with other frames.
+                                # Realtime apps drive their own app-level
+                                # heartbeats (Discord ≈ every 41s), which keep NAT
+                                # mappings warm AND detect real death — the proxy
+                                # relay sees the close and tears down cleanly.
+                                # Opt-in only for apps with NO heartbeat at all.
 WS_PONG_TIMEOUT     = 15       # seconds to wait for a pong after a ping before
                                 # declaring the upstream dead (only used when
                                 # WS_PING_INTERVAL > 0; must be < WS_PING_INTERVAL
@@ -344,9 +353,9 @@ GRACEFUL_SHUTDOWN   = True     # drain in-flight requests on SIGTERM
 # streaming a response so it can ALSO be cached to disk after the stream
 # finishes. Bodies larger than this are still streamed to the browser, but
 # NOT cached to disk — prevents OOM on huge video/download streams.
-# Default: 256 MB. Set to 0 to disable stream-to-disk caching entirely
+# Default: 64 MB. Set to 0 to disable stream-to-disk caching entirely
 # (every stream is forwarded and forgotten, never written to site_src).
-STREAM_CACHE_MAX_BYTES = 256 * 1024 * 1024   # 256 MB
+STREAM_CACHE_MAX_BYTES = 64 * 1024 * 1024   # 64 MB
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Filters / constants
@@ -3407,36 +3416,6 @@ def resolve_mime(lp: str) -> str:
     """
     return guess_mime(lp)
 
-
-def _resolve_mime_with_sniff(lp: str, data: bytes | None = None) -> str:
-    """Resolve a MIME type for a cached file, sniffing HTML for no-ext files.
-
-    Per the 09/10 spec: for files WITHOUT an extension (the new
-    ``asset/?id=N`` layout), identify HTML by content and serve as
-    ``text/html``; everything else is ``application/octet-stream``.
-    Files WITH an extension use ``guess_mime(lp)`` as before.
-
-    Only the first 512 bytes are read when ``data`` is None — the HTML
-    check (``_is_valid_html``) only looks at the first 512 bytes, so
-    reading more would waste memory when many large binary assets are
-    processed concurrently.
-    """
-    has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
-    looks_html = lp.endswith(".html") or lp.endswith("/index.html")
-    if has_ext or looks_html:
-        return guess_mime(lp)
-    # Extensionless file — sniff HTML only (spec: "rest → octet-stream").
-    if data is None:
-        try:
-            with open(lp, "rb") as f:
-                data = f.read(512)   # head only — never read the full file here
-        except OSError:
-            return "application/octet-stream"
-    if _is_valid_html(data) and not _is_wire_payload(data):
-        return "text/html; charset=utf-8"
-    return "application/octet-stream"
-
-
 def is_static_asset(ct: str) -> bool:
     """Dynamic check: is this a static asset (CSS/JS/font/image/audio/video/wasm)?
 
@@ -3601,8 +3580,8 @@ def _flatten_cookiejar(cookies_obj, prefer_host: str = "") -> dict:
 def _needs_isolation(body: bytes) -> bool:
     """Heuristic: does this HTML look like it needs Cross-Origin isolation?
 
-    Applications that use SharedArrayBuffer / WASM threads need COOP+COEP on
-    the top-level document
+    Sites that use SharedArrayBuffer / WASM threads (browser-based game
+    clients are the canonical case) need COOP+COEP on the top-level document
     or the browser silently refuses to hand them a working SharedArrayBuffer
     — the app initializes just far enough to paint its background/canvas and
     then hangs forever waiting on a threading primitive that was never
@@ -3614,19 +3593,23 @@ def _needs_isolation(body: bytes) -> bool:
     """
     if not body:
         return False
-    head = body[:65536].lower()
-    has_sab = b"sharedarraybuffer" in head
-    has_atomics = b"atomics.wait" in head
-    has_worker = b"new worker(" in head and b"postmessage" in head
-    # Some clients explicitly fail startup when cross-origin isolation is off.
-    has_xorigin_check = (
-        b"crossoriginisolated" in head
-        or b"cross-origin isolation is required" in head
-        or b"cross origin isolation is required" in head
-        or (b"coop" in head and b"coep" in head
-            and b"cross-origin isolation" in head)
-    )
-    # A .wasm reference alone does not imply that isolation is required.
+    head = body[:65536]
+    has_sab = b"SharedArrayBuffer" in head
+    has_atomics = b"Atomics.wait" in head
+    has_worker = b"new Worker(" in head and b"postMessage" in head
+    # v8.3 — also detect EXPLICIT cross-origin-isolation checks. Many
+    # WASM-threaded web clients gate their boot on
+    # `if (!self.crossOriginIsolated) throw new Error("Cross-origin isolation
+    # is required...")`. The check itself is the most reliable marker that
+    # the page NEEDS the headers — better signal than SAB/Atomics (which
+    # usually live in a lazy-loaded chunk that's NOT in the first 64KB of
+    # the HTML, so the heuristic misses them on real-world SPAs).
+    has_xorigin_check = b"crossOriginIsolated" in head
+    # A bare .wasm reference is NOT a strong enough signal — many sites load
+    # WASM without needing threads/cross-origin isolation. Requiring COEP for
+    # them blocks all cross-origin sub-resources (analytics, fonts, ads) that
+    # don't send CORP headers. Only trigger if WASM co-occurs with a threading
+    # primitive, or if SAB/Atomics/Worker+postMessage is present on its own.
     has_wasm = b".wasm" in head
     return (has_sab or has_atomics or has_xorigin_check
             or (has_worker and (has_wasm or has_sab)))
@@ -3806,9 +3789,11 @@ def _apply_security_headers(out, body: bytes = b"",
     """Add safe HTTP security headers in addition to COOP/COEP.
 
     These complement the cross-origin isolation headers (COOP/COEP/CORP) that
-    filter_resp() already sets. X-Content-Type-Options is enforced as
-    ``nosniff``; Referrer-Policy is added when absent. Both are safe for the
-    proxy and harden responses without blocking proxy functionality:
+    filter_resp() already sets. Each header is only added when the response
+    doesn't already carry one (case-insensitive key check via _ci_header_keys),
+    so an origin that sent its own value through the passive path keeps its
+    choice. The headers added here are universally safe for a local proxy —
+    they harden the response without blocking any proxy feature:
 
       • X-Content-Type-Options: nosniff — prevents MIME-sniffing attacks where
         a browser interprets a text/plain response as HTML/JS. Universal best
@@ -3818,8 +3803,8 @@ def _apply_security_headers(out, body: bytes = b"",
         cross-origin (HTTPS→HTTPS), and no Referer for HTTPS→HTTP. Safe to set
         explicitly so sites that rely on a specific referrer behavior get a
         predictable one even when their own header was stripped.
-      • Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy — applied
-        only when the document/worker needs cross-origin isolation.
+      • Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy — left to
+        filter_resp()'s existing _needs_isolation() heuristic.
 
     Headers deliberately NOT added here (they would break proxy functionality):
       • Content-Security-Policy — would block our injected service-worker
@@ -3833,9 +3818,9 @@ def _apply_security_headers(out, body: bytes = b"",
     werkzeug Headers object (resp.headers). _ci_header_keys() handles the
     iteration difference (Headers.__iter__ yields tuples in some versions).
     """
-    _ci_remove_header(out, "X-Content-Type-Options")
-    out["X-Content-Type-Options"] = "nosniff"
     _existing = _ci_header_keys(out)
+    if "x-content-type-options" not in _existing:
+        out["X-Content-Type-Options"] = "nosniff"
     if "referrer-policy" not in _existing:
         out["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
@@ -3862,30 +3847,18 @@ def _is_worker_request() -> bool:
         return False
 
 
-def _is_document_request() -> bool:
-    """Detect a top-level browser navigation that must establish isolation."""
-    try:
-        if not flask_request:
-            return False
-        _dest = (flask_request.headers.get("Sec-Fetch-Dest", "") or "").lower()
-        if _dest == "document":
-            return True
-        _mode = (flask_request.headers.get("Sec-Fetch-Mode", "") or "").lower()
-        _accept = (flask_request.headers.get("Accept", "") or "").lower()
-        return _mode == "navigate" and "text/html" in _accept
-    except (RuntimeError, AttributeError):
-        return False
-
-
 def _apply_isolation_headers(out, body: bytes = b"",
                              is_top_level_html: bool = False,
                              is_worker_script: bool = False) -> None:
-    """Inject COOP/COEP on document navigations and Worker responses.
+    """Inject COOP/COEP on responses, on-demand.
 
-    Two paths trigger isolation:
+    COOP/COEP are delivered ONLY when the response actually needs them —
+    not on every response. Two detection paths (both checked here):
 
-      1. Top-level HTML document navigations. Runtime isolation checks are
-         often in a separately loaded script and absent from cached HTML.
+      1. Top-level HTML whose body has SAB / Atomics / Worker+WASM /
+         `crossOriginIsolated` markers (heuristic in _needs_isolation).
+         Catches SPAs that inline the cross-origin-isolation check in
+         their HTML entry point.
 
       2. Worker script responses — detected via the `is_worker_script`
          parameter, set by callers that inspect Sec-Fetch-Dest: worker.
@@ -3894,36 +3867,43 @@ def _apply_isolation_headers(out, body: bytes = b"",
          inherit crossOriginIsolated from the parent. Sites that don't
          use Workers pay zero overhead.
 
-    COEP value is `require-corp`, as required by the affected runtime.
+    COEP value is hardcoded to `require-corp` — the value game clients
+    explicitly check for. S2L already serves CORP: cross-origin on every
+    response, so `require-corp` works without per-site config.
 
-    Idempotent — responses that need isolation receive the complete,
-    compatible pair even if the origin supplied only one header or supplied
-    a value that does not enable cross-origin isolation.
+    Idempotent — preserves origin's own COOP/COEP values verbatim.
 
     Centralized here so the SAME behavior applies on every response path
     (online filter_resp, cache-hit _cached_response, _make_flask_resp
     safety net, _stream_resp, CDN mini-server, ext_asset route).
     """
-    # Document navigations always get the pair. Body inspection remains a
-    # fallback for HTML responses in clients without Fetch Metadata headers.
-    _html_needs_isolation = bool(
-        is_top_level_html
-        and (_is_document_request() or (body and _needs_isolation(body))))
-    # Worker responses need COEP so the Worker can inherit
-    # crossOriginIsolated from its parent.
-    _should_apply = _html_needs_isolation or is_worker_script
+    # On-demand mode: only apply when detection fires.
+    _should_apply = False
+    if is_top_level_html and body and _needs_isolation(body):
+        # Path 1: HTML body has explicit isolation markers.
+        _should_apply = True
+    if is_worker_script:
+        # Path 2: request carries Sec-Fetch-Dest: worker / sharedworker.
+        # The browser is fetching a Worker script — apply COEP so the
+        # Worker can inherit crossOriginIsolated from its parent.
+        _should_apply = True
     if not _should_apply:
         return
-    if _html_needs_isolation:
-        _ci_remove_header(out, "Cross-Origin-Opener-Policy")
-        out["Cross-Origin-Opener-Policy"] = "same-origin"
-    if _should_apply:
-        _ci_remove_header(out, "Cross-Origin-Embedder-Policy")
-        out["Cross-Origin-Embedder-Policy"] = "require-corp"
+    _existing = _ci_header_keys(out)
+    if ("cross-origin-opener-policy" in _existing
+            or "cross-origin-embedder-policy" in _existing):
+        return
+    out["Cross-Origin-Opener-Policy"]   = "same-origin"
+    out["Cross-Origin-Embedder-Policy"] = "require-corp"
 
 
 def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
     # Strip security headers that block our local proxy, plus hop-by-hop headers.
+    # NOTE: Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy are
+    # deliberately NOT in this skip-set — they're PASSIVE now (see below).
+    # The origin's own COOP/COEP choice flows through untouched, and we only
+    # ADD safe defaults on top-level HTML that looks like it needs isolation
+    # but wasn't sent any. No flag to remember to flip per site.
     skip = _HOP_BY_HOP | {
         "content-encoding",
         "content-security-policy", "content-security-policy-report-only",
@@ -3953,8 +3933,26 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
     # Wildcard "*" blocks credentialed requests, so _apply_cors_headers only
     # uses it when no Origin header is present.
     _apply_cors_headers(out)
+    # COOP/COEP are PASSIVE: the origin's own headers (kept above, since they're
+    # not in `skip`) flow through untouched. The one thing we add proactively
+    # is a safety net for the top-level HTML document: if the origin needed
+    # isolation but didn't send the headers (common when the isolation was
+    # coming from a static host's own server config rather than the app
+    # itself), auto-apply the least-disruptive pair only there.
+    # v8.2: extracted to _apply_isolation_headers() so the SAME heuristic can
+    # be re-applied on cache-hit paths (offline mode, dead upstream) — without
+    # it, the cached 200 silently loses COOP/COEP, SharedArrayBuffer goes
+    # missing on reload, and the page freezes (the user's "delete site_src/"
+    # workaround). filter_resp() here is the online path; cache hits call
+    # the helper from _cached_response() / _make_flask_resp().
+    # v8.6: on-demand isolation. COOP/COEP applied only when:
+    #   - top-level HTML body has SAB/crossOriginIsolated markers, OR
+    #   - this is a Worker script fetch (Sec-Fetch-Dest: worker).
     _apply_isolation_headers(out, body, is_top_level_html,
                              is_worker_script=_is_worker_request())
+    # Additional safe security headers (X-Content-Type-Options, Referrer-Policy)
+    # — added when not already present. See _apply_security_headers() docstring
+    # for the rationale on which headers are/aren't safe to set on a proxy.
     _apply_security_headers(out, body, is_top_level_html)
     if "Set-Cookie" in out:
         # Determine if the request came in over HTTPS or from localhost.
@@ -3994,21 +3992,6 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
         else:
             out["Set-Cookie"] = _rewrite_cookie(cookie_val)
     return out
-
-
-def _finalize_security_headers(response: Response) -> Response:
-    """Apply the proxy's baseline security headers to every Flask response."""
-    _apply_security_headers(response.headers)
-    _is_html = response.mimetype == "text/html"
-    _body = b""
-    if _is_html and not response.is_streamed:
-        _body = response.get_data()
-    _apply_isolation_headers(
-        response.headers, _body,
-        is_top_level_html=_is_html,
-        is_worker_script=_is_worker_request(),
-    )
-    return response
 
 # ──────────────────────────────────────────────────────────────────────────────
 # General utils
@@ -4876,213 +4859,8 @@ def _safe_seg(name: str) -> str:
     h = hashlib.sha1(name.encode()).hexdigest()[:12]
     return f"{base[:32]}_{h}{ext}"
 
-def _sanitize_query_for_filename(qs: str) -> str:
-    """Make a query string safe to embed in a filename while keeping it readable.
-
-    Keeps alphanumerics, dots, hyphens and the ``=`` sign so the original
-    ``id=N`` shape survives (the whole point of the new naming is to make
-    cached query-string files identifiable at a glance). Everything else
-    (spaces, ``&``, ``/``, ``?``, ``%``, control chars, HTML break-through
-    characters) is collapsed to ``_``. Long queries are truncated and a
-    short sha1 suffix is appended so two different long queries that happen
-    to share the first ~80 chars still cache as distinct files.
-    """
-    safe = re.sub(r"[^\w.\-=]", "_", qs)
-    # MAX_FNAME minus headroom for prefix ("base_="), device suffix
-    # ("__s2l_mobile") and extension (".js"/".html").
-    if len(safe) > MAX_FNAME - 24:
-        safe = safe[:80] + "_" + hashlib.sha1(qs.encode()).hexdigest()[:12]
-    return safe
-
-
-def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
-    """Compute LEGACY on-disk cache paths for a URL — used only for migration.
-
-    Two prior naming schemes are recognised so existing caches keep working
-    after the query-string rename:
-
-    1. ``_q<sha1[:10]>`` suffix (the immediately-previous scheme):
-       * with extension + query  → ``a/b_q<hash>.js``
-       * no extension + query    → ``a/index_q<hash>.html``
-         (the old code unconditionally appended ``/index.html`` before
-         hashing, so the segment became ``index_q<hash>.html`` inside the
-         path-named folder).
-
-    2. ``<last_seg>_=<query>.html`` (the scheme before that, only ever
-       produced for no-extension + query URLs — e.g. ``v1/asset?id=N``
-       → ``v1/asset_=id=N.html``). Listed second so the newer format is
-       preferred when both somehow exist.
-
-    The optional ``device`` tag is applied to the legacy filename exactly
-    as ``local_path()`` would have done at the time, so a device-variant
-    legacy cache migrates to the device-variant new path.
-    """
-    p = urlparse(normalize_url(u))
-    path = p.path or "/"
-    host_dir = p.netloc.split("@")[-1].split(":")[0]
-    host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
-    if not p.query:
-        return []
-
-    qs_hash = hashlib.sha1(p.query.encode()).hexdigest()[:10]
-    qs_safe = _sanitize_query_for_filename(p.query)
-    has_ext = bool(os.path.splitext(path)[1]) and not path.endswith("/")
-    legacy: list[str] = []
-
-    if has_ext:
-        # ── Legacy-1 only (no legacy-2 ever existed for extension+query) ──
-        path_clean = path.rstrip("/")
-        parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-        last = parts[-1]
-        base, ext = os.path.splitext(last)
-        parts[-1] = f"{base}_q{qs_hash}{ext}"
-        if device and parts:
-            b, e = os.path.splitext(parts[-1])
-            parts[-1] = f"{b}__s2l_{device}{e}"
-        legacy.append(os.path.join(SRC_FOLDER, host_dir, *parts))
-        return legacy
-
-    # ── No-extension + query: two legacy layouts to try ──
-    path_clean = path.rstrip("/")
-    raw_parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-    last_seg = raw_parts[-1] if raw_parts else "index"
-
-    # Legacy-1: <path>/index_q<hash>.html
-    idx_parts = raw_parts + ["index.html"]
-    b, e = os.path.splitext(idx_parts[-1])
-    idx_parts[-1] = f"{b}_q{qs_hash}{e}"
-    if device and idx_parts:
-        b2, e2 = os.path.splitext(idx_parts[-1])
-        idx_parts[-1] = f"{b2}__s2l_{device}{e2}"
-    legacy.append(os.path.join(SRC_FOLDER, host_dir, *idx_parts))
-
-    # Legacy-2: <path_dir>/<last_seg>_=<query>.html
-    legacy2_name = f"{last_seg}_={qs_safe}.html"
-    if device:
-        legacy2_name = f"{last_seg}_={qs_safe}__s2l_{device}.html"
-    legacy2_dir_parts = raw_parts[:-1]  # parent directory of last_seg
-    if legacy2_dir_parts:
-        legacy.append(os.path.join(SRC_FOLDER, host_dir, *legacy2_dir_parts, legacy2_name))
-    else:
-        legacy.append(os.path.join(SRC_FOLDER, host_dir, legacy2_name))
-
-    return legacy
-
-
-# In-memory cache of paths that have ALREADY been checked for migration.
-# Without this, every local_path() call (16× per request × 150 concurrent
-# requests = 2400 calls) would do an os.path.isfile() stat on the new path
-# AND on each legacy path — a torrent of stat calls that alone can saturate
-# the FS and cause request timeouts (ERR_CONNECTION_*).
-#
-# The set is capped; when it exceeds _MIGRATION_CHECKED_MAX we clear it and
-# start over. A clear is safe — worst case, a few stat calls are repeated.
-_migration_checked: set[str] = set()
-_migration_checked_lock = threading.Lock()
-_MIGRATION_CHECKED_MAX = 50000
-
-
-def _migrate_legacy_cache(u: str, new_lp: str, device: str = "") -> str:
-    """Auto-migrate an old cache file to the new naming on first request.
-
-    Called from ``local_path()`` as a side effect. Three tiers:
-
-    1. **TIER 1 (hottest)**: ``new_lp`` is in the in-memory
-       ``_migration_checked`` set → return immediately. Zero stat calls.
-       This is the steady state after the first request for each URL.
-
-    2. **TIER 2**: ``new_lp`` is on disk (file exists) → add to the set
-       and return. One stat call.
-
-    3. **TIER 3 (cold)**: neither — check legacy paths and atomically
-       rename the first one found. Uses ``os.rename`` (lock-free, atomic
-       on same filesystem). If two threads race, one wins and the other
-       gets ``OSError`` (caught). No global lock needed — this is the
-       key fix for the lock-contention bug that serialised all 150+
-       concurrent asset requests under a single threading.Lock.
-    """
-    # TIER 1: in-memory cache (amortised zero-cost after first request).
-    if new_lp in _migration_checked:
-        return new_lp
-
-    # TIER 2: file already on disk.
-    try:
-        if os.path.isfile(new_lp):
-            with _migration_checked_lock:
-                _migration_checked.add(new_lp)
-                if len(_migration_checked) > _MIGRATION_CHECKED_MAX:
-                    _migration_checked.clear()
-                    _migration_checked.add(new_lp)
-            return new_lp
-    except OSError:
-        with _migration_checked_lock:
-            _migration_checked.add(new_lp)
-        return new_lp
-
-    # TIER 3: check legacy paths and try atomic rename (no lock).
-    for legacy in _legacy_cache_paths(u, device):
-        if not os.path.isfile(legacy):
-            continue
-        try:
-            os.makedirs(os.path.dirname(new_lp) or ".", exist_ok=True)
-            # os.rename is atomic on same filesystem — if two threads race,
-            # one succeeds and the other gets OSError (caught below).
-            os.rename(legacy, new_lp)
-            log(f"Cache migrated: {os.path.relpath(legacy)} → {os.path.relpath(new_lp)}", "INFO")
-            with _migration_checked_lock:
-                _migration_checked.add(new_lp)
-            return new_lp
-        except OSError:
-            # Another thread may have just migrated (FileExistsError), or
-            # cross-filesystem (EXDEV — fall back to shutil.move), or the
-            # legacy file was deleted between our isfile check and rename.
-            try:
-                if os.path.isfile(new_lp):
-                    # Another thread won the race — we're done.
-                    with _migration_checked_lock:
-                        _migration_checked.add(new_lp)
-                    return new_lp
-                # Cross-filesystem fallback (rare — SRC_FOLDER is one tree).
-                shutil.move(legacy, new_lp)
-                log(f"Cache migrated (shutil): {os.path.relpath(legacy)} → {os.path.relpath(new_lp)}", "INFO")
-                with _migration_checked_lock:
-                    _migration_checked.add(new_lp)
-                return new_lp
-            except OSError:
-                continue
-
-    # No legacy file found — caller will fetch and write at new_lp.
-    with _migration_checked_lock:
-        _migration_checked.add(new_lp)
-    return new_lp
-
-
 def local_path(u: str, device: str = "") -> str:
     """Map a URL → its on-disk cache path.
-
-    Naming rules (the 09/10 cache rename):
-
-    * **No query string** — unchanged from before:
-        ``/a/b.js``      → ``host/a/b.js``
-        ``/a/`` or ``/a`` → ``host/a/index.html``
-
-    * **Path has an extension + query** — the query is appended verbatim
-      between ``_=`` and the real extension, so the file is human-readable
-      and the extension (hence MIME) is preserved:
-        ``/a/b.js?v=1.2`` → ``host/a/b_=v=1.2.js``
-      No hash, no .html fallback — the upstream extension wins.
-
-    * **Path has no extension + query** (binary endpoints such as
-      ``/v1/asset?id=N``) — the path becomes a directory and the query
-      string becomes the filename, with no extension added:
-        ``/v1/asset?id=N`` → ``host/v1/asset/id=N``
-      ``_serve_cached`` sniffs the file content to decide HTML vs
-      ``application/octet-stream`` because the on-disk path carries no
-      extension hint.
-
-    Legacy caches (``*_q<hash>*`` and ``<seg>_=<query>.html``) are
-    auto-migrated to the new layout on first request via
-    ``_migrate_legacy_cache()``.
 
     `device` is a VARIANT TAG from _device_variant() ("", "mobile",
     "tablet"). Non-empty tags suffix the filename (index.html →
@@ -5096,56 +4874,28 @@ def local_path(u: str, device: str = "") -> str:
     """
     p = urlparse(normalize_url(u))
     path = p.path or "/"
-    # ``splitext`` returns ('', '') for '/', ('/a/b', '') for '/a/b', and
-    # ('/a/b', '.js') for '/a/b.js'. A trailing '/' means "directory" → no
-    # extension. We deliberately check this BEFORE the no-query fallback
-    # so the three branches below are mutually exclusive.
-    has_ext = bool(os.path.splitext(path)[1]) and not path.endswith("/")
-
+    if path.endswith("/") or not os.path.splitext(path)[1]:
+        path = path.rstrip("/") + "/index.html"
+    parts = [_safe_seg(x) for x in path.split("/") if x]
+    # Include a query-string hash so URLs with different params (e.g. search
+    # queries, paginated APIs) are cached as separate files — prevents stale search results.
     if p.query:
-        if has_ext:
-            # ── extension + query → base_=<query>.ext ──
-            path_clean = path.rstrip("/")
-            parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-            last = parts[-1]
-            base, ext = os.path.splitext(last)
-            qs_safe = _sanitize_query_for_filename(p.query)
-            parts[-1] = f"{base}_={qs_safe}{ext}"
-        else:
-            # ── no extension + query → path-named folder + query-named file ──
-            # e.g. /v1/asset?id=N → host/v1/asset/id=N
-            path_clean = path.rstrip("/")
-            parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-            qs_safe = _sanitize_query_for_filename(p.query)
-            parts.append(qs_safe)
-    else:
-        # ── no query → unchanged from before ──
-        if path.endswith("/") or not os.path.splitext(path)[1]:
-            path = path.rstrip("/") + "/index.html"
-        parts = [_safe_seg(x) for x in path.split("/") if x]
-
-    # Device-variant suffix — applied AFTER the query handling, to EVERY
-    # file type. The __s2l_ prefix avoids colliding with real files. For
-    # no-extension files (the new "id=N" case) splitext returns ('', '')
-    # so we just append the tag with no extension — the result is still
-    # extensionless and _serve_cached's content sniff still kicks in.
+        qs_hash = hashlib.sha1(p.query.encode()).hexdigest()[:10]
+        last = parts[-1] if parts else "index.html"
+        base, ext = os.path.splitext(last)
+        ext = ext or ".html"
+        parts[-1] = f"{base}_q{qs_hash}{ext}"
+    # Device-variant suffix — applied AFTER the query hash, to EVERY file
+    # type (the __s2l_ prefix avoids colliding with real files).
     if device and parts:
         base, ext = os.path.splitext(parts[-1])
         parts[-1] = f"{base}__s2l_{device}{ext}"
-
     # Strip the port and only the "www." PREFIX (not all occurrences) from netloc.
     # Using .replace("www.", "") would mangle hosts like "mywww.example.com".
     # Stripping the port avoids ":" in directory names (invalid on Windows).
     host_dir = p.netloc.split("@")[-1].split(":")[0]   # strip user:pass@ and :port
     host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
-    new_lp = os.path.join(SRC_FOLDER, host_dir, *parts)
-
-    # Auto-migrate legacy caches (_q<hash> and <seg>_=<query>.html) on
-    # first request. Idempotent and fast-path-gated — when the new file
-    # already exists this is a single os.path.isfile() call.
-    _migrate_legacy_cache(u, new_lp, device)
-
-    return new_lp
+    return os.path.join(SRC_FOLDER, host_dir, *parts)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Site init
@@ -6103,10 +5853,6 @@ def _real_origin_for(incoming: str | None) -> str:
 def _start_cdn_server(cdn_host: str, port: int) -> None:
     cdn_app = Flask(f"cdn_{cdn_host}", static_folder=None)
 
-    @cdn_app.after_request
-    def _cdn_security_headers(response: Response) -> Response:
-        return _finalize_security_headers(response)
-
     @cdn_app.route("/", defaults={"p": ""}, methods=_ALL_METHODS)
     @cdn_app.route("/<path:p>",             methods=_ALL_METHODS)
     def _cdn_serve(p: str):
@@ -6166,15 +5912,15 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         # should still be served when offline.
         lp = local_path(cdn_url)
         if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
-            _c304 = _conditional_304(lp, _resolve_mime_with_sniff(lp))
+            _c304 = _conditional_304(lp, guess_mime(lp))
             if _c304 is not None:
                 stats.inc("cache_304")
-                log(f"{_CACHE_HIT_MARKER} {method} HIT 304 {_fmt_host(cdn_host)}/{p}", "CDN")
+                log(f"CDN {method} HIT 304 {_fmt_host(cdn_host)}/{p}", "CDN")
                 return _c304
             result = _serve_cached(lp)
             if result is not None:
                 data, ct = result
-                log(f"{_CACHE_HIT_MARKER} {method} HIT {_fmt_host(cdn_host)}/{p} {_fmt_size(len(data))}", "CDN")
+                log(f"CDN {method} HIT {_fmt_host(cdn_host)}/{p} {_fmt_size(len(data))}", "CDN")
                 resp = Response(data, content_type=ct)
                 if ct.startswith("text/html") or "json" in ct:
                     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -6185,6 +5931,11 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                         resp.headers["ETag"] = _val[0]
                         resp.headers["Last-Modified"] = _val[1]
                 _apply_cors_headers(resp.headers)
+                # v8.5 — CDN cache-hit responses also need COOP/COEP for
+                # Workers to be crossOriginIsolated (Workers inherit from
+                # the SCRIPT response, not the parent document).
+                # v8.6: on-demand — only when HTML body has markers OR
+                # this is a Worker script request (Sec-Fetch-Dest: worker).
                 _apply_isolation_headers(resp.headers,
                                          is_worker_script=_is_worker_request())
                 _apply_security_headers(resp.headers)
@@ -6232,8 +5983,8 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             # and _should_stream returns False for octet-stream when Content-Length
             # is unknown (cl=0) — so a 14.4MB WASM bundle with no extension would
             # be fully buffered in memory with a 12s timeout. The path-level check
-            # below catches common binary-resource path patterns so these
-            # responses always stream.
+            # below catches "wasm" / "builds" / "objects" patterns common to game
+            # CDNs so these always stream.
             _path_lower = "/" + p.lower()
             _looks_large_binary = (
                 "wasm" in _path_lower
@@ -6338,10 +6089,10 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if CAPTURE and CAPTURE_CDN:
                 _maybe_capture(ctx)
 
-            log(f"{method} {ctx.resp_status} {_fmt_host(cdn_host)}/{p} {_fmt_size(len(ctx.resp_body))} :{port}", "CDN")
+            log(f"CDN {method} {ctx.resp_status} {_fmt_host(cdn_host)}/{p} {_fmt_size(len(ctx.resp_body))} :{port}", "CDN")
             _gui_push_raw(method, f"/{p}", ctx.resp_status, ctx.resp_ct, ctx.resp_body,
                           display_tag=f"[CDN:{port}]", origin=_fmt_host(cdn_host),
-                          _skip_log=True)
+                          _skip_log=True)   # line 4702 already logged
             # Health tracking for the web viewer (per-host dot + RTT + requests).
             record_cdn_health(cdn_host, ctx.resp_status, int(r.elapsed.total_seconds()*1000))
             return Response(ctx.resp_body, status=ctx.resp_status, headers=ctx.resp_headers, content_type=ctx.resp_ct)
@@ -6373,7 +6124,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         # Port is now bound — register so JS injector can start routing here
         with _cdn_port_lock:
             _cdn_host_port[cdn_host] = port
-        log(f"{cdn_host} → :{port}", "CDN")
+        log(f"CDN {cdn_host} → :{port}", "CDN")
         try:
             server.serve_forever()
         except Exception as exc:
@@ -6484,10 +6235,20 @@ def _proxy_target(host: str, tail: str) -> str | None:
             port = _cdn_host_port.get(host_no_port, 0)
     if port > 0 and MULTIPORT:
         return f"http://{_request_hostname()}:{port}{tail}"
-    # Use the main port: /__s2l_ext__/<host>/<path> is routed by the main
-    # Flask app, while each CDN mini-server only proxies its own host.
-    # Using the current request's port can send rewritten cross-CDN URLs
-    # to a mini-server that cannot route them.
+    # MUST be absolute AND point to the MAIN port (PORT=8080), NOT the
+    # current request's port. /__s2l_ext__/<host>/<path> is only routed
+    # by the main Flask app on PORT — CDN mini-servers (port 8084, 8085,
+    # etc.) only proxy their own single CDN host, not arbitrary third
+    # parties. The previous version used _proxy_base() which returned the
+    # current Host header — when this function ran while serving a CDN
+    # port's HTML/CSS/JSON response (e.g. an iframe parent on
+    # localhost:8085), that produced "http://localhost:8085/__s2l_ext__/
+    # other-cdn.com/..." which 400'd because port 8085's Flask only
+    # proxies its own host. Symptom: nested iframe games (Poki's CDN
+    # d9916997-...gdn.poki.com iframe-parented from play.poki.com on
+    # another CDN port) returned "400 BAD REQUEST" / "invalid game"
+    # because the game's index.html fetch landed on the wrong Flask
+    # instance with the /__s2l_ext__/ prefix still in the path.
     return f"http://{_request_hostname()}:{PORT}{_EXT_PREFIX}/{host}{tail}"
 
 def _rewrite_json_urls(data: bytes) -> bytes:
@@ -7059,6 +6820,16 @@ def _fetch_external_asset(u: str) -> None:
                     save_queue.put((u, body, r.headers.get("Content-Type", ""), _effective_device()))
                 _register_cdn_host(netloc)
                 stats.inc("cdn_fetched")
+                log(f"CDN-bg fetch GET {r.status_code} {_fmt_host(netloc)}{urlparse(u).path} {_fmt_size(len(body))}", "CDN")
+                # Push to GUI traffic log so background CDN fetches appear in
+                # the Hook Inspector — they're real requests the user needs to
+                # see, not just terminal noise.
+                _parsed_u = urlparse(u)
+                _gui_push_raw("GET", _parsed_u.path or "/", r.status_code,
+                              r.headers.get("Content-Type", "application/octet-stream"),
+                              body, display_tag="[CDN-BG]",
+                              origin=_fmt_host(netloc),
+                              _skip_log=True)   # caller already logged
                 if CAPTURE and CAPTURE_CDN:
                     parsed_u = urlparse(u)
                     ctx_cdn  = HookContext(
@@ -7420,57 +7191,45 @@ def _crawl(u: str) -> None:
     netloc = urlparse(u).netloc
     if not is_allowed_domain(netloc):
         return
+    if _is_host_dead(netloc):
+        return
+
+    try:
+        r = _get_proxy_session().get(u, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
+    except _CONN_ERRORS as e:
+        log(f"Skipping {netloc} — {_short_exc(e)}", "WARN")
+        _mark_host_dead(netloc)
+        stats.inc("conn_errors")
+        return
+    except Exception as e:
+        log(f"Crawl error: {u} — {_short_exc(e)}", "WARN")
+        stats.inc("conn_errors")
+        return
+
+    stats.inc("crawled")
     path_short = urlparse(u).path or "/"
     host_disp = _fmt_host(netloc)
-    device = _device_variant(_effective_device())
-    cache_path = local_path(u, device)
-    cached = os.path.isfile(cache_path)
 
-    if cached:
-        try:
-            with open(cache_path, "rb") as f:
-                data = f.read()
-        except OSError as e:
-            log(f"Crawl cache read error: {cache_path} — {_short_exc(e)}", "ERROR")
-            return
-        ct = guess_mime(u)
-        log(f"Cached  {host_disp}{path_short} — skipping download", "CRAWL")
-    else:
-        if _is_host_dead(netloc):
-            return
-        try:
-            r = _get_proxy_session().get(u, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
-        except _CONN_ERRORS as e:
-            log(f"Skipping {netloc} — {_short_exc(e)}", "WARN")
-            _mark_host_dead(netloc)
-            stats.inc("conn_errors")
-            return
-        except Exception as e:
-            log(f"Crawl error: {u} — {_short_exc(e)}", "WARN")
-            stats.inc("conn_errors")
-            return
+    # Always decompress before processing
+    data = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
+    ct   = r.headers.get("Content-Type", "")
 
-        stats.inc("crawled")
-        # Always decompress before processing
-        data = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
-        ct   = r.headers.get("Content-Type", "")
+    sc_c = (Fore.GREEN if r.status_code < 300
+            else Fore.YELLOW if r.status_code < 400
+            else Fore.RED)
+    log(f"GET {sc_c}{r.status_code}{Style.RESET_ALL}  {host_disp}{path_short}  {_fmt_size(len(data))}", "CRAWL")
+    # Push crawl fetches to the GUI traffic log so they appear in the Hook
+    # Inspector alongside proxied requests — the user needs to see what the
+    # crawler is fetching, not just the terminal.
+    _gui_push_raw("GET", path_short, r.status_code, ct, data,
+                  display_tag="[CRAWL]", origin=host_disp,
+                  _skip_log=True)   # caller already logged
 
-        sc_c = (Fore.GREEN if r.status_code < 300
-                else Fore.YELLOW if r.status_code < 400
-                else Fore.RED)
-        log(f"GET {sc_c}{r.status_code}{Style.RESET_ALL}  {host_disp}{path_short}  {_fmt_size(len(data))}", "CRAWL")
-        # Push crawl fetches to the GUI traffic log so they appear in the Hook
-        # Inspector alongside proxied requests — the user needs to see what the
-        # crawler is fetching, not just the terminal.
-        _gui_push_raw("GET", path_short, r.status_code, ct, data,
-                      display_tag="[CRAWL]", origin=host_disp,
-                      _skip_log=True)   # caller already logged
-
-        if r.status_code >= 400:
-            stats.inc("http_errors")
-            if SAVE_ERRORS:
-                save_queue.put((u, data, ct, device))
-            return
+    if r.status_code >= 400:
+        stats.inc("http_errors")
+        if SAVE_ERRORS:
+            save_queue.put((u, data, ct, _effective_device()))
+        return
 
     if SHOW_HIDDEN and is_html(data, ct):
         data = _reveal_hidden(data)
@@ -7481,11 +7240,8 @@ def _crawl(u: str) -> None:
         log(f"RSC payload skipped (not cached): {path_short}", "WARN")
         return
 
-    # Save original (never rewritten) so cached files stay clean. Existing
-    # cache entries are read above only for link discovery and must not be
-    # queued for writing back to disk.
-    if not cached:
-        save_queue.put((u, data, ct, device))
+    # Save original (never rewritten) so cached files stay clean
+    save_queue.put((u, data, ct, _effective_device()))
 
     if is_html(data, ct):
         soup = BeautifulSoup(data.decode("utf-8", "ignore"), "lxml")
@@ -9757,10 +9513,6 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             self.close_connection = True
 app = Flask(__name__, static_folder=None)
 
-@app.after_request
-def _main_security_headers(response: Response) -> Response:
-    return _finalize_security_headers(response)
-
 @app.before_request
 def _normalize_request_origin():
     # When HTTPS-Only mode is active, or when a site JS reads
@@ -10152,15 +9904,32 @@ def _make_flask_resp(ctx: HookContext, method: str) -> Response:
 
     resp = Response(body, status=ctx.resp_status,
                     headers=clean_headers, content_type=ctx.resp_ct)
-    # Keep CORS and CORP headers consistent across all response paths.
+    # CORS + CORP — use the helper so credentialed requests get the concrete
+    # Access-Control-Expose-Headers list (not "*"), and so a cache-hit refresh
+    # never silently drops these. That mismatch is what makes cross-origin-
+    # isolated apps (SharedArrayBuffer/WASM threads) report missing headers
+    # only after the first reload.
     _apply_cors_headers(resp.headers)
-    _is_html_resp = "text/html" in (ctx.resp_ct or "").lower()
-    # Apply isolation headers to document and Worker responses.
-    _apply_isolation_headers(resp.headers, body, is_top_level_html=_is_html_resp,
+    # v8.2 — Re-run the COOP/COEP heuristic on the final response object as a
+    # safety net. filter_resp() and _cached_response() already call the
+    # helper on their header dicts, but a few response paths (WAF retry
+    # fallback, last-resort re-fetch, hook-set bodies) build ctx.resp_headers
+    # without going through filter_resp — this catch-all guarantees the
+    # isolation headers reach the wire on EVERY top-level HTML response,
+    # regardless of how the body was produced. Idempotent: a response that
+    # already carries COOP/COEP (origin's own choice) is left untouched.
+    # v8.5 — Apply on EVERY response (not just top-level HTML). Workers
+    # inherit crossOriginIsolated from the SCRIPT RESPONSE's COEP, not
+    # the parent document — so JS responses served via this catch-all
+    # (WAF-retry bodies, hook-set JS, etc) also need COEP.
+    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker. The is_top_level_html=True is
+    # safe to pass for non-HTML responses too: the heuristic inside
+    # _apply_isolation_headers checks body content, not just the flag.
+    _apply_isolation_headers(resp.headers, body, is_top_level_html=True,
                              is_worker_script=_is_worker_request())
     _apply_security_headers(resp.headers)
 
-    is_html_resp = _is_html_resp
+    is_html_resp = "text/html" in ctx.resp_ct
     is_hooked    = bool(ctx.resp_headers.get("_hooked"))
 
     # HOOK RELIABILITY: when GUI is active, all responses get no-store so the
@@ -10274,6 +10043,10 @@ def _conditional_304(lp: str, ct: str) -> Response | None:
     # A 304 updates the stored response's freshness — keep revalidating.
     resp.headers["Cache-Control"] = "no-cache"
     _apply_cors_headers(resp.headers)
+    # v8.5: 304 responses for Workers still need COOP/COEP — the Worker's
+    # crossOriginIsolated flag is set from the response headers, which
+    # for a 304 means the cached copy + the headers carried by the 304.
+    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
     _apply_isolation_headers(resp.headers,
                              is_worker_script=_is_worker_request())
     _apply_security_headers(resp.headers)
@@ -10342,23 +10115,15 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
             _slice = _rf.read(end - start + 1)
     except OSError:
         return None
-    # For no-extension cache files (the 09/10 "asset/?id=N" layout), the
-    # path itself gives no MIME hint — sniff the leading bytes so a Range
-    # request on a cached PNG/MP3/WASM asset gets the right Content-Type
-    # and the browser can stream it correctly. We pass _slice only as a
-    # hint when start==0 (the sniff needs the file's leading bytes); for
-    # mid-file ranges we fall back to a fresh read of just the head, which
-    # is cheap relative to the range payload.
-    if start == 0:
-        ct = _resolve_mime_with_sniff(lp, _slice)
-    else:
-        ct = _resolve_mime_with_sniff(lp)
-    ct = _ensure_wasm_content_type(ct, lp)
+    ct = resolve_mime(lp)
     resp = Response(_slice, status=206, content_type=ct)
     resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = str(len(_slice))
     _apply_cors_headers(resp.headers)
+    # v8.5: range responses (Workers fetching partial script bytes) also
+    # need COOP/COEP for the Worker to be crossOriginIsolated.
+    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
     _apply_isolation_headers(resp.headers,
                              is_worker_script=_is_worker_request())
     _apply_security_headers(resp.headers)
@@ -10370,43 +10135,18 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
 
 
 def _serve_cached(lp: str) -> tuple[bytes, str] | None:
-    """Load a cached file from disk and apply HTML/CSS/JSON rewrites as needed.
-
-    Per the 09/10 spec, three file shapes arrive here:
-
-    * ``.html`` paths (the long-standing layout for no-query URL caches
-      and for HTML stored before the 09/10 rename) — treated as HTML.
-    * No-extension paths (the 09/10 layout for "binary endpoint + query"
-      URLs such as ``/v1/asset?id=N`` → ``host/v1/asset/id=N``) — the
-      on-disk path gives no MIME hint, so we sniff the bytes:
-      real HTML is served as ``text/html`` (and gets the full HTML
-      rewrite + runtime injection pipeline); everything else is served
-      verbatim as ``application/octet-stream``. This is the safest
-      fallback for binary endpoints — the JS consumer reads the raw
-      bytes and parses them according to its own logic, not the
-      Content-Type.
-    * Any other extension (``.js``, ``.css``, ``.json``, ``.wasm`` …) —
-      MIME resolved by ``guess_mime()`` from the extension, with
-      URL-rewrite passes applied for CSS and JSON.
-    """
-    try:
-        with open(lp, "rb") as f:
-            data = f.read()
-    except OSError:
-        return None
-
+    """Load a cached file from disk and apply HTML/CSS/JSON rewrites as needed."""
+    # No more .s2l-ctype sidecar — we trust the on-disk path extension
+    # (which local_path() set from the upstream Content-Type on first
+    # fetch) and fall back to guess_mime() when ambiguous.
     looks_html = lp.endswith(".html") or lp.endswith("/index.html")
-    has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
-
-    if not has_ext and not looks_html:
-        # No-extension file (the new "asset/?id=N" layout).
-        # Spec: identify HTML by content; rest → octet-stream.
-        if _is_valid_html(data) and not _is_wire_payload(data):
-            looks_html = True
-        else:
-            return data, "application/octet-stream"
 
     if looks_html:
+        try:
+            with open(lp, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
         if _is_wire_payload(data) or not _is_valid_html(data):
             # OFFLINE: never destroy irreplaceable cache — serve what we have
             # rather than permanently 404'ing the resource for the rest of the
@@ -10441,6 +10181,11 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
         data = _inject_sw_clear(data)
         return data, "text/html; charset=utf-8"
 
+    try:
+        with open(lp, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
     ct = guess_mime(lp)
     # Ensure WASM files served from disk cache also have the correct Content-Type
     # — critical for WebAssembly.instantiateStreaming() after a cache hit.
@@ -10458,28 +10203,7 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
     # validators come from the CURRENT disk state: a hand edit immediately
     # stops matching the old ETag (fresh 200 next request) and a deleted file
     # never 304s (the request falls through to refetch/404).
-    #
-    # For no-extension cache files (the 09/10 "asset/?id=N" layout), the
-    # path gives no MIME hint. We do a cheap head-only read to sniff the
-    # real Content-Type so:
-    #   (a) HTML/JSON no-ext files are NOT 304'd (the proxy must always
-    #       re-serve them so the runtime/rewrite pipeline runs and the
-    #       browser sees the right Content-Type — otherwise the browser
-    #       caches an old octet-stream response with the wrong type and
-    #       the JS consumer throws);
-    #   (b) binary no-ext files (PNG/WASM/...) DO get a 304 with the
-    #       sniffed MIME, so the browser can revalidate without re-downloading.
-    _has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
-    _looks_html_path = lp.endswith(".html") or lp.endswith("/index.html")
-    if _has_ext or _looks_html_path:
-        _probe_ct = guess_mime(lp)
-    else:
-        try:
-            with open(lp, "rb") as _hf:
-                _head = _hf.read(512)
-        except OSError:
-            return None
-        _probe_ct = _resolve_mime_with_sniff(lp, _head)
+    _probe_ct = guess_mime(lp)
     _c304 = _conditional_304(lp, _probe_ct)
     if _c304 is not None:
         stats.inc("cache_304")
@@ -10512,8 +10236,16 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
                          else "no-cache",
         **({"ETag": _val[0], "Last-Modified": _val[1]} if _val else {}),
     }
-    # Cached document and Worker responses need the same isolation headers as
-    # live responses.
+    # v8.2 — COOP/COEP must be present on cached HTML responses too, or
+    # cross-origin-isolated apps (SharedArrayBuffer/WASM-threaded game
+    # clients) lose SAB on the very first reload from disk and freeze
+    # — the user's "delete site_src to fix" symptom. filter_resp()
+    # applies this on the online path; we mirror it here for cache hits.
+    # v8.5 — also apply on non-HTML cached responses (JS/CSS/etc).
+    # Workers inherit crossOriginIsolated from the script response's
+    # COEP, not from the parent document — so cached JS files need
+    # COEP too, or Workers can't use SharedArrayBuffer.
+    # v8.6: on-demand — only when HTML body has markers OR Sec-Fetch-Dest: worker.
     _apply_isolation_headers(_hdrs, data, is_top_level_html=_is_html_cached,
                              is_worker_script=_is_worker_request())
     ctx = HookContext(
@@ -11831,20 +11563,19 @@ def ext_asset(extpath: str) -> Response:
 
     lp = local_path(real_url)
     if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
-        _probe_ct_e = _resolve_mime_with_sniff(lp)
-        _c304 = _conditional_304(lp, _probe_ct_e)
+        _c304 = _conditional_304(lp, guess_mime(lp))
         if _c304 is not None:
             stats.inc("cache_304")
-            log(f"{_CACHE_HIT_MARKER} [EXT] {method} HIT 304 {_fmt_host(ext_host)}{ext_path}", "CDN")
-            _gui_push_raw(method, ext_path, 304, _probe_ct_e, b"",
-                          display_tag="[CDN] [←] [EXT]", origin=ext_host, _skip_log=True)
+            log(f"EXT {method} HIT 304 {_fmt_host(ext_host)}{ext_path}", "CDN")
+            _gui_push_raw(method, ext_path, 304, guess_mime(lp), b"",
+                          display_tag="[CDN]", origin=ext_host, _skip_log=True)
             return _c304
         result = _serve_cached(lp)
         if result is not None:
             data, ct = result
-            log(f"{_CACHE_HIT_MARKER} [EXT] {method} HIT {_fmt_host(ext_host)}{ext_path} {_fmt_size(len(data))}", "CDN")
+            log(f"EXT {method} HIT {_fmt_host(ext_host)}{ext_path} {_fmt_size(len(data))}", "CDN")
             _gui_push_raw("GET", ext_path, 200, ct, data,
-                          display_tag="[CDN] [←] [EXT]", origin=ext_host, _skip_log=True)
+                          display_tag="[CDN]", origin=ext_host)
             resp = Response(data, content_type=ct)
             if ct.startswith("text/html") or "json" in ct:
                 resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -11855,6 +11586,10 @@ def ext_asset(extpath: str) -> Response:
                     resp.headers["ETag"] = _val[0]
                     resp.headers["Last-Modified"] = _val[1]
             _apply_cors_headers(resp.headers)
+            # v8.5 — ext_asset cache-hit responses also need COOP/COEP for
+            # Workers to be crossOriginIsolated.
+            # v8.6: on-demand — only when HTML body has markers OR
+            # Sec-Fetch-Dest: worker.
             _apply_isolation_headers(resp.headers,
                                      is_worker_script=_is_worker_request())
             _apply_security_headers(resp.headers)
@@ -11887,7 +11622,7 @@ def ext_asset(extpath: str) -> Response:
         # Decide streaming BEFORE building kwargs so we can use the longer
         # TIMEOUT_STREAM_READ for streamed (large/binary) responses. See the
         # matching comment in _cdn_serve for why extensionless large binary
-        # paths need the path-level heuristic.
+        # paths (common on game CDNs) need the path-level heuristic.
         _has_range = bool(flask_request.headers.get("Range", ""))
         _guess_ct_e = guess_mime(ext_path)
         _path_lower_e = ext_path.lower()
@@ -11962,7 +11697,7 @@ def ext_asset(extpath: str) -> Response:
             stats.inc("hooks_run", _run_hooks(_RESP_HOOKS, ctx))
         _apply_gui_hooks(ctx)
 
-        log(f"[EXT] {method} {ctx.resp_status} {_fmt_host(ext_host)}{ext_path} {_fmt_size(len(ctx.resp_body))}", "CDN")
+        log(f"EXT {method} {ctx.resp_status} {_fmt_host(ext_host)}{ext_path} {_fmt_size(len(ctx.resp_body))}", "CDN")
         _gui_push_raw(method, ext_path, ctx.resp_status, ctx.resp_ct, ctx.resp_body,
                       display_tag="[EXT]", origin=_fmt_host(ext_host),
                       _skip_log=True)   # caller already logged
@@ -12124,7 +11859,7 @@ def proxy(path: str) -> Response:
                     if os.path.isfile(_cdn_lp):
                         _cdn_r = _cached_response(_cdn_lp, _cdn_url, method, req_path)
                         if _cdn_r is not None:
-                            log(f"{_CACHE_HIT_MARKER} offline CDN fallback hit {_fmt_host(_cdn_host)}{req_path_cdn}", "CDN")
+                            log(f"OFFLINE CDN fallback hit {_fmt_host(_cdn_host)}{req_path_cdn}", "CDN")
                             return _cdn_r
         elif method in _BODY_METHODS and os.path.isfile(local_path(target)):
             # POST/PUT to a path that has a cached GET body — return 405 so
@@ -12615,21 +12350,18 @@ def proxy(path: str) -> Response:
                 except OSError as e:
                     log(f"CDN disk hit unreadable: {cdn_lp} — {_short_exc(e)}", "WARN")
                 else:
-                    log(f"{_CACHE_HIT_MARKER} CDN disk hit {_fmt_host(cdn_host)}{req_path_cdn}", "CDN")
-                    # For no-extension cache files (the 09/10 "asset/?id=N"
-                    # layout), guess_mime() can't tell a PNG from a JSON
-                    # from a WASM — sniff the leading bytes so the browser
-                    # gets the right Content-Type and the JS consumer can
-                    # pick a parser. A generic binary MIME type on an
-                    # extensionless response can make clients reject valid data.
-                    _cdn_ct = _resolve_mime_with_sniff(cdn_lp, cdn_data)
-                    _cdn_ct = _ensure_wasm_content_type(_cdn_ct, cdn_lp)
+                    log(f"CDN hit {_fmt_host(cdn_host)}{req_path_cdn}", "CDN")
+                    _cdn_ct = resolve_mime(cdn_lp)
                     _c304 = _conditional_304(cdn_lp, _cdn_ct)
                     if _c304 is not None:
                         stats.inc("cache_304")
                         return _c304
                     resp = Response(cdn_data, content_type=_cdn_ct)
                     _apply_cors_headers(resp.headers)
+                    # v8.5 — CDN cache-hit (main proxy route) needs COOP/COEP
+                    # for Workers to be crossOriginIsolated.
+                    # v8.6: on-demand — only when HTML body has markers OR
+                    # Sec-Fetch-Dest: worker.
                     _apply_isolation_headers(resp.headers,
                                              is_worker_script=_is_worker_request())
                     _apply_security_headers(resp.headers)
