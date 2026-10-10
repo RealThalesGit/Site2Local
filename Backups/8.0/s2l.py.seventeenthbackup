@@ -131,9 +131,6 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 RAINBOW_LOGS = False   # early default so log() works before CONFIG
-_qt_shutdown_requested = threading.Event()
-_s2l_qt_message_handler = None
-_s2l_qt_previous_message_handler = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -1251,9 +1248,7 @@ def _launch_hook_gui() -> None:
     QTimer, the same hook schema on disk, and the same keyboard shortcuts.
     """
     try:
-        from PyQt6.QtCore import (
-            Qt, QTimer, qFormatLogMessage, qInstallMessageHandler,
-        )
+        from PyQt6.QtCore import Qt, QTimer
         from PyQt6.QtGui import (
             QPalette, QColor, QFont, QKeySequence, QShortcut,
             QTextCursor, QTextCharFormat,
@@ -1271,26 +1266,8 @@ def _launch_hook_gui() -> None:
         return
 
     def _gui_main() -> None:
-        global _s2l_qt_message_handler, _s2l_qt_previous_message_handler
         app = QApplication.instance() or QApplication(sys.argv)
         app.setStyle("Fusion")
-
-        def _qt_message_handler(message_type, context, message):
-            if (_qt_shutdown_requested.is_set()
-                    and message.startswith("QThreadStorage: entry ")
-                    and " destroyed before end of thread " in message):
-                return
-            if _s2l_qt_previous_message_handler is not None:
-                _s2l_qt_previous_message_handler(
-                    message_type, context, message)
-            else:
-                sys.stderr.write(
-                    qFormatLogMessage(message_type, context, message) + "\n")
-                sys.stderr.flush()
-
-        _s2l_qt_message_handler = _qt_message_handler
-        _s2l_qt_previous_message_handler = qInstallMessageHandler(
-            _s2l_qt_message_handler)
 
         # ── Capture unhandled exceptions in Qt slots ───────────────────────
         # Without this, an exception inside a QTimer slot (e.g. _poll) is
@@ -1557,9 +1534,6 @@ def _launch_hook_gui() -> None:
         # ── RIGHT: body editor ──────────────────────────────────────────────
         right_lay.addWidget(_lbl(right, "Body Editor", font=_mono_lg, color=_ACC))
         info_lbl = _lbl(right, "← Select a request", color=_ACC)
-        info_lbl.setMinimumWidth(0)
-        info_lbl.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         right_lay.addWidget(info_lbl)
 
         body_box = _text_box(right, wrap=True)
@@ -1697,11 +1671,8 @@ def _launch_hook_gui() -> None:
             _info_prefix = f"[{_info_origin}]  " if _info_origin else ""
             _info_wt = data.get("web_type", "")
             _info_wt_s = f"  {_info_wt}" if _info_wt else ""
-            info_text = (
-                f"{_info_prefix}{data['method']}  {path_qs}  "
-                f"[{data['status']}]{_info_wt_s}  {data['ct']}")
-            info_lbl.setText(info_text)
-            info_lbl.setToolTip(info_text)
+            info_lbl.setText(
+                f"{_info_prefix}{data['method']}  {path_qs}  [{data['status']}]{_info_wt_s}  {data['ct']}")
 
             raw_body = data["body"]
             txt, _trunc = _editor_preview(raw_body, data.get("ct", ""))
@@ -2204,9 +2175,6 @@ def _launch_hook_gui() -> None:
         ws_info_layout.setContentsMargins(0, 0, 0, 0)
         ws_info_layout.setSpacing(4)
         ws_info_lbl = _lbl(ws_info_row, "← Select a WS message", color=_ACC)
-        ws_info_lbl.setMinimumWidth(0)
-        ws_info_lbl.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         ws_info_layout.addWidget(ws_info_lbl, 1)
         ws_load_selected_btn = _btn(
             ws_info_row, "Set match from selected",
@@ -2584,11 +2552,9 @@ def _launch_hook_gui() -> None:
             _op_disp = (data.get("op_name") or "?").upper()
             _trunc_note = (f"  · editor-capped @ {_fmt_size(_EDITOR_MAX_BYTES)}"
                            if _full_len > _EDITOR_MAX_BYTES else "")
-            ws_info_text = (
+            ws_info_lbl.setText(
                 f"{_dir_disp}  {_op_disp}  {data['ws_url']}  "
                 f"[{_fmt_size(_full_len)}]{_trunc_note}")
-            ws_info_lbl.setText(ws_info_text)
-            ws_info_lbl.setToolTip(ws_info_text)
             ws_hex_box.setPlainText(_bytes_to_hexdump(payload))
             _ws_sync_text_from_hex()
             ws_dir_combo.setCurrentText(_dir_raw if _dir_raw in ("in", "out") else "*")
@@ -5468,7 +5434,7 @@ def local_path(u: str, device: str = "") -> str:
 
     `device` is a VARIANT TAG from _device_variant() ("", "mobile",
     "tablet"). Non-empty tags suffix the filename (index.html →
-    index__s2l_mobile.html, bundle.css → bundle__s2l_mobile.css)" so each
+    index__s2l_mobile.html, bundle.css → bundle__s2l_mobile.css) so each
     device family caches its own copy of EVERY file type — UA-sniffing
     sites serve different HTML, CSS/JS bundles, JSON payloads, manifest
     lists and even images (WebP vs JPEG) per device. The canonical
@@ -13423,7 +13389,6 @@ if __name__ == "__main__":
     if not PROXY_CDN and MULTIPORT:
         log("MULTIPORT=True has no effect without PROXY_CDN=True", "WARN")
     def _sigint_handler(_sig, _frame):
-        _qt_shutdown_requested.set()
         # Clear the ^C that the terminal echoes on Ctrl+C — write \r + spaces
         # to overwrite it, then move cursor to start of line.
         sys.stdout.write("\r" + " " * 80 + "\r")
