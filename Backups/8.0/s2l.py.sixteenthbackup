@@ -30,7 +30,6 @@ import queue
 import zlib
 import gc
 import hashlib
-import codecs
 import mimetypes
 import email.utils
 import logging
@@ -277,7 +276,7 @@ BACKOFF = 0.4                  # exponential backoff base (s)
 CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 SAVE_ERRORS = False            # cache 4xx/5xx responses
-DUMP_ALL = False               # extract + crawl every URL found in any response body
+DUMP_ALL = True               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
@@ -771,14 +770,13 @@ _gui_hooks_lock = threading.Lock()
 #   path. Hooks with match_mode="any" still work as before for users who
 #   genuinely want a blanket override.
 _gui_ws_log_queue: queue.Queue = queue.Queue(maxsize=2000)
-_gui_ws_drop_last_log: list = [0.0]
 _gui_ws_hooks: list[dict] = []   # {name, direction, opcode, pattern, origin_url,
                                   #  body_bytes, enabled, match_mode, match_payload}
 _gui_ws_hooks_lock = threading.Lock()
 
 def _gui_ws_push(direction: str, opcode: int, payload: bytes,
                  ws_url: str, tunnel_id: int) -> None:
-    """Push the original WS message to the GUI traffic log (before replacement)."""
+    """Push a captured WS message to the GUI traffic log (after hook apply)."""
     if not HOOK_GUI:
         return
     try:
@@ -796,10 +794,7 @@ def _gui_ws_push(direction: str, opcode: int, payload: bytes,
             "tunnel_id": tunnel_id,
         })
     except queue.Full:
-        now = time.time()
-        if now - _gui_ws_drop_last_log[0] > 5.0:
-            log(f"WebSocket GUI queue full — dropping messages ({direction} {ws_url})", "WARN")
-            _gui_ws_drop_last_log[0] = now
+        pass
 
 def _apply_gui_ws_hooks(direction: str, opcode: int, payload: bytes,
                         ws_url: str, tunnel_id: int) -> bytes:
@@ -861,9 +856,9 @@ def _apply_gui_ws_hooks(direction: str, opcode: int, payload: bytes,
         if mode != "any":
             mp = h.get("match_payload") or b""
             if not mp:
-                # A payload-specific hook without its persisted target must
-                # never degrade into a wildcard replacement.
-                continue
+                # No match_payload set → fall back to "any" so hooks without
+                # a payload don't silently no-op.
+                pass
             elif mode == "exact":
                 if payload != mp:
                     continue
@@ -1132,7 +1127,7 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
             except OSError: pass
             raise
 
-    def save(hook: dict) -> bool:
+    def save(hook: dict) -> None:
         try:
             p, meta_path = _paths(hook["name"])
             meta = {k: v for k, v in hook.items() if k != "body_bytes"}
@@ -1146,10 +1141,8 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
                     del meta[f]
             _atomic_write(p, hook["body_bytes"])
             _atomic_write(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
-            return True
         except Exception as e:
             log(f"Hook disk save failed ({subdir}): {e}", "ERROR")
-            return False
 
     def delete(name: str) -> None:
         for fp in _paths(name):
@@ -1184,8 +1177,8 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
                     loaded.append({**defaults, **meta, "body_bytes": body_bytes})
                 except Exception as e:
                     log(f"Hook load error {fn} ({subdir}): {e}", "WARN")
-        except Exception as e:
-            log(f"Hook store scan failed ({subdir}): {e}", "ERROR")
+        except Exception:
+            pass
         return loaded
 
     return save, delete, load_all
@@ -2050,29 +2043,6 @@ def _launch_hook_gui() -> None:
 
         # ── LEFT: WS message log ───────────────────────────────────────────
         ws_left_lay.addWidget(_lbl(ws_left, "WebSocket Messages", font=_mono_lg, color=_ACC))
-        ws_filter_row = QWidget(ws_left)
-        ws_filter_layout = QHBoxLayout(ws_filter_row)
-        ws_filter_layout.setContentsMargins(0, 0, 0, 0)
-        ws_filter_layout.setSpacing(4)
-        ws_filter_edit = _entry(ws_filter_row)
-        ws_filter_edit.setPlaceholderText("Filter by origin or path…")
-        ws_filter_layout.addWidget(ws_filter_edit, 1)
-        ws_filter_payload_cb = QCheckBox("Payload", ws_filter_row)
-        ws_filter_payload_cb.setToolTip(
-            "Include the first 8 KiB of each UTF-8 payload in text filtering.")
-        ws_filter_layout.addWidget(ws_filter_payload_cb)
-        ws_dir_filter = QComboBox(ws_filter_row)
-        ws_dir_filter.addItems(["All directions", "Incoming", "Outgoing"])
-        ws_dir_filter.setFont(_mono_sm)
-        ws_filter_layout.addWidget(ws_dir_filter)
-        ws_op_filter = QComboBox(ws_filter_row)
-        ws_op_filter.addItems(["All opcodes", "Text", "Binary"])
-        ws_op_filter.setFont(_mono_sm)
-        ws_filter_layout.addWidget(ws_op_filter)
-        ws_filter_count = _lbl(ws_filter_row, "0 / 0", color=_DIM)
-        ws_filter_layout.addWidget(ws_filter_count)
-        ws_left_lay.addWidget(ws_filter_row)
-
         ws_cols = ["ts", "dir", "op", "origin", "path", "size"]
         ws_labels = ["Time", "Dir", "Op", "Origin", "Path", "Size"]
         ws_widths = {"ts": 58, "dir": 36, "op": 50, "origin": 130, "size": 56}
@@ -2099,93 +2069,19 @@ def _launch_hook_gui() -> None:
         ws_paused_cb = QCheckBox("Pause", ws_ctrl)
         wsc.addWidget(ws_auto_scroll_cb); wsc.addWidget(ws_paused_cb)
         _ws_row_data: dict[str, dict] = {}
-        _ws_row_payload_search: dict[str, str] = {}
         _ws_row_counter = [0]
         _WS_MAX_ROWS = 800
 
         def _ws_clear():
             ws_tree.clear()
             _ws_row_data.clear()
-            _ws_row_payload_search.clear()
-            _ws_apply_filters()
         wsc.addWidget(_btn(ws_ctrl, "Clear", _ws_clear))
         wsc.addStretch(1)
 
-        def _ws_apply_filters(scroll=False):
-            query = ws_filter_edit.text().strip().casefold()
-            search_payload = ws_filter_payload_cb.isChecked()
-            direction_filter = ws_dir_filter.currentText()
-            opcode_filter = ws_op_filter.currentText()
-            visible = 0
-            total = ws_tree.topLevelItemCount()
-            last_visible = None
-            for row in range(total):
-                item = ws_tree.topLevelItem(row)
-                iid = item.data(0, Qt.ItemDataRole.UserRole)
-                data = _ws_row_data.get(iid, {})
-                direction = data.get("direction")
-                opcode = data.get("opcode")
-                searchable = f"{data.get('origin', '')} {data.get('path', '')}".casefold()
-                if search_payload:
-                    searchable += " " + _ws_row_payload_search.get(iid, "")
-                matches = (
-                    (not query or query in searchable)
-                    and (direction_filter == "All directions"
-                         or (direction_filter == "Incoming" and direction == "in")
-                         or (direction_filter == "Outgoing" and direction == "out"))
-                    and (opcode_filter == "All opcodes"
-                         or (opcode_filter == "Text" and opcode == 1)
-                         or (opcode_filter == "Binary" and opcode == 2))
-                )
-                item.setHidden(not matches)
-                if matches:
-                    visible += 1
-                    last_visible = item
-            if ws_paused_cb.isChecked():
-                queued = _gui_ws_log_queue.qsize()
-                ws_filter_count.setText(
-                    f"Paused (+{queued} queued)" if queued else
-                    (f"{visible} / {total} · Paused" if total else "Paused"))
-                ws_filter_count.setToolTip(
-                    f"{visible} visible out of {total} captured; "
-                    f"{queued} message(s) waiting in the queue.")
-            elif total:
-                ws_filter_count.setText(f"{visible} / {total}")
-                ws_filter_count.setToolTip(
-                    f"{visible} WebSocket message(s) visible out of {total} captured.")
-            else:
-                ws_filter_count.setText("Waiting for frames")
-                ws_filter_count.setToolTip(
-                    "The WebSocket connection can be open while idle. "
-                    "Interact with the page to make it send or receive a frame.")
-            if scroll and ws_auto_scroll_cb.isChecked() and last_visible is not None:
-                ws_tree.scrollToItem(last_visible)
-
-        ws_filter_edit.textChanged.connect(lambda *_: _ws_apply_filters())
-        ws_filter_payload_cb.toggled.connect(lambda *_: _ws_apply_filters())
-        ws_dir_filter.currentIndexChanged.connect(lambda *_: _ws_apply_filters())
-        ws_op_filter.currentIndexChanged.connect(lambda *_: _ws_apply_filters())
-        ws_paused_cb.toggled.connect(lambda *_: _ws_apply_filters())
-        _ws_apply_filters()
-
         # ── RIGHT: WS hook editor ──────────────────────────────────────────
         ws_right_lay.addWidget(_lbl(ws_right, "WebSocket Hook Editor", font=_mono_lg, color=_ACC))
-        ws_info_row = QWidget(ws_right)
-        ws_info_layout = QHBoxLayout(ws_info_row)
-        ws_info_layout.setContentsMargins(0, 0, 0, 0)
-        ws_info_layout.setSpacing(4)
-        ws_info_lbl = _lbl(ws_info_row, "← Select a WS message", color=_ACC)
-        ws_info_layout.addWidget(ws_info_lbl, 1)
-        ws_load_selected_btn = _btn(
-            ws_info_row, "Set match from selected",
-            lambda: _ws_load_selected(force=True),
-            font=_mono_sm)
-        ws_load_selected_btn.setObjectName("s2l_ws_load_selected")
-        ws_load_selected_btn.setToolTip(
-            "Set the selected message as the original match target, even while "
-            "Freeze is on. The replacement editor also loads this message.")
-        ws_info_layout.addWidget(ws_load_selected_btn)
-        ws_right_lay.addWidget(ws_info_row)
+        ws_info_lbl = _lbl(ws_right, "← Select a WS message", color=_ACC)
+        ws_right_lay.addWidget(ws_info_lbl)
 
         ws_row1 = QWidget(ws_right); wr1 = QHBoxLayout(ws_row1); wr1.setContentsMargins(0, 0, 0, 0); wr1.setSpacing(4)
         ws_row2 = QWidget(ws_right); wr2 = QHBoxLayout(ws_row2); wr2.setContentsMargins(0, 0, 0, 0); wr2.setSpacing(4)
@@ -2239,30 +2135,18 @@ def _launch_hook_gui() -> None:
         wwf = QVBoxLayout(ws_when_frame); wwf.setContentsMargins(4, 2, 4, 2); wwf.setSpacing(2)
         wtf = QVBoxLayout(ws_then_frame); wtf.setContentsMargins(4, 2, 4, 2); wtf.setSpacing(2)
 
-        wwf.addWidget(_lbl(ws_when_frame, "Original payload to match (kept intact):",
+        wwf.addWidget(_lbl(ws_when_frame, "If the site sends (or tries to send):",
                            font=_mono_sm_b, color=_RED))
 
         ws_when_top_row = QWidget(ws_when_frame); ws_when_top_row.setStyleSheet(f"background: {_PNL};")
         wwtr = QHBoxLayout(ws_when_top_row); wwtr.setContentsMargins(0, 0, 0, 0); wwtr.setSpacing(4)
         wwf.addWidget(ws_when_top_row)
         wwtr.addWidget(_lbl(ws_when_frame,
-                             "(read-only — saved as the original match target)",
+                             "(read-only — auto-filled when you click a message in the traffic log)",
                              font=_mono_xs, color=_DIM), 1)
-        ws_freeze_cb = QCheckBox("Freeze match", ws_when_top_row); ws_freeze_cb.setFont(_mono_xs)
-        ws_freeze_cb.setToolTip(
-            "Lock the original payload in the When panel as the match target. "
-            "Selecting another message will still load it into the replacement "
-            "editor, so you can edit what should replace the original.")
+        ws_freeze_cb = QCheckBox("Freeze", ws_when_top_row); ws_freeze_cb.setFont(_mono_xs)
         ws_freeze_lbl = _lbl(ws_when_top_row, "", font=_mono_sm_b, color=_ACC)
-        ws_match_mode_combo = QComboBox(ws_when_top_row)
-        ws_match_mode_combo.addItems([
-            "Exact payload", "Any payload", "Regex payload", "Contains payload"])
-        ws_match_mode_combo.setFont(_mono_xs)
-        ws_match_mode_combo.setCurrentText("Any payload")
-        ws_match_mode_combo.setToolTip(
-            "Choose whether a hook matches any payload, exact bytes, a regex, or contained bytes.")
         wwtr.addWidget(ws_freeze_lbl)
-        wwtr.addWidget(ws_match_mode_combo)
         wwtr.addWidget(ws_freeze_cb)
 
         def _on_freeze_toggle(_state):
@@ -2273,85 +2157,59 @@ def _launch_hook_gui() -> None:
                 ws_freeze_lbl.setText("")
         ws_freeze_cb.stateChanged.connect(_on_freeze_toggle)
 
-        ws_when_tabs = QTabWidget(ws_when_frame)
-        ws_when_tabs.setFont(_mono_sm)
-        ws_when_text = _text_box(ws_when_tabs, wrap=True, readonly=True)
+        ws_when_text = _text_box(ws_when_frame, wrap=True, readonly=True)
         ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_YLW};")
-        ws_when_json = _text_box(ws_when_tabs, wrap=False, readonly=True)
-        ws_when_json.setStyleSheet(f"background: {_PNL}; color: {_FG};")
-        ws_when_hex = _text_box(ws_when_tabs, wrap=False, readonly=True)
-        ws_when_hex.setObjectName("s2l_ws_match_hex")
-        ws_when_hex.setStyleSheet(f"background: {_PNL}; color: {_GRN};")
-        ws_when_tabs.addTab(ws_when_text, "Text")
-        ws_when_tabs.addTab(ws_when_json, "JSON")
-        ws_when_tabs.addTab(ws_when_hex, "Hex")
-        wwf.addWidget(ws_when_tabs, 1)
+        wwf.addWidget(ws_when_text, 1)
 
-        # ── RIGHT: THEN panel (synchronized editable hex and text) ────────
+        # ── RIGHT: THEN panel (editable hex + read-only text preview) ────
         wtf.addWidget(_lbl(ws_then_frame,
-                            "Replacement payload (saved separately from the original):",
+                            "Then immediately replace it with my hook before it is sent:",
                             font=_mono_sm_b, color=_GRN))
 
-        ws_then_tabs = QTabWidget(ws_then_frame)
-        ws_then_tabs.setFont(_mono_sm)
-        ws_hex_box = _text_box(ws_then_tabs, wrap=False)
-        ws_hex_box.setObjectName("s2l_ws_replacement_hex")
-        ws_hex_box.setPlaceholderText(
-            "Enter bytes such as: 48 65 6c 6c 6f\n"
-            "Offsets are optional; bytes can be added or removed freely.")
-        ws_hex_box.setToolTip(
-            "Space-separated bytes. No offsets or length fields are required.")
+        ws_then_split = QSplitter(Qt.Orientation.Vertical, ws_then_frame)
+        ws_then_split.setChildrenCollapsible(False)
+        ws_hex_frame = QWidget(); ws_hex_frame.setStyleSheet(f"background: {_PNL};")
+        ws_txt_frame = QWidget(); ws_txt_frame.setStyleSheet(f"background: {_PNL};")
+        ws_then_split.addWidget(ws_hex_frame)
+        ws_then_split.addWidget(ws_txt_frame)
+        ws_then_split.setSizes([180, 100])
+        wtf.addWidget(ws_then_split, 1)
+
+        whf = QVBoxLayout(ws_hex_frame); whf.setContentsMargins(0, 0, 0, 0); whf.setSpacing(2)
+        wtf2 = QVBoxLayout(ws_txt_frame); wtf2.setContentsMargins(0, 0, 0, 0); wtf2.setSpacing(2)
+
+        whf.addWidget(_lbl(ws_hex_frame, "Hex (editable)", font=_mono_sm_b, color=_YLW))
+        ws_hex_box = _text_box(ws_hex_frame, wrap=False)
         ws_hex_box.setStyleSheet(f"background: {_PNL}; color: {_GRN};")
         _ws_sp = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         ws_hex_box.setSizePolicy(_ws_sp)
-        ws_txt_box = _text_box(ws_then_tabs, wrap=True)
-        ws_txt_box.setObjectName("s2l_ws_replacement_text")
-        ws_txt_box.setStyleSheet(f"background: {_PNL_ALT}; color: {_FG};")
-        ws_txt_box.setSizePolicy(_ws_sp)
-        ws_encoding_row = QWidget(ws_then_frame)
-        ws_encoding_layout = QHBoxLayout(ws_encoding_row)
-        ws_encoding_layout.setContentsMargins(0, 0, 0, 0)
-        ws_encoding_layout.setSpacing(4)
-        ws_encoding_layout.addWidget(_lbl(
-            ws_encoding_row, "Text encoding:", color=_ACC))
-        ws_encoding_combo = QComboBox(ws_encoding_row)
-        ws_encoding_combo.setObjectName("s2l_ws_encoding")
-        ws_encoding_combo.setEditable(True)
-        ws_encoding_combo.addItems([
-            "Auto", "UTF-8", "UTF-8-SIG", "UTF-16", "UTF-16-LE",
-            "UTF-16-BE", "UTF-32", "UTF-32-LE", "UTF-32-BE",
-            "Windows-1252", "ISO-8859-1", "Shift-JIS", "GB18030",
-            "EUC-KR", "Big5",
-        ])
-        ws_encoding_combo.setCurrentText("Auto")
-        ws_encoding_combo.setToolTip(
-            "Auto detects BOMs and common Unicode byte patterns; choose or type "
-            "any encoding supported by Python's codecs for other payloads.")
-        ws_encoding_layout.addWidget(ws_encoding_combo, 1)
-        wtf.addWidget(ws_encoding_row)
-        ws_then_tabs.addTab(ws_hex_box, "Hex (raw bytes)")
-        ws_then_tabs.addTab(ws_txt_box, "Text")
-        ws_then_tabs.setToolTip(
-            "Edit either representation. Text uses the selected encoding; "
-            "use Hex for arbitrary binary payloads.")
-        wtf.addWidget(ws_then_tabs, 1)
+        whf.addWidget(ws_hex_box, 1)
 
-        # ── Hex / text helpers + bidirectional live sync ─────────────────
+        wtf2.addWidget(_lbl(ws_txt_frame, "Text (live preview)", font=_mono_sm_b, color=_DIM))
+        ws_txt_box = _text_box(ws_txt_frame, wrap=False, readonly=True)
+        ws_txt_box.setStyleSheet(f"background: {_PNL_ALT}; color: {_FG};")
+        ws_txt_box.setSizePolicy(_ws_sp)   # same content-independent sizing
+        wtf2.addWidget(ws_txt_box, 1)
+
+        # ── Hex / text helpers + live sync ────────────────────────────────
         def _bytes_to_hexdump(data: bytes) -> str:
-            """Format editable bytes without offsets or length fields."""
+            """Canonical hex dump: '00000000  48 54 54 50 ...' (16 bytes/line)."""
             if not data:
                 return ""
-            return "\n".join(
-                " ".join(f"{b:02x}" for b in data[off:off + 16])
-                for off in range(0, len(data), 16)
-            )
+            lines = []
+            for off in range(0, len(data), 16):
+                chunk = data[off:off + 16]
+                hex_part = " ".join(f"{b:02x}" for b in chunk)
+                if len(chunk) > 8:
+                    hex_part = hex_part[:24] + " " + hex_part[24:]
+                lines.append(f"{off:08x}  {hex_part}")
+            return "\n".join(lines)
 
         def _hexdump_to_bytes(text: str):
-            """Parse raw hex bytes or legacy offset-prefixed dumps."""
+            """Parse a hex dump back to bytes. Returns None on invalid input."""
             out = bytearray()
             for line in text.splitlines():
-                stripped = re.sub(
-                    r"^[0-9a-fA-F]{8}\s{2,}", "", line).strip()
+                stripped = re.sub(r"^[0-9a-fA-F]{8}\s+", "", line).strip()
                 if not stripped:
                     continue
                 for tok in stripped.split():
@@ -2362,121 +2220,25 @@ def _launch_hook_gui() -> None:
                     out.extend(bytes.fromhex(tok))
             return bytes(out)
 
-        _ws_syncing_editors = [False]
-        _ws_text_sync_error = [False]
-
-        def _ws_auto_encoding(data: bytes) -> str:
-            """Detect common Unicode encodings; arbitrary legacy encodings are ambiguous."""
-            for marker, encoding in (
-                (codecs.BOM_UTF32_LE, "utf-32"),
-                (codecs.BOM_UTF32_BE, "utf-32"),
-                (codecs.BOM_UTF8, "utf-8-sig"),
-                (codecs.BOM_UTF16_LE, "utf-16"),
-                (codecs.BOM_UTF16_BE, "utf-16"),
-            ):
-                if data.startswith(marker):
-                    return encoding
-            sample = data[:256]
-            if len(sample) >= 4:
-                even_nuls = sum(sample[i] == 0 for i in range(0, len(sample), 2))
-                odd_nuls = sum(sample[i] == 0 for i in range(1, len(sample), 2))
-                pairs = len(sample) // 2
-                if even_nuls > pairs * 0.3 and odd_nuls == 0:
-                    return "utf-16-be"
-                if odd_nuls > pairs * 0.3 and even_nuls == 0:
-                    return "utf-16-le"
-            try:
-                data.decode("utf-8", errors="strict")
-                return "utf-8"
-            except UnicodeDecodeError:
-                return "cp1252"
-
-        def _ws_selected_encoding(data: bytes) -> tuple[str, str]:
-            requested = ws_encoding_combo.currentText().strip()
-            if not requested or requested.casefold() == "auto":
-                encoding = _ws_auto_encoding(data)
-            else:
-                try:
-                    encoding = codecs.lookup(requested).name
-                except LookupError as exc:
-                    raise ValueError(
-                        f"Unknown encoding '{requested}'. Choose or type a Python codec name."
-                    ) from exc
-            return requested or "Auto", encoding
-
         def _ws_sync_text_from_hex(*_):
-            """Decode valid replacement bytes using the selected codec."""
-            if _ws_syncing_editors[0]:
-                return
-            parsed = _hexdump_to_bytes(ws_hex_box.toPlainText())
+            """Live-update the read-only text pane from the hex pane."""
+            raw = ws_hex_box.toPlainText()
+            parsed = _hexdump_to_bytes(raw)
             if parsed is None:
-                _ws_text_sync_error[0] = True
                 ws_save_status_lbl.setText("Hex invalid: odd digit count or non-hex character.")
                 ws_save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
                 return
-            try:
-                requested, encoding = _ws_selected_encoding(parsed)
-            except ValueError as exc:
-                _ws_text_sync_error[0] = True
-                ws_save_status_lbl.setText(str(exc))
-                ws_save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
-                return
-            lossy = False
-            try:
-                decoded = parsed.decode(encoding, errors="strict")
-            except UnicodeError:
-                try:
-                    decoded = parsed.decode(encoding, errors="replace")
-                except UnicodeError as exc:
-                    _ws_text_sync_error[0] = True
-                    ws_save_status_lbl.setText(
-                        f"Cannot decode with {encoding}: {exc}")
-                    ws_save_status_lbl.setStyleSheet(
-                        f"color: {_RED}; background: transparent;")
-                    return
-                lossy = True
-            _ws_syncing_editors[0] = True
-            try:
-                ws_txt_box.setPlainText(decoded)
-            finally:
-                _ws_syncing_editors[0] = False
-            _ws_text_sync_error[0] = False
-            detected = f" · detected {encoding}" if requested.casefold() == "auto" else f" · {encoding}"
-            message = f"Replacement valid: {len(parsed)} byte(s){detected}."
-            if lossy:
-                message += " Decode used replacement characters; select another encoding."
-            ws_save_status_lbl.setText(message)
-            ws_save_status_lbl.setStyleSheet(
-                f"color: {_YLW if lossy else _DIM}; background: transparent;")
-
-        def _ws_sync_hex_from_text(*_):
-            """Encode text edits with the chosen codec and refresh the hex editor."""
-            if _ws_syncing_editors[0]:
-                return
-            try:
-                current_data = _hexdump_to_bytes(ws_hex_box.toPlainText()) or b""
-                requested, encoding = _ws_selected_encoding(
-                    current_data)
-                data = ws_txt_box.toPlainText().encode(encoding, errors="strict")
-            except (LookupError, UnicodeError, ValueError) as exc:
-                _ws_text_sync_error[0] = True
-                ws_save_status_lbl.setText(f"Text cannot be encoded: {exc}")
-                ws_save_status_lbl.setStyleSheet(f"color: {_RED}; background: transparent;")
-                return
-            _ws_syncing_editors[0] = True
-            try:
-                ws_hex_box.setPlainText(_bytes_to_hexdump(data))
-            finally:
-                _ws_syncing_editors[0] = False
-            _ws_text_sync_error[0] = False
-            label = encoding if requested.casefold() == "auto" else requested
+            decoded = parsed.decode("utf-8", errors="replace")
+            display = "".join(
+                c if (c.isprintable() or c in "\n\r\t") else "·"
+                for c in decoded
+            )
+            ws_txt_box.setPlainText(display)
             ws_save_status_lbl.setText(
-                f"Text encoded as {label}: {len(data)} byte(s).")
+                f"Replacement OK: {len(parsed)} byte(s). Preview below the hex editor.")
             ws_save_status_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
 
         ws_hex_box.textChanged.connect(_ws_sync_text_from_hex)
-        ws_txt_box.textChanged.connect(_ws_sync_hex_from_text)
-        ws_encoding_combo.currentTextChanged.connect(_ws_sync_text_from_hex)
 
         # ── WHEN panel updater ───────────────────────────────────────────
         def _ws_update_when_panel(*_):
@@ -2484,56 +2246,42 @@ def _launch_hook_gui() -> None:
             mp = ws_match_payload_holder[0]
             if mode == "any" or not mp:
                 ws_when_text.setPlainText(
-                    "Any payload matching the URL, direction and opcode filters "
-                    "will trigger this hook.\n\n"
-                    "Freeze locks only the original match target. Selecting another "
-                    "message still loads it into the replacement editor.")
-                ws_when_json.setPlainText("No exact payload selected.")
-                ws_when_hex.setPlainText("")
+                    "(any message matching the path/dir/op filters above)\n\n"
+                    "Every message on this WebSocket path will be replaced.\n\n"
+                    "Click a message in the traffic log on the left to\n"
+                    "target a specific payload — only that exact content\n"
+                    "will trigger the hook.")
                 ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_DIM};")
             else:
-                decoded = mp.decode("utf-8", errors="replace")
-                display = "".join(
-                    c if (c.isprintable() or c in "\n\r\t") else "·"
-                    for c in decoded
-                )
                 if mode == "regex":
                     ws_when_text.setPlainText(
-                        f"[payload regex]\n{display}\n\n"
-                        "Only payloads matching this expression trigger the hook.")
-                elif mode == "contains":
-                    ws_when_text.setPlainText(
-                        f"[payload contains]\n{display}\n\n"
-                        "Only payloads containing these bytes trigger the hook.")
+                        f"[regex pattern]\n"
+                        f"{mp.decode('utf-8', 'replace')}\n\n"
+                        f"Incoming payloads matching this regex will be replaced.")
                 else:
+                    decoded = mp.decode("utf-8", errors="replace")
+                    display = "".join(
+                        c if (c.isprintable() or c in "\n\r\t") else "·"
+                        for c in decoded
+                    )
                     ws_when_text.setPlainText(display)
-                try:
-                    pretty_json = json.dumps(
-                        json.loads(decoded), indent=2, ensure_ascii=False)
-                except (json.JSONDecodeError, RecursionError):
-                    pretty_json = "This payload is not valid JSON."
-                ws_when_json.setPlainText(pretty_json)
-                ws_when_hex.setPlainText(_bytes_to_hexdump(mp))
                 ws_when_text.setStyleSheet(f"background: {_PNL}; color: {_YLW};")
-
-        def _ws_match_mode_changed(text):
-            ws_match_mode[0] = {
-                "Exact payload": "exact",
-                "Any payload": "any",
-                "Regex payload": "regex",
-                "Contains payload": "contains",
-            }.get(text, "any")
-            _ws_update_when_panel()
-
-        ws_match_mode_combo.currentTextChanged.connect(_ws_match_mode_changed)
         _ws_update_when_panel()
 
-        def _ws_load_selected(force=False):
+        def _ws_on_select(*_):
+            # ── FREEZE GUARD (full panel lock) ───────────────────────────
+            # When Freeze is ON, clicking a new message in the traffic log
+            # does NOT touch anything — neither the WHEN panel (match
+            # payload / mode) nor the THEN editor (hex / text / dir / op /
+            # pattern / origin / name). The user has explicitly pinned the
+            # current hook content; the row is still visually selected by
+            # Qt (so the user knows which row they clicked), but no field
+            # is overwritten. They must toggle Freeze OFF to load a
+            # different message into the editor.
+            if ws_freeze_cb.isChecked():
+                return
             items = ws_tree.selectedItems()
             if not items:
-                ws_save_status_lbl.setText("Select a WebSocket message first.")
-                ws_save_status_lbl.setStyleSheet(
-                    f"color: {_YLW}; background: transparent;")
                 return
             item = items[0]
             iid = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2566,20 +2314,9 @@ def _launch_hook_gui() -> None:
             ws_origin_edit.setText(data.get("origin", "") or "*")
             if not ws_name_edit.text().strip():
                 ws_name_edit.setText(f"ws_{_dir_raw}_{_op_disp.lower()}")
-            if not ws_freeze_cb.isChecked() or force:
-                ws_match_payload_holder[0] = bytes(payload)
-                ws_match_mode[0] = "exact"
-                ws_match_mode_combo.setCurrentText("Exact payload")
+            ws_match_payload_holder[0] = bytes(payload)
+            ws_match_mode[0] = "exact"
             _ws_update_when_panel()
-            if ws_freeze_cb.isChecked() and not force:
-                ws_save_status_lbl.setText(
-                    "Replacement loaded from selected message; frozen match target unchanged.")
-                ws_save_status_lbl.setStyleSheet(
-                    f"color: {_ACC}; background: transparent;")
-
-        def _ws_on_select(*_):
-            _ws_load_selected()
-
         ws_tree.itemSelectionChanged.connect(_ws_on_select)
 
         # ── Disk persistence + Save / Test buttons ───────────────────────
@@ -2590,12 +2327,6 @@ def _launch_hook_gui() -> None:
             name = ws_name_edit.text().strip()
             if not name:
                 QMessageBox.warning(win, "S2L", "Hook name is required.")
-                return
-            if (ws_then_tabs.currentWidget() is ws_txt_box
-                    and _ws_text_sync_error[0]):
-                QMessageBox.warning(win, "S2L",
-                    "The text editor is not synchronized. Fix the encoding or "
-                    "switch to Hex and correct the payload before saving.")
                 return
             raw_hex = ws_hex_box.toPlainText()
             body_bytes = _hexdump_to_bytes(raw_hex)
@@ -2616,20 +2347,7 @@ def _launch_hook_gui() -> None:
             op_map = {"text": 1, "bin": 2}
             opcode = op_map.get(ws_op_combo.currentText(), 0)
             frozen = ws_freeze_cb.isChecked()
-            match_mode = ws_match_mode[0]
-            match_payload = ws_match_payload_holder[0] if match_mode != "any" else b""
-            if match_mode != "any" and not match_payload:
-                QMessageBox.warning(win, "S2L",
-                    "Select a captured message for a payload match, "
-                    "or choose Any payload.")
-                return
-            if match_mode == "regex":
-                try:
-                    re.compile(match_payload.decode("utf-8", "ignore"), re.DOTALL)
-                except re.error as e:
-                    QMessageBox.critical(win, "S2L",
-                        f"Invalid payload regex: {e}")
-                    return
+            match_payload = ws_match_payload_holder[0]
             # PERSISTENCE FIX: the WHEN panel's "Freeze" state is now part of
             # the hook itself. Previously `frozen` lived only in the checkbox,
             # so after a restart editing a saved hook left Freeze unchecked —
@@ -2639,6 +2357,11 @@ def _launch_hook_gui() -> None:
             # across restarts: the freeze guard in _ws_on_select reads this
             # flag (restored into the checkbox on edit) and refuses to touch
             # the holder while it's set.
+            if match_payload:
+                match_mode = "exact"
+            else:
+                match_mode = "any"
+                match_payload = b""
             hook = {
                 "name":          name,
                 "direction":     ws_dir_combo.currentText(),
@@ -2660,21 +2383,10 @@ def _launch_hook_gui() -> None:
                         return
                     _gui_ws_hooks[:] = [h for h in _gui_ws_hooks if h["name"] != name]
                 _gui_ws_hooks.append(hook)
-            if not _ws_hook_save_to_disk(hook):
-                ws_save_status_lbl.setText(
-                    f"'{name}' is active for this session, but disk save failed. "
-                    "Check the terminal log.")
-                ws_save_status_lbl.setStyleSheet(
-                    f"color: {_RED}; background: transparent;")
-                _render_ws_hook_rows()
-                return
+            _ws_hook_save_to_disk(hook)
             _render_ws_hook_rows()
-            _trigger_desc = {
-                "exact": "exact payload",
-                "any": "any payload",
-                "regex": "payload regex",
-                "contains": "payload contains",
-            }.get(match_mode, "any payload")
+            _trigger_desc = ("exact payload" if match_mode == "exact"
+                             else "any message on path")
             ws_save_status_lbl.setText(
                 f"Saved '{name}'  [dir={hook['direction']} op={ws_op_combo.currentText()} "
                 f"trigger={_trigger_desc}]  {hook['pattern']}")
@@ -2784,13 +2496,6 @@ def _launch_hook_gui() -> None:
                         # the holder to render the WHEN panel.
                         ws_match_payload_holder[0] = hook_ref.get("match_payload", b"") or b""
                         ws_match_mode[0] = hook_ref.get("match_mode", "any") or "any"
-                        ws_match_mode_combo.setCurrentText(
-                            {
-                                "exact": "Exact payload",
-                                "any": "Any payload",
-                                "regex": "Regex payload",
-                                "contains": "Contains payload",
-                            }.get(ws_match_mode[0], "Any payload"))
                         # Restore the Freeze checkbox so the WHEN content stays
                         # pinned after restart. setChecked fires stateChanged,
                         # which updates the [FROZEN] label via _on_freeze_toggle.
@@ -2843,11 +2548,8 @@ def _launch_hook_gui() -> None:
             # Wrapped in try/except so a slot exception is logged, not
             # swallowed — same protection as the main _poll() loop.
             try:
-                if ws_paused_cb.isChecked():
-                    _ws_apply_filters()
-                else:
+                if not ws_paused_cb.isChecked():
                     count = 0
-                    received = 0
                     while count < 60:
                         try:
                             entry = _gui_ws_log_queue.get_nowait()
@@ -2875,18 +2577,11 @@ def _launch_hook_gui() -> None:
                         item.setData(0, Qt.ItemDataRole.UserRole, iid)
                         ws_tree.addTopLevelItem(item)
                         _ws_row_data[iid] = entry
-                        _ws_row_payload_search[iid] = (
-                            (entry.get("payload") or b"")[:8192]
-                            .decode("utf-8", "replace").casefold())
                         if ws_tree.topLevelItemCount() > _WS_MAX_ROWS:
-                            removed = ws_tree.takeTopLevelItem(0)
-                            removed_iid = removed.data(0, Qt.ItemDataRole.UserRole)
-                            _ws_row_data.pop(removed_iid, None)
-                            _ws_row_payload_search.pop(removed_iid, None)
+                            ws_tree.takeTopLevelItem(0)
+                        if ws_auto_scroll_cb.isChecked():
+                            ws_tree.scrollToItem(item)
                         count += 1
-                        received += 1
-                    if received:
-                        _ws_apply_filters(scroll=True)
             except Exception as _e:
                 import traceback as _tb
                 log(f"_ws_poll() raised {_e.__class__.__name__}: {_e}\n"
@@ -4058,12 +3753,6 @@ def _ci_remove_header(out, name: str) -> None:
             pass
 
 
-def _apply_corp_header(out) -> None:
-    """Allow proxied resources to be embedded by isolated cross-origin pages."""
-    _ci_remove_header(out, "Cross-Origin-Resource-Policy")
-    out["Cross-Origin-Resource-Policy"] = "cross-origin"
-
-
 def _apply_cors_headers(out: dict) -> None:
     """Set CORS + CORP headers on a response dict OR werkzeug Headers object,
     correctly handling the credentialed-request case. Use this in cache-hit /
@@ -4109,7 +3798,7 @@ def _apply_cors_headers(out: dict) -> None:
         out["Access-Control-Expose-Headers"] = _CORS_CONCRETE_EXPOSE
     else:
         out["Access-Control-Expose-Headers"] = "*"
-    _apply_corp_header(out)
+    out["Cross-Origin-Resource-Policy"] = "cross-origin"
 
 
 def _apply_security_headers(out, body: bytes = b"",
@@ -4188,17 +3877,6 @@ def _is_document_request() -> bool:
         return False
 
 
-def _coep_value() -> str:
-    """Use credentialless on Chromium so anonymous third-party assets can load."""
-    try:
-        ua = (flask_request.headers.get("User-Agent", "") or "")
-    except (RuntimeError, AttributeError):
-        ua = ""
-    if "CriOS/" not in ua and re.search(r"(?:Chrome|Chromium|Edg|OPR)/", ua, re.I):
-        return "credentialless"
-    return "require-corp"
-
-
 def _apply_isolation_headers(out, body: bytes = b"",
                              is_top_level_html: bool = False,
                              is_worker_script: bool = False) -> None:
@@ -4216,10 +3894,7 @@ def _apply_isolation_headers(out, body: bytes = b"",
          inherit crossOriginIsolated from the parent. Sites that don't
          use Workers pay zero overhead.
 
-    Chromium uses COEP `credentialless`: it preserves cross-origin isolation
-    while allowing anonymous cross-origin no-CORS assets that cannot be made
-    to send CORP (for example, third-party SDK scripts). Other browsers retain
-    the broadly supported `require-corp` policy.
+    COEP value is `require-corp`, as required by the affected runtime.
 
     Idempotent — responses that need isolation receive the complete,
     compatible pair even if the origin supplied only one header or supplied
@@ -4244,7 +3919,7 @@ def _apply_isolation_headers(out, body: bytes = b"",
         out["Cross-Origin-Opener-Policy"] = "same-origin"
     if _should_apply:
         _ci_remove_header(out, "Cross-Origin-Embedder-Policy")
-        out["Cross-Origin-Embedder-Policy"] = _coep_value()
+        out["Cross-Origin-Embedder-Policy"] = "require-corp"
 
 
 def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = False) -> dict:
@@ -4322,13 +3997,8 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
 
 
 def _finalize_security_headers(response: Response) -> Response:
-    """Apply baseline security and cross-origin resource headers to responses."""
+    """Apply the proxy's baseline security headers to every Flask response."""
     _apply_security_headers(response.headers)
-    # COEP: require-corp blocks cross-origin no-CORS resources unless their
-    # response explicitly opts in. The proxy owns every response on both the
-    # main and CDN Flask apps, so set CORP here as a final universal safeguard,
-    # including errors and routes that don't pass through filter_resp().
-    _apply_corp_header(response.headers)
     _is_html = response.mimetype == "text/html"
     _body = b""
     if _is_html and not response.is_streamed:
@@ -4993,27 +4663,9 @@ def _build_s2l_injector() -> bytes:
             'if(!d||!d.set)return;'
             'Object.defineProperty(ctor.prototype,"src",{'
               'get:d.get,'
-              'set:function(v){'
-                'var u=typeof v==="string"?v:(v&&typeof v.href==="string"?v.href:v);'
-                'return d.set.call(this,typeof u==="string"?rw(u):u);'
-              '}'
+              'set:function(v){return d.set.call(this,typeof v==="string"&&v.indexOf("http")===0?rw(v):v);}'
             '});'
           '});'
-        '}catch(e){}'
-        # setAttribute() starts the fetch as soon as a script element is
-        # connected. Rewriting it synchronously avoids racing that request
-        # against the MutationObserver for SDKs that build script tags by hand.
-        'try{'
-          'var _elSA=Element.prototype.setAttribute;'
-          'Element.prototype.setAttribute=function(name,value){'
-            'var n=typeof name==="string"?name.toLowerCase():"";'
-            'if((n==="src"||n==="href"||n==="poster"||n==="data-src"||n==="data-href"||n==="action")'
-               '&&(typeof value==="string"||(value&&typeof value.href==="string"))){'
-              'var u=typeof value==="string"?value:value.href;'
-              'value=rw(u);'
-            '}'
-            'return _elSA.call(this,name,value);'
-          '};'
         '}catch(e){}'
         # ── HTMLIFrameElement.setAttribute("src", ...) patch ────────────────────
         # Some frameworks use setAttribute instead of the .src property.
@@ -8192,7 +7844,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                 _not_cached_note = " — too large, not cached"
             elif not completed:
                 _not_cached_note = " — incomplete, not cached"
-            log(f"[STREAM] {method} {sc} {_fmt_host(urlparse(target).netloc)}{urlparse(target).path}"
+            log(f"STREAM {method} {sc} {_fmt_host(urlparse(target).netloc)}{urlparse(target).path}"
                 f" [{_fmt_size(total)}]{_not_cached_note}", "→")
             # Push to the GUI traffic log. For 206/204 and other non-2xx the
             # preview may be empty — that's fine, _gui_push_raw handles it.
@@ -8208,8 +7860,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                     _gui_body = _preview_bytes
                 _gui_push_raw(method, _path, sc, ct, _gui_body,
                               display_tag="[STREAM]",
-                              origin=_fmt_host(urlparse(target).netloc),
-                              _skip_log=True)
+                              origin=_fmt_host(urlparse(target).netloc))
             # CRITICAL: always close the upstream response, even on client
             # disconnect (GeneratorExit is a BaseException, not caught by
             # the `except Exception` above). Without this, the underlying
@@ -8576,22 +8227,20 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 if frag_compressed:
                     msg = _ws_inflate_msg(tunnel.tunnel_id, msg)
                 _run_ws_msg_hooks("in", frag_opcode or opcode, msg, tunnel.tunnel_id)
-                # Capture the original frame for the GUI before applying any
-                # replacement, so the When panel can retain the exact source.
+                # Apply GUI WS hooks (editable hex overrides) then push the
+                # post-hook payload to the GUI traffic log for inspection.
                 # Wrapped in try/except so a hook error NEVER kills the tunnel —
                 # the site stays functional even if the hook has a bad pattern
                 # or the GUI queue is full.
-                original_msg = msg
                 try:
                     msg = _apply_gui_ws_hooks("in", frag_opcode or opcode, msg,
                                               ws_url, tunnel.tunnel_id)
                 except Exception as _hk:
                     log(f"WS hook error (in): {_short_exc(_hk)}", "WARN")
                 try:
-                    _gui_ws_push("in", frag_opcode or opcode, original_msg,
-                                 ws_url, tunnel.tunnel_id)
-                except Exception as _push_err:
-                    log(f"WS GUI capture error (in): {_short_exc(_push_err)}", "WARN")
+                    _gui_ws_push("in", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
+                except Exception:
+                    pass
                 _maybe_capture_ws("in", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 tunnel.msgs_in  += 1
                 tunnel.bytes_in += len(msg)
@@ -8688,20 +8337,18 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 # the payload for us — rsv1 is reported False either way, and
                 # we must not double-inflate.)
                 _run_ws_msg_hooks("out", frag_opcode or opcode, msg, tunnel.tunnel_id)
-                # Capture the original frame for the GUI before applying any
-                # replacement, so the When panel can retain the exact source.
+                # Apply GUI WS hooks (editable hex overrides) then push the
+                # post-hook payload to the GUI traffic log for inspection.
                 # Wrapped in try/except so a hook error NEVER kills the tunnel.
-                original_msg = msg
                 try:
                     msg = _apply_gui_ws_hooks("out", frag_opcode or opcode, msg,
                                               ws_url, tunnel.tunnel_id)
                 except Exception as _hk:
                     log(f"WS hook error (out): {_short_exc(_hk)}", "WARN")
                 try:
-                    _gui_ws_push("out", frag_opcode or opcode, original_msg,
-                                 ws_url, tunnel.tunnel_id)
-                except Exception as _push_err:
-                    log(f"WS GUI capture error (out): {_short_exc(_push_err)}", "WARN")
+                    _gui_ws_push("out", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
+                except Exception:
+                    pass
                 _maybe_capture_ws("out", frag_opcode or opcode, msg, ws_url, tunnel.tunnel_id)
                 tunnel.msgs_out  += 1
                 tunnel.bytes_out += len(msg)
