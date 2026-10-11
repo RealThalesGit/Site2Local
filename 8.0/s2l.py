@@ -5259,41 +5259,108 @@ def _safe_seg(name: str) -> str:
     return f"{base[:32]}_{h}{ext}"
 
 def _sanitize_query_for_filename(qs: str) -> str:
-    """Make a query string safe to embed in a filename while keeping it readable.
+    """LEGACY (09/10) query → filename mapping. LOSSY — do not use for new files.
 
-    Keeps alphanumerics, dots, hyphens and the ``=`` sign so the original
-    ``id=N`` shape survives (the whole point of the new naming is to make
-    cached query-string files identifiable at a glance). Everything else
-    (spaces, ``&``, ``/``, ``?``, ``%``, control chars, HTML break-through
-    characters) is collapsed to ``_``. Long queries are truncated and a
-    short sha1 suffix is appended so two different long queries that happen
-    to share the first ~80 chars still cache as distinct files.
+    Kept only so ``_legacy_cache_paths()`` can locate caches written by the
+    09/10 layout (``b_=<query>.js`` / ``v1/asset/id=N`` straight in the host
+    folder) and migrate them into ``__query__/``. Everything outside
+    ``[\\w.\\-=]`` collapses to ``_`` here, so different queries could share
+    one name (``a=1&b=2`` and ``a=1_b=2``). New files use
+    ``_encode_query_for_filename()`` instead.
     """
     safe = re.sub(r"[^\w.\-=]", "_", qs)
-    # MAX_FNAME minus headroom for prefix ("base_="), device suffix
-    # ("__s2l_mobile") and extension (".js"/".html").
     if len(safe) > MAX_FNAME - 24:
         safe = safe[:80] + "_" + hashlib.sha1(qs.encode()).hexdigest()[:12]
     return safe
 
 
+# Reserved folder, one per host, that holds EVERY cache file whose URL carries
+# a query string. The host tree outside it mirrors the real site's paths 1:1;
+# query variants live in here so they never mix with real files.
+_QUERY_DIR = "__query__"
+
+# Characters written verbatim into a query filename. Everything else is
+# percent-encoded. ``.`` is handled separately (see below).
+_QS_SAFE_RE = re.compile(r"[A-Za-z0-9_\-=&,+~@]")
+_QS_PCT_RE  = re.compile(r"%[0-9A-Fa-f]{2}")
+
+# Hard ceiling for one on-disk name (bytes == chars: names are pure ASCII).
+# Most filesystems allow 255; 240 leaves room for the device suffix.
+_FS_NAME_MAX = 240
+
+
+def _encode_query_for_filename(qs: str, bare: bool) -> str:
+    """Raw query string → filesystem-safe name, readable and collision-free.
+
+    The query is stored as the server saw it (no decoding, no re-ordering):
+
+    * ``[A-Za-z0-9_-=&,+~@]`` are kept as-is, so ``id=7`` and ``a=1&b=2``
+      stay legible.
+    * Existing ``%XX`` escapes are kept as-is (``q=a%20b`` stays ``q=a%20b``).
+    * Everything else — ``/ \\ ? : * " < > |``, spaces, quotes, ``$ ! ;``,
+      non-ASCII, control chars, a stray ``%`` — becomes ``%XX`` (UTF-8 bytes).
+      Unlike the 09/10 scheme (which collapsed all of these to ``_``) two
+      different queries no longer land on the same file.
+    * ``bare=True`` (no extension in the URL path: the file IS the query,
+      e.g. ``__query__/v1/asset/id=7``): dots are written ``%2E``. Otherwise
+      ``?file=app.js`` would produce a file called ``file=app.js`` that
+      ``_serve_cached`` mistakes for a real ``.js`` (served as JavaScript and
+      URL-rewritten), and a query that is just ``..`` would resolve to the
+      parent folder. With dots encoded a bare file never has an extension.
+    * ``bare=True`` and no ``=`` in the result (``?debug``): a leading ``=``
+      is added (``=debug``). URL path segments can never contain ``=``
+      (``_safe_seg`` replaces it), so a name with ``=`` can never collide
+      with a sub-folder (``/a?c`` vs ``/a/c?x=1``).
+    * Longer than ``MAX_FNAME - 24``: the first 80 chars (never cutting an
+      escape in half) + ``_`` + sha1 of the ORIGINAL query.
+
+    Known, accepted corner: a malformed stray ``%`` (→ ``%25``) shares a name
+    with a literal ``%25``; and ``?debug`` shares ``=debug`` with ``?=debug``.
+    """
+    out: list[str] = []
+    i, n = 0, len(qs)
+    while i < n:
+        ch = qs[i]
+        if ch == "%" and _QS_PCT_RE.fullmatch(qs[i:i + 3]):
+            out.append(qs[i:i + 3])
+            i += 3
+            continue
+        if ch == ".":
+            out.append("%2E" if bare else ".")
+        elif _QS_SAFE_RE.fullmatch(ch):
+            out.append(ch)
+        else:
+            out.append("".join(f"%{b:02X}" for b in ch.encode("utf-8", "surrogatepass")))
+        i += 1
+    name = "".join(out)
+    if len(name) > MAX_FNAME - 24:
+        head = re.sub(r"%[0-9A-Fa-f]?$", "", name[:80])
+        name = head + "_" + hashlib.sha1(qs.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    if bare and "=" not in name:
+        name = "=" + name
+    return name
+
+
 def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
     """Compute LEGACY on-disk cache paths for a URL — used only for migration.
 
-    Two prior naming schemes are recognised so existing caches keep working
-    after the query-string rename:
+    Three prior naming schemes are recognised so existing caches keep working
+    after the move into ``__query__/``. Listed newest first, so the most
+    recent layout wins when several exist:
 
-    1. ``_q<sha1[:10]>`` suffix (the immediately-previous scheme):
+    0. The 09/10 layout (query files straight in the host folder, lossy name):
+       * with extension + query → ``a/b_=<query>.js``
+       * no extension + query   → ``a/asset/id=N``
+
+    1. ``_q<sha1[:10]>`` suffix:
        * with extension + query  → ``a/b_q<hash>.js``
        * no extension + query    → ``a/index_q<hash>.html``
          (the old code unconditionally appended ``/index.html`` before
          hashing, so the segment became ``index_q<hash>.html`` inside the
          path-named folder).
 
-    2. ``<last_seg>_=<query>.html`` (the scheme before that, only ever
-       produced for no-extension + query URLs — e.g. ``v1/asset?id=N``
-       → ``v1/asset_=id=N.html``). Listed second so the newer format is
-       preferred when both somehow exist.
+    2. ``<last_seg>_=<query>.html`` (only ever produced for no-extension +
+       query URLs — e.g. ``v1/asset?id=N`` → ``v1/asset_=id=N.html``).
 
     The optional ``device`` tag is applied to the legacy filename exactly
     as ``local_path()`` would have done at the time, so a device-variant
@@ -5311,10 +5378,24 @@ def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
     has_ext = bool(os.path.splitext(path)[1]) and not path.endswith("/")
     legacy: list[str] = []
 
+    path_clean = path.rstrip("/")
+    raw_parts = [_safe_seg(x) for x in path_clean.split("/") if x]
+
+    # ── Layout 0: the 09/10 layout ──
+    parts0 = list(raw_parts)
     if has_ext:
-        # ── Legacy-1 only (no legacy-2 ever existed for extension+query) ──
-        path_clean = path.rstrip("/")
-        parts = [_safe_seg(x) for x in path_clean.split("/") if x]
+        base0, ext0 = os.path.splitext(parts0[-1])
+        parts0[-1] = f"{base0}_={qs_safe}{ext0}"
+    else:
+        parts0.append(qs_safe)
+    if device and parts0:
+        b0, e0 = os.path.splitext(parts0[-1])
+        parts0[-1] = f"{b0}__s2l_{device}{e0}"
+    legacy.append(os.path.join(SRC_FOLDER, host_dir, *parts0))
+
+    if has_ext:
+        # ── Layout 1 only (layout 2 never existed for extension+query) ──
+        parts = list(raw_parts)
         last = parts[-1]
         base, ext = os.path.splitext(last)
         parts[-1] = f"{base}_q{qs_hash}{ext}"
@@ -5324,12 +5405,10 @@ def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
         legacy.append(os.path.join(SRC_FOLDER, host_dir, *parts))
         return legacy
 
-    # ── No-extension + query: two legacy layouts to try ──
-    path_clean = path.rstrip("/")
-    raw_parts = [_safe_seg(x) for x in path_clean.split("/") if x]
+    # ── No-extension + query: two older layouts to try ──
     last_seg = raw_parts[-1] if raw_parts else "index"
 
-    # Legacy-1: <path>/index_q<hash>.html
+    # Layout 1: <path>/index_q<hash>.html
     idx_parts = raw_parts + ["index.html"]
     b, e = os.path.splitext(idx_parts[-1])
     idx_parts[-1] = f"{b}_q{qs_hash}{e}"
@@ -5338,7 +5417,7 @@ def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
         idx_parts[-1] = f"{b2}__s2l_{device}{e2}"
     legacy.append(os.path.join(SRC_FOLDER, host_dir, *idx_parts))
 
-    # Legacy-2: <path_dir>/<last_seg>_=<query>.html
+    # Layout 2: <path_dir>/<last_seg>_=<query>.html
     legacy2_name = f"{last_seg}_={qs_safe}.html"
     if device:
         legacy2_name = f"{last_seg}_={qs_safe}__s2l_{device}.html"
@@ -5442,28 +5521,32 @@ def _migrate_legacy_cache(u: str, new_lp: str, device: str = "") -> str:
 def local_path(u: str, device: str = "") -> str:
     """Map a URL → its on-disk cache path.
 
-    Naming rules (the 09/10 cache rename):
+    Naming rules (the 10/10 layout):
 
-    * **No query string** — unchanged from before:
+    * **No query string** — the host folder mirrors the site's own paths:
         ``/a/b.js``      → ``host/a/b.js``
         ``/a/`` or ``/a`` → ``host/a/index.html``
 
-    * **Path has an extension + query** — the query is appended verbatim
-      between ``_=`` and the real extension, so the file is human-readable
-      and the extension (hence MIME) is preserved:
-        ``/a/b.js?v=1.2`` → ``host/a/b_=v=1.2.js``
-      No hash, no .html fallback — the upstream extension wins.
+    * **Any query string** — the file goes under the host's reserved
+      ``__query__/`` folder, so query variants never mix with real files:
 
-    * **Path has no extension + query** (binary endpoints such as
-      ``/v1/asset?id=N``) — the path becomes a directory and the query
-      string becomes the filename, with no extension added:
-        ``/v1/asset?id=N`` → ``host/v1/asset/id=N``
-      ``_serve_cached`` sniffs the file content to decide HTML vs
-      ``application/octet-stream`` because the on-disk path carries no
-      extension hint.
+      - path has an extension → the query sits between ``_=`` and the real
+        extension (MIME is preserved, name stays readable):
+            ``/a/b.js?v=1.2`` → ``host/__query__/a/b_=v=1.2.js``
+      - path has no extension (binary/data endpoints such as
+        ``/v1/asset?id=N``) → the path becomes a folder and the query is the
+        file name, no extension:
+            ``/v1/asset?id=N`` → ``host/__query__/v1/asset/id=N``
+        ``_serve_cached`` sniffs the content to decide HTML vs
+        ``application/octet-stream`` because the name carries no extension.
 
-    Legacy caches (``*_q<hash>*`` and ``<seg>_=<query>.html``) are
-    auto-migrated to the new layout on first request via
+      Query text is stored as sent (not decoded or re-ordered) and encoded
+      by ``_encode_query_for_filename()`` — readable, reversible in
+      practice, no collisions from lossy ``_`` replacement.
+
+    Caches from the three older layouts (``_q<hash>``, ``<seg>_=<query>.html``
+    and the 09/10 files that sat directly in the host folder) are
+    auto-migrated into ``__query__/`` on first request via
     ``_migrate_legacy_cache()``.
 
     `device` is a VARIANT TAG from _device_variant() ("", "mobile",
@@ -5480,51 +5563,51 @@ def local_path(u: str, device: str = "") -> str:
     path = p.path or "/"
     # ``splitext`` returns ('', '') for '/', ('/a/b', '') for '/a/b', and
     # ('/a/b', '.js') for '/a/b.js'. A trailing '/' means "directory" → no
-    # extension. We deliberately check this BEFORE the no-query fallback
-    # so the three branches below are mutually exclusive.
+    # extension.
     has_ext = bool(os.path.splitext(path)[1]) and not path.endswith("/")
 
     if p.query:
+        path_clean = path.rstrip("/")
+        dir_parts = [_safe_seg(x) for x in path_clean.split("/") if x]
         if has_ext:
-            # ── extension + query → base_=<query>.ext ──
-            path_clean = path.rstrip("/")
-            parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-            last = parts[-1]
-            base, ext = os.path.splitext(last)
-            qs_safe = _sanitize_query_for_filename(p.query)
-            parts[-1] = f"{base}_={qs_safe}{ext}"
+            # ── extension + query → __query__/<dirs>/base_=<query>.ext ──
+            base, ext = os.path.splitext(dir_parts.pop())
+            qname = _encode_query_for_filename(p.query, bare=False)
+            # Keep the whole name under the filesystem limit (long base +
+            # long query used to overflow 255 bytes and fail on write).
+            room = _FS_NAME_MAX - 2 - len(ext) - 12 - len(qname)   # 12 = device suffix
+            if len(base) > room:
+                base = base[:max(8, room - 13)] + "_" + hashlib.sha1(base.encode()).hexdigest()[:12]
+            parts = [_QUERY_DIR, *dir_parts, f"{base}_={qname}{ext}"]
         else:
-            # ── no extension + query → path-named folder + query-named file ──
-            # e.g. /v1/asset?id=N → host/v1/asset/id=N
-            path_clean = path.rstrip("/")
-            parts = [_safe_seg(x) for x in path_clean.split("/") if x]
-            qs_safe = _sanitize_query_for_filename(p.query)
-            parts.append(qs_safe)
+            # ── no extension + query → __query__/<path folders>/<query> ──
+            # e.g. /v1/asset?id=N → host/__query__/v1/asset/id=N
+            qname = _encode_query_for_filename(p.query, bare=True)
+            parts = [_QUERY_DIR, *dir_parts, qname]
     else:
-        # ── no query → unchanged from before ──
+        # ── no query → mirrors the site's own paths ──
         if path.endswith("/") or not os.path.splitext(path)[1]:
             path = path.rstrip("/") + "/index.html"
         parts = [_safe_seg(x) for x in path.split("/") if x]
 
     # Device-variant suffix — applied AFTER the query handling, to EVERY
     # file type. The __s2l_ prefix avoids colliding with real files. For
-    # no-extension files (the new "id=N" case) splitext returns ('', '')
-    # so we just append the tag with no extension — the result is still
+    # no-extension files (the bare query case) splitext returns ('', '') so
+    # the tag is appended with no extension — the result is still
     # extensionless and _serve_cached's content sniff still kicks in.
     if device and parts:
         base, ext = os.path.splitext(parts[-1])
         parts[-1] = f"{base}__s2l_{device}{ext}"
 
     # Strip the port and only the "www." PREFIX (not all occurrences) from netloc.
-    # Using .replace("www.", "") would mangle hosts like "mywww.example.com".
     # Stripping the port avoids ":" in directory names (invalid on Windows).
     host_dir = p.netloc.split("@")[-1].split(":")[0]   # strip user:pass@ and :port
     host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
     new_lp = os.path.join(SRC_FOLDER, host_dir, *parts)
 
-    # Auto-migrate legacy caches (_q<hash> and <seg>_=<query>.html) on
-    # first request. Idempotent and fast-path-gated — when the new file
-    # already exists this is a single os.path.isfile() call.
+    # Auto-migrate legacy caches on first request. Idempotent and
+    # fast-path-gated — when the new file already exists this is a single
+    # os.path.isfile() call.
     _migrate_legacy_cache(u, new_lp, device)
 
     return new_lp
