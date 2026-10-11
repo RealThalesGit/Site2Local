@@ -316,7 +316,7 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # When False, the matching /__s2l_*__ routes return 404 and their cross-links
 # are hidden from the other page, so the proxy runs headless with zero web
 # surface. Flip either on to expose the corresponding self-contained viewer.
-WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CDNVIEWER    = False            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4650,6 +4650,15 @@ def _build_s2l_injector() -> bytes:
         'var HP=' + json.dumps(hp) + ';'
         'var EXT=' + json.dumps(_EXT_PREFIX) + ';'
         'var MP=' + json.dumps(PORT) + ';'
+        # MS: the MAIN target's real scheme ("http:" / "https:"). SP: the real
+        # scheme of whatever document this script runs in — the main port
+        # reflects the target's scheme; every other port is a CDN mini-server
+        # whose upstream is always https (see _start_cdn_server). The
+        # location.protocol/origin spoof below uses SP so any site, http or
+        # https, keeps taking the same code path it takes on the original
+        # (sites that pick ws://:plain-port vs wss://:443 by protocol).
+        'var MS=' + json.dumps("http:" if str(SITE_URL).lower().startswith("http://") else "https:") + ';'
+        'var SP=(location.port===String(MP)||(!location.port&&MP===80))?MS:"https:";'
         'var PX="http://"+location.hostname+":"+MP;'
         'var DNR=' + _dr_regex_js + ';'
         'var DNR_RE=DNR?new RegExp(DNR,"i"):null;'
@@ -4695,7 +4704,7 @@ def _build_s2l_injector() -> bytes:
             'var cdnp=HP[p.hostname]||HP[p.host];'
             'if(p.host===M||p.host==="www."+M)return "ws://"+proxyHost+":"+proxyPort+p.pathname+(p.search||"")+(p.hash||"");'
             'if(cdnp)return "ws://"+proxyHost+":"+cdnp+p.pathname+(p.search||"")+(p.hash||"");'
-            'return "ws://"+proxyHost+":"+proxyPort+"/__s2l_ws_ext__/"+wh+p.pathname+(p.search||"")+(p.hash||"");'
+            'return "ws://"+proxyHost+":"+proxyPort+(p.protocol==="ws:"?"/__s2l_ws_ext_plain__/":"/__s2l_ws_ext__/")+wh+p.pathname+(p.search||"")+(p.hash||"");'
           '}'
           'if(p.host===M||p.host==="www."+M)return PX+p.pathname+(p.search||"")+(p.hash||"");'
           'if(HP[p.host])return "http://"+proxyHost+":"+HP[p.host]+p.pathname+(p.search||"")+(p.hash||"");'
@@ -4786,11 +4795,11 @@ def _build_s2l_injector() -> bytes:
         'try{'
           'var _locP2=Object.getPrototypeOf(location);'
           'Object.defineProperty(_locP2,"protocol",{'
-            'configurable:true,get:function(){return "https:";}'
+            'configurable:true,get:function(){return SP;}'
           '});'
           'Object.defineProperty(_locP2,"origin",{'
             'configurable:true,get:function(){'
-              'return "https://"+location.host;'
+              'return SP+"//"+location.host;'
             '}'
           '});'
         '}catch(e){}'
@@ -4874,7 +4883,7 @@ def _build_s2l_injector() -> bytes:
                 'try{'
                   'var pu=new URL(o);'
                   'var pp=pu.port?parseInt(pu.port,10):(pu.protocol==="https:"?443:80);'
-                  'if(pp===MP)return "https://"+M;'
+                  'if(pp===MP)return MS+"//"+M;'
                   'for(var h in HP){if(HP[h]===pp)return "https://"+h;}'
                 '}catch(_e){}'
                 'return o;'
@@ -9432,12 +9441,11 @@ def _ws_connect_upstream(ws_url: str, extra_headers: dict):
     if _CURL_CFFI_OK:
         try:
             return _CffiUpstreamWS(ws_url, extra_headers)
-        except Exception as e:
-            # _CffiUpstreamWS already logs the curl_cffi failure at WARN.
-            # Only log here if it was the IPv6-skip (which raises before the
-            # WARN log) so the user sees why we fell back to raw socket.
-            if "IPv6" in str(e):
-                log(f"WS: {e} — using raw socket fallback", "INFO")
+        except Exception:
+            # _CffiUpstreamWS already logs real curl_cffi failures at WARN.
+            # The IPv6-literal skip is expected (and silent): it falls through
+            # to the raw-socket path below, which handles IPv6 fine.
+            pass
     return _RawSocketUpstreamWS(ws_url, extra_headers)
 
 # NOTE: the old v1 `_pump_ws_frames` has been removed. The WS pipeline now
@@ -9903,6 +9911,7 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
 
             # ── Route matching ────────────────────────────────────────────
             ws_prefix_ext = "/__s2l_ws_ext__/"
+            ws_prefix_ext_plain = "/__s2l_ws_ext_plain__/"
             ws_prefix_tcp = "/__s2l_tcp__/"
             ws_prefix_udp = "/__s2l_udp__/"
 
@@ -9920,14 +9929,17 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
                 return
 
             # ── Build WS target URL ──────────────────────────────────────
-            if path.startswith(ws_prefix_ext):
-                wspath = path[len(ws_prefix_ext):]
+            if path.startswith(ws_prefix_ext) or path.startswith(ws_prefix_ext_plain):
+                _plain = path.startswith(ws_prefix_ext_plain)
+                wspath = path[len(ws_prefix_ext_plain if _plain else ws_prefix_ext):]
                 ws_host = wspath.split("/", 1)[0]
                 ws_path_q = wspath[len(ws_host):] or "/"
                 if query:
                     ws_path_q += f"?{query}"
-                target = f"https://{ws_host}{ws_path_q}"
-                req_display = f"/__s2l_ws_ext__/{wspath}"
+                # plain ws:// targets (original page used ws://, not wss://)
+                # must be dialed without TLS, keeping their explicit port.
+                target = f"{'http' if _plain else 'https'}://{ws_host}{ws_path_q}"
+                req_display = f"{ws_prefix_ext_plain if _plain else ws_prefix_ext}{wspath}"
             else:
                 # Main host WS, or a CDN mini-server's own host if this
                 # request came in on one of those ports (see s2l_target_base,
