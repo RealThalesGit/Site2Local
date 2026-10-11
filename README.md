@@ -10,7 +10,9 @@ Coming Soon!
 
 ## What i can change on it?
 You can change if you want or don't want to use the "dump all" (only avaliable in 7.0-8.0), you can enable or disable crawling (if you have already crawled the site, or you want crawling in demand only) 
+
 Change headers to mobile, tablet, desktop, macintosh, ie11, iphone, ipad, symbian, and bot. 
+
 Optional thing is that also you can enable rainbow logs (It will use lolcat if your system has it, but make sure to install lolcat before!), and there is so much others you can do.
 
 ## What i shouldn't do with it?
