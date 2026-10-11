@@ -1,8 +1,8 @@
 # Site2Local — Technical Documentation
 
-Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
+Documented version: V8.1 · Source: `Stable/s2l.py` · Updated: 2026-10-11
 
-> This document describes the source code in the `8.0` folder. It is based on code inspection; it is not a claim that every feature has been exercised against every browser, operating system, dependency combination, or upstream site. Validate behavior in the environment and against the sites you are authorized to mirror.
+> This document describes the source code in `Stable/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
 
 ## Contents
 
@@ -22,9 +22,8 @@ Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
 14. [Traffic capture](#14-traffic-capture)
 15. [Internal endpoints](#15-internal-endpoints)
 16. [Source-code map](#16-source-code-map)
-17. [Limitations and safe operation](#17-limitations-and-safe-operation)
+17. [Limitations and operational considerations](#17-limitations-and-operational-considerations)
 18. [Troubleshooting](#18-troubleshooting)
-19. [Keeping this document current](#19-keeping-this-document-current)
 
 ## 1. Overview
 
@@ -99,7 +98,7 @@ python -m pip install curl-cffi
 ### Configure and launch
 
 1. Edit the constants in the `CONFIG` section near the top of `s2l.py`. In this source version, configuration is by editing the file; there is no documented command-line configuration interface.
-2. Set `SITE` to a site you are authorized to mirror. Set `CRAWL = False` for browser-driven, on-demand fetching, or leave it enabled for background crawling.
+2. Set `SITE` to the upstream site. Set `CRAWL = False` for browser-driven, on-demand fetching, or leave it enabled for background crawling.
 3. Run the script:
 
    ```sh
@@ -119,6 +118,21 @@ The startup banner reports the target, listening address, device profile, select
 At startup, `CACHE_CDN = True` is disabled with a warning if `PROXY_CDN = False`. `MULTIPORT` has no effect when CDN proxying is disabled.
 
 When `GRACEFUL_SHUTDOWN = True`, the Ctrl+C handler waits for the save and enabled capture queues to drain before calling `os._exit`. This is queue draining, not a guarantee that every in-flight network request completes.
+
+### Common operating profiles
+
+These are configuration recipes, not separate modes or command-line flags:
+
+| Goal | Suggested settings | Result |
+|---|---|---|
+| Browse and cache as you go | `CRAWL = False`, `OFFLINE = False` | The browser drives upstream requests; eligible responses are cached. |
+| Crawl and then inspect offline | `CRAWL = True`, `OFFLINE = False`, then stop and set `OFFLINE = True` | Starts a background crawl, then a later run can serve the saved files without upstream requests. |
+| Use only an existing mirror | `OFFLINE = True` | Safe HTTP methods use cached files; uncached paths return an offline response. |
+| Diagnose external-resource failures | `PROXY_CDN = True`, then compare `MULTIPORT = True` and `False` | Tests dedicated CDN ports against the main-port `/__s2l_ext__/` route. |
+| Inspect or edit HTTP traffic | `HOOK_GUI = True` | Starts the optional PyQt6 traffic inspector; it requires a graphical session. |
+| Capture traffic for analysis | `CAPTURE = True` and optionally `CAPTURE_WS = True` | Writes HTTP and/or WebSocket records under `site_data`. Review capture data before sharing it. |
+
+Configuration is stored in the Python source, so changing an option normally requires restarting S2L. Cache and auxiliary data paths are relative to the process working directory.
 
 ## 3. Configuration reference
 
@@ -143,6 +157,10 @@ Values below are the defaults in the documented source. Some options interact; c
 
 The main listener default is reachable from other devices on the same reachable network. For loopback-only use, consider changing `HOST` to `127.0.0.1`.
 
+`DEVICE = "auto"` forwards the incoming browser User-Agent after sanitizing control characters and detects a broad device family for cache/session decisions. The documented profile names include `auto`, `mobile`, `macintosh`, `ie11`, `iphone`, `ipad`, and `bot`; the implementation may also recognize UA-derived classes such as `desktop`, `tablet`, and `symbian`. Cache variants collapse these profiles into canonical, mobile, and tablet families; see section 7.
+
+The connection pool limits apply per session. They are separate from the WSGI HTTP request thread-pool cap and the worker counts used by the crawler, scanner, and background discovery tasks.
+
 ### 3.2 Crawling and response handling
 
 | Setting       |      Default | Purpose                                                                 |
@@ -153,10 +171,10 @@ The main listener default is reachable from other devices on the same reachable 
 | `SCAN_LIMIT`  | `256 * 1024` | Maximum body bytes examined by `DUMP_ALL`.                              |
 | `CRAWL_DEPTH` |          `7` | Maximum URL path depth followed by the crawler.                         |
 | `WORKERS`     |         `60` | Crawler worker-pool size.                                               |
-| `SAVE_ERRORS` |      `False` | Whether eligible 4xx/5xx responses may be saved.                        |
+| `SAVE_ERRORS` |      `False` | Whether eligible 4xx/5xx GET responses may be saved to the main cache.   |
 | `SHOW_HIDDEN` |      `False` | Reveal selected hidden or disabled HTML elements.                       |
 
-`CRAWL` is ignored when offline. A crawl improves coverage but cannot guarantee that every resource, client-side route, authenticated view, or dynamically generated URL is discovered.
+`CRAWL` is ignored when offline. The crawler and discovery workers are separate from the request-serving thread pool. A crawl improves coverage but cannot guarantee that every resource, client-side route, authenticated view, or dynamically generated URL is discovered.
 
 ### 3.3 Disk cache and streams
 
@@ -167,7 +185,7 @@ The main listener default is reachable from other devices on the same reachable 
 | `SAVE_INTERVAL`          |              `0.15` | Maximum wait interval between save flushes, in seconds.                              |
 | `STREAM_CACHE_MAX_BYTES` | `256 * 1024 * 1024` | Maximum streamed response body accumulated for caching. `0` disables stream caching. |
 
-Large streams can still be relayed to the browser after the cache accumulation limit is reached; the limit is intended to bound memory use, not to impose a maximum browser download size.
+Large streams can still be relayed to the browser after the cache accumulation limit is reached; the limit is intended to bound memory use, not to impose a maximum browser download size. Cache writes use a background queue and worker, with `SAVE_BATCH` and `SAVE_INTERVAL` controlling flush batching.
 
 ### 3.4 CDN and external-host behavior
 
@@ -176,12 +194,14 @@ Large streams can still be relayed to the browser after the cache accumulation l
 | `PROXY_CDN`    |  `True` | Proxy supported external/CDN resources.                      |
 | `CACHE_CDN`    |  `True` | Save proxied CDN resources to disk.                          |
 | `MULTIPORT`    |  `True` | Start a dedicated local port for each registered CDN host.   |
-| `CDN_BLOCK`    |    `()` | CDN hosts to block.                                          |
-| `BLOCK_PATHS`  |    `()` | Target URL fragments/paths to block with `403`.              |
+| `CDN_BLOCK`    |    `()` | Hostname substrings excluded from CDN handling/discovery.    |
+| `BLOCK_PATHS`  |    `()` | URL substrings blocked with `403` on applicable proxy paths.  |
 | `DONT_REWRITE` |    `()` | Hosts or host/path patterns whose URLs should remain direct. |
 | `DUMP_TARGETS` |    `{}` | Additional targets used by discovery/extraction logic.       |
 
-When `MULTIPORT = False`, external resources use `/__s2l_ext__/` on the main port. `DONT_REWRITE` can be useful for third-party widgets that reject a local proxy origin; those requests then go directly from the browser to the external host.
+When `MULTIPORT = False`, external resources use `/__s2l_ext__/` on the main port. `DONT_REWRITE` can be useful for third-party widgets that reject a local proxy origin; those requests then go directly from the browser to the external host. Host entries can match subdomains; the source comments specify bare hostnames without a scheme or port.
+
+`DUMP_TARGETS` is an initially empty mapping used by URL-dump/discovery logic. When `DUMP_ALL` is enabled and this mapping is non-empty, only discovered URLs whose `netloc` is a key in `DUMP_TARGETS` are accepted, in addition to the configured main host. Keys therefore need to match the URL network location, including any explicit port.
 
 ### 3.5 WebSocket, SSE, and tunnels
 
@@ -230,7 +250,7 @@ The web viewer is disabled by default in this source version. When disabled, its
 
 ## 4. Architecture
 
-The application is implemented in a single Python file. Major components include:
+The application is implemented in a single Python file. Runtime state is divided between in-memory state (sessions, counters, queues, registered CDN ports, and active hooks) and filesystem state (cached responses, capture records, and persisted GUI hooks). Major components include:
 
 - **Main Flask application:** serves normal HTTP requests through Werkzeug on `PORT`.
 - **`_S2LWSGIRequestHandler`:** intercepts WebSocket upgrades and tunnel upgrades at the socket level before Flask routing.
@@ -242,9 +262,24 @@ The application is implemented in a single Python file. Major components include
 
 The source also contains URL/cache mapping, content decoding and MIME inference, response-header policy, streaming, WebSocket framing/relays, SSE handling, capture, and statistics.
 
+### Runtime directories
+
+At startup, the configured site is normalized into `SITE_URL`, `MAIN_HOST`, and `SITE_NAME` (the main host with a leading `www.` removed and dots replaced by underscores). The principal directories are created relative to the current working directory:
+
+```text
+site_src/<site-name>/                 cached upstream content
+site_data/<site-name>/                captures, scanner output, and site data
+site_data/MyHooks/<host>/             persisted GUI HTTP hooks
+site_data/MyWSHooks/<host>/           persisted GUI WebSocket hooks
+```
+
+Use the same working directory when restarting if you expect S2L to find the same cache and hook data. The folder name is derived from the configured main host; changing `SITE` can therefore select a different cache tree.
+
 ## 5. HTTP request lifecycle
 
 `proxy()` handles ordinary HTTP methods. WebSocket upgrades and raw tunnel upgrades are intercepted before a Flask view is called; see section 9.
+
+The main Flask catch-all route accepts `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`. `GET` and `HEAD` are treated as safe/cache lookup methods; `POST`, `PUT`, `PATCH`, and `DELETE` may carry a request body. `OPTIONS` is handled locally for preflight rather than being sent to the upstream.
 
 1. **Resolve target and apply local shortcuts.** S2L combines the configured upstream with the request path. It can answer selected document prefetches with `204`, serve a no-op Service Worker script, block configured paths with `403`, and answer `OPTIONS` locally with CORS/Private Network Access headers.
 2. **Handle offline requests.** In `OFFLINE` mode, S2L does not contact the upstream. For safe methods it looks for a device-specific cache variant, then a canonical file, and may also search known CDN caches. Missing content results in `404`. A body method against a path with only a cached GET may return `405`.
@@ -253,7 +288,7 @@ The source also contains URL/cache mapping, content decoding and MIME inference,
 5. **Retry selected connection failures.** The main proxy can rotate a client session and try fresh session implementations, including `curl_cffi`, cloudscraper-compatible sessions, and plain `requests`. If those attempts fail, a cached canonical copy may be used for a safe method; otherwise the client receives `502`.
 6. **Choose streaming or buffered processing.** Range/media/large-body hints and SSE request signals can cause the upstream request to use streaming. SSE is handled by `_stream_sse_resp()`; eligible media, partial, or large responses use `_stream_resp()`. Stream accumulation for disk caching is bounded by `STREAM_CACHE_MAX_BYTES`.
 7. **Normalize the upstream response.** Buffered response bodies are decompressed before applicable transformations. S2L adjusts MIME and response headers, detects selected WAF/bot pages and platforms, and handles special cases such as RSC-style payloads or unexpectedly empty bodies. A detected challenge/bot response is not saved as an ordinary cache entry.
-8. **Queue an eligible cache copy.** The upstream body is queued for disk saving before response hooks and browser-specific rewrites. This allows the cache to retain the upstream representation while delivery-time behavior is applied.
+8. **Queue an eligible cache copy.** Eligible `GET` responses with a body are queued for disk saving before response hooks and browser-specific rewrites. Error responses are excluded unless `SAVE_ERRORS` is enabled; bot/challenge and recognized wire-format responses may be excluded by their dedicated checks. This allows the cache to retain the upstream representation while delivery-time behavior is applied.
 9. **Rewrite and return.** Applicable HTML/CSS/JSON/JavaScript URL transformations are applied, HTML may receive S2L browser scripts, response hooks are applied, and the final response includes the relevant CORS, security, isolation, and freshness headers.
 10. **Reprocess cache hits for delivery.** `_cached_response()` applies relevant response transformations/hooks/headers when serving a cached body, instead of assuming a prior browser-specific transformation is appropriate for every later request.
 
@@ -267,6 +302,8 @@ The main cache is stored below:
 site_src/<site-name>/<host>/<path>
 ```
 
+For example, `https://www.example.test/catalog/item.js` maps under the site cache root to a host directory normalized from `example.test` and a path corresponding to `catalog/item.js`. Exact normalization and exceptional cases are handled by `local_path()`.
+
 `local_path()` maps a URL to a file path:
 
 - A path such as `/a/b.js` maps to the corresponding host directory and path.
@@ -277,7 +314,9 @@ site_src/<site-name>/<host>/<path>
 - Host ports and the `www.` prefix are normalized for filesystem use. Long path segments are shortened using a hash to respect filesystem limits.
 - Legacy cache layouts are migrated to the current query-cache layout when encountered.
 
-The exact filename encoding is an implementation detail; use `local_path()` and the current code as the source of truth when scripting against the cache.
+For a path with an extension and a query, the current layout places the entry under `__query__` while preserving the path hierarchy, with the encoded query inserted before the extension. For an extensionless path with a query, the URL path becomes directories and the query has its own final filename; filename encoding preserves query text while escaping filesystem-sensitive characters. Very long names are shortened to fit filesystem limits. The mapping is designed to keep query variants separate, but applications should use `local_path()` rather than constructing cache filenames themselves.
+
+The exact filename encoding can change between revisions. Use `local_path()` and the matching source revision as the source of truth when scripting against the cache.
 
 In offline mode, only cached content is available. Files edited manually in the cache are the local content S2L serves, subject to its response processing. The cache is associated with the configured site name; it is not automatically synchronized between installations.
 
@@ -440,7 +479,7 @@ Import-time availability determines which optional packages can be used. A succe
 
 The source identifies some Cloudflare/block responses (including selected challenge pages that return HTTP 200) and includes platform/WAF fingerprinting based on response headers and body. Detection is heuristic: false positives, false negatives, and unknown platforms are possible. The code does not automatically solve every challenge; waiting rooms and systems such as Anubis are documented limitations.
 
-Client sessions are separated by client identity for cookies/session state. Retry and session rotation logic is intended to recover from some connection failures; it does not make unsafe retrying of arbitrary application operations universally correct. Use only against sites where you have permission.
+Client sessions are separated by client identity for cookies/session state. Retry and session rotation logic is intended to recover from some connection failures; it does not make unsafe retrying of arbitrary application operations universally correct. A retry of a state-changing request can have different consequences if the upstream processed the first attempt before the connection failed.
 
 ## 13. Crawler and path scanner
 
@@ -462,9 +501,11 @@ The path scanner probes paths from files under `WORDLISTS_DIR` against the confi
 - `"all-in-dir"`: top-level wordlists only.
 - A relative wordlist path, such as `"common/admin.txt"`.
 
-Blank lines and lines beginning with `#` are ignored; leading slashes are stripped. `SCANS_PER_SECOND` caps aggregate probe rate when positive. `tqdm` is used for progress when available; otherwise progress is logged. If running interactively, the scanner can prompt for status filtering. In non-interactive sessions it skips the prompt. The scanner is ignored in offline mode.
+Blank lines and lines beginning with `#` are ignored; leading slashes are stripped. The scanner sends `HEAD` first and retries with `GET` when the server returns `405`; redirects are not followed. Responses other than `404` and `410` are recorded in `hidden_paths.json`, including statuses such as `401`, `403`, and redirects. The interactive status filter affects terminal logging, not which results are saved. The JSON output includes the scan time, target, mode, configured rate, filters, wordlist names, and result records containing path, URL, status, wordlist, and content type.
 
-Use path scanning only against targets you own or are explicitly authorized to test. It sends real requests to the upstream and should be rate-limited responsibly.
+`SCANS_PER_SECOND` caps aggregate probe rate when positive. The scanner uses a bounded worker pool; setting the value to zero or less disables the explicit rate cap. `tqdm` is used for progress when available; otherwise progress is logged. If running interactively, the scanner can prompt for status filtering. In non-interactive sessions it skips the prompt. The scanner is ignored in offline mode.
+
+Path scanning sends real HTTP requests to the upstream. Use a suitable wordlist and a rate limit appropriate to the network and server; non-positive `SCANS_PER_SECOND` values disable the scanner's explicit aggregate rate cap.
 
 ## 14. Traffic capture
 
@@ -533,7 +574,7 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 | Main proxy route                                 | 12500–13380; `proxy()`                                          |
 | Banner and startup                               | 13380–end                                                       |
 
-## 17. Limitations and safe operation
+## 17. Limitations and operational considerations
 
 - **Not a complete browser emulator:** compatibility varies by site, browser, dependency version, authentication model, and network environment.
 - **Incomplete mirror is possible:** crawler discovery and runtime rewriting cannot guarantee that every route or resource is found.
@@ -545,7 +586,6 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 - **Viewer endpoints have no authentication:** `WEB_CDNVIEWER` is off by default, but enabling it exposes statistics and a state-changing reset endpoint to clients that can reach the listener.
 - **Mirrored content is not sandboxed:** CSP is removed to support rewriting, and proxied pages run in the browser. Use a separate test browser profile and avoid signing into sensitive accounts unless you understand the consequences.
 - **Capture data can be sensitive:** do not commit or share raw captures without reviewing and redacting them.
-- **Authorization matters:** mirror and scan only sites you own or have explicit permission to test. Respect the upstream site's terms, rate limits, and access controls.
 
 ## 18. Troubleshooting
 
@@ -555,7 +595,7 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 | Main listener fails to bind                               | `PORT` is already in use or unavailable.                                                                       | Choose a free `PORT`. Multiport CDN servers also need free local ports.                                                                                  |
 | Browser cannot connect to S2L                             | Wrong address/port, stopped process, or local firewall rule.                                                   | Confirm the `Listening on ...` log and use the same host/port in the browser.                                                                            |
 | Main page loads but external scripts/fonts/images fail    | CDN host not registered, host excluded by `DONT_REWRITE`, occupied/blocked CDN port, or browser origin policy. | Check CDN logs, `/.__s2l_hp`, and browser developer tools. Compare with `MULTIPORT = False` if appropriate.                                              |
-| CAPTCHA, challenge, blank page, or upstream block appears | WAF, rate limit, unsupported challenge, or upstream returned an empty/challenge response.                      | Inspect status/logs and detected platform. `curl-cffi` may improve compatibility but is not a guarantee; reduce request volume and respect access rules. |
+| CAPTCHA, challenge, blank page, or upstream block appears | WAF, rate limit, unsupported challenge, or upstream returned an empty/challenge response.                      | Inspect status/logs and detected platform. `curl-cffi` may improve compatibility but is not a guarantee; reduce request volume and retry after the upstream's restriction window. |
 | Offline request returns `404`                             | The URL/query was not cached, the cache belongs to another site name, or the expected variant is missing.      | Inspect `site_src/<site-name>/`, confirm `SITE`, and fetch the resource online before switching to offline mode.                                         |
 | Video seeking or resuming fails                           | Upstream/client range behavior differs, the requested range is invalid, or the cached full file is missing.    | Inspect `206` and `Content-Range` in the browser/network log; verify the complete file is cached for offline playback.                                   |
 | WebSocket fails while offline                             | Expected limitation: a live socket cannot be served from the HTTP cache.                                       | Use online mode for pages requiring real-time connections.                                                                                               |
@@ -563,11 +603,3 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 | PyQt6 GUI does not open                                   | `HOOK_GUI` is off, PyQt6 is missing, or no graphical desktop is available.                                     | Enable `HOOK_GUI`, install PyQt6 in the active environment, and run in a graphical session. The proxy can run without the GUI.                           |
 
 When diagnosing cache behavior, verify that a file actually exists under the expected `site_src` tree; a page rendering once does not prove that every resource was saved. An offline run is a useful coverage check but will expose missing resources as 404s. Use the browser developer tools and S2L logs together to identify the failing URL and status.
-
-## 19. Keeping this document current
-
-- Verify defaults against the `CONFIG` block in the exact `s2l.py` revision being documented.
-- Update the version/date, source-code map, endpoints, examples, and limitations when code changes.
-- Distinguish behavior inferred from source from behavior tested at runtime. Browser, target, network, and optional dependency differences matter.
-- Avoid documenting secrets or real user data. Never include raw cookies, tokens, captures, or private upstream content in examples.
-- For behavior with multiple branches, link the explanation to the actual source function and check all relevant routes (main, CDN, cached, streaming, and error paths) before claiming it is universal.
