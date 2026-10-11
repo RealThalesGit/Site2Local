@@ -306,6 +306,7 @@ SCANS_PER_SECOND = 10           # SCAN_PATHS rate limit + progress refresh caden
                                 #   Set to 0 (or a negative) to disable the rate
                                 #   limit — the scanner then runs as fast as 8
                                 #   worker threads allow (no cap).
+WORDLISTS_DIR = "Wordlists"      # wordlist files for SCAN_PATHS (one path per line)
 CAPTURE = False                  # record every request+response as JSON
 CAPTURE_CDN = False              # include CDN responses in captures
 CAPTURE_BODIES = False            # include request bodies in captures
@@ -5660,7 +5661,6 @@ MAIN_HOST = urlparse(SITE_URL).netloc
 SITE_NAME = MAIN_HOST.removeprefix("www.").replace(".", "_")
 SRC_FOLDER  = os.path.join("site_src",  SITE_NAME)
 DATA_FOLDER = os.path.join("site_data", SITE_NAME)
-WORDLISTS_DIR = "wordlists"   # wordlist files for SCAN_PATHS (one path per line)
 os.makedirs(SRC_FOLDER,  exist_ok=True)
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
