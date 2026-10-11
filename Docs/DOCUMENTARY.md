@@ -2,7 +2,7 @@
 
 Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
 
-> This document describes the source code in the `Stable` folder. It is based on code inspection; it is not a claim that every feature has been exercised against every browser, operating system, dependency combination, or upstream site. Validate behavior in the environment and against the sites you are authorized to mirror.
+> This document describes the source code in the `8.0` folder. It is based on code inspection; it is not a claim that every feature has been exercised against every browser, operating system, dependency combination, or upstream site. Validate behavior in the environment and against the sites you are authorized to mirror.
 
 ## Contents
 
@@ -28,7 +28,7 @@ Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
 
 ## 1. Overview
 
-site2local (S2L) is a Python reverse proxy and disk-backed site mirror built around Flask and Werkzeug. It listens locally, forwards eligible requests to a configured upstream site, rewrites selected URLs so the browser continues to use the proxy, and saves eligible upstream responses to disk. Saved files can be edited and served later, including in offline mode.
+Site2Local (S2L) is a Python reverse proxy and disk-backed site mirror built around Flask and Werkzeug. It listens locally, forwards eligible requests to a configured upstream site, rewrites selected URLs so the browser continues to use the proxy, and saves eligible upstream responses to disk. Saved files can be edited and served later, including in offline mode.
 
 Major features in this source version include:
 
@@ -48,7 +48,7 @@ The main operating modes are:
 - **Background crawl:** set `CRAWL = True`; a crawler starts from the configured site URL while the proxy is running.
 - **Offline serving:** set `OFFLINE = True`; regular HTTP content is served from the local cache only. WebSocket connections cannot be replayed from the HTTP cache.
 
-S2L is a mirroring and development tool, not a general-purpose production web server or a security boundary.
+Site2Local is a mirroring and development tool, not a general-purpose production web server or a security boundary.
 
 ## 2. Installation and first run
 
