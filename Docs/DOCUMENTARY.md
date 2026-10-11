@@ -1,8 +1,8 @@
 # Site2Local — Technical Documentation
 
-Documented version: V8.1 · Source: `Stable/s2l.py` · Updated: 2026-10-11
+Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
 
-> This document describes the source code in `Stable/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
+> This document describes the source code in `8.0/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
 
 ## Contents
 
@@ -123,14 +123,14 @@ When `GRACEFUL_SHUTDOWN = True`, the Ctrl+C handler waits for the save and enabl
 
 These are configuration recipes, not separate modes or command-line flags:
 
-| Goal | Suggested settings | Result |
-|---|---|---|
-| Browse and cache as you go | `CRAWL = False`, `OFFLINE = False` | The browser drives upstream requests; eligible responses are cached. |
-| Crawl and then inspect offline | `CRAWL = True`, `OFFLINE = False`, then stop and set `OFFLINE = True` | Starts a background crawl, then a later run can serve the saved files without upstream requests. |
-| Use only an existing mirror | `OFFLINE = True` | Safe HTTP methods use cached files; uncached paths return an offline response. |
-| Diagnose external-resource failures | `PROXY_CDN = True`, then compare `MULTIPORT = True` and `False` | Tests dedicated CDN ports against the main-port `/__s2l_ext__/` route. |
-| Inspect or edit HTTP traffic | `HOOK_GUI = True` | Starts the optional PyQt6 traffic inspector; it requires a graphical session. |
-| Capture traffic for analysis | `CAPTURE = True` and optionally `CAPTURE_WS = True` | Writes HTTP and/or WebSocket records under `site_data`. Review capture data before sharing it. |
+| Goal                                | Suggested settings                                                    | Result                                                                                           |
+| ----------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Browse and cache as you go          | `CRAWL = False`, `OFFLINE = False`                                    | The browser drives upstream requests; eligible responses are cached.                             |
+| Crawl and then inspect offline      | `CRAWL = True`, `OFFLINE = False`, then stop and set `OFFLINE = True` | Starts a background crawl, then a later run can serve the saved files without upstream requests. |
+| Use only an existing mirror         | `OFFLINE = True`                                                      | Safe HTTP methods use cached files; uncached paths return an offline response.                   |
+| Diagnose external-resource failures | `PROXY_CDN = True`, then compare `MULTIPORT = True` and `False`       | Tests dedicated CDN ports against the main-port `/__s2l_ext__/` route.                           |
+| Inspect or edit HTTP traffic        | `HOOK_GUI = True`                                                     | Starts the optional PyQt6 traffic inspector; it requires a graphical session.                    |
+| Capture traffic for analysis        | `CAPTURE = True` and optionally `CAPTURE_WS = True`                   | Writes HTTP and/or WebSocket records under `site_data`. Review capture data before sharing it.   |
 
 Configuration is stored in the Python source, so changing an option normally requires restarting S2L. Cache and auxiliary data paths are relative to the process working directory.
 
@@ -171,7 +171,7 @@ The connection pool limits apply per session. They are separate from the WSGI HT
 | `SCAN_LIMIT`  | `256 * 1024` | Maximum body bytes examined by `DUMP_ALL`.                              |
 | `CRAWL_DEPTH` |          `7` | Maximum URL path depth followed by the crawler.                         |
 | `WORKERS`     |         `60` | Crawler worker-pool size.                                               |
-| `SAVE_ERRORS` |      `False` | Whether eligible 4xx/5xx GET responses may be saved to the main cache.   |
+| `SAVE_ERRORS` |      `False` | Whether eligible 4xx/5xx GET responses may be saved to the main cache.  |
 | `SHOW_HIDDEN` |      `False` | Reveal selected hidden or disabled HTML elements.                       |
 
 `CRAWL` is ignored when offline. The crawler and discovery workers are separate from the request-serving thread pool. A crawl improves coverage but cannot guarantee that every resource, client-side route, authenticated view, or dynamically generated URL is discovered.
@@ -195,7 +195,7 @@ Large streams can still be relayed to the browser after the cache accumulation l
 | `CACHE_CDN`    |  `True` | Save proxied CDN resources to disk.                          |
 | `MULTIPORT`    |  `True` | Start a dedicated local port for each registered CDN host.   |
 | `CDN_BLOCK`    |    `()` | Hostname substrings excluded from CDN handling/discovery.    |
-| `BLOCK_PATHS`  |    `()` | URL substrings blocked with `403` on applicable proxy paths.  |
+| `BLOCK_PATHS`  |    `()` | URL substrings blocked with `403` on applicable proxy paths. |
 | `DONT_REWRITE` |    `()` | Hosts or host/path patterns whose URLs should remain direct. |
 | `DUMP_TARGETS` |    `{}` | Additional targets used by discovery/extraction logic.       |
 
@@ -589,17 +589,17 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 
 ## 18. Troubleshooting
 
-| Symptom                                                   | Likely causes                                                                                                  | Checks and next steps                                                                                                                                    |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ModuleNotFoundError` at startup                          | A required package is missing from the active Python environment.                                              | Activate/use the intended virtual environment and install the required packages there.                                                                   |
-| Main listener fails to bind                               | `PORT` is already in use or unavailable.                                                                       | Choose a free `PORT`. Multiport CDN servers also need free local ports.                                                                                  |
-| Browser cannot connect to S2L                             | Wrong address/port, stopped process, or local firewall rule.                                                   | Confirm the `Listening on ...` log and use the same host/port in the browser.                                                                            |
-| Main page loads but external scripts/fonts/images fail    | CDN host not registered, host excluded by `DONT_REWRITE`, occupied/blocked CDN port, or browser origin policy. | Check CDN logs, `/.__s2l_hp`, and browser developer tools. Compare with `MULTIPORT = False` if appropriate.                                              |
+| Symptom                                                   | Likely causes                                                                                                  | Checks and next steps                                                                                                                                                             |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ModuleNotFoundError` at startup                          | A required package is missing from the active Python environment.                                              | Activate/use the intended virtual environment and install the required packages there.                                                                                            |
+| Main listener fails to bind                               | `PORT` is already in use or unavailable.                                                                       | Choose a free `PORT`. Multiport CDN servers also need free local ports.                                                                                                           |
+| Browser cannot connect to S2L                             | Wrong address/port, stopped process, or local firewall rule.                                                   | Confirm the `Listening on ...` log and use the same host/port in the browser.                                                                                                     |
+| Main page loads but external scripts/fonts/images fail    | CDN host not registered, host excluded by `DONT_REWRITE`, occupied/blocked CDN port, or browser origin policy. | Check CDN logs, `/.__s2l_hp`, and browser developer tools. Compare with `MULTIPORT = False` if appropriate.                                                                       |
 | CAPTCHA, challenge, blank page, or upstream block appears | WAF, rate limit, unsupported challenge, or upstream returned an empty/challenge response.                      | Inspect status/logs and detected platform. `curl-cffi` may improve compatibility but is not a guarantee; reduce request volume and retry after the upstream's restriction window. |
-| Offline request returns `404`                             | The URL/query was not cached, the cache belongs to another site name, or the expected variant is missing.      | Inspect `site_src/<site-name>/`, confirm `SITE`, and fetch the resource online before switching to offline mode.                                         |
-| Video seeking or resuming fails                           | Upstream/client range behavior differs, the requested range is invalid, or the cached full file is missing.    | Inspect `206` and `Content-Range` in the browser/network log; verify the complete file is cached for offline playback.                                   |
-| WebSocket fails while offline                             | Expected limitation: a live socket cannot be served from the HTTP cache.                                       | Use online mode for pages requiring real-time connections.                                                                                               |
-| Worker or cross-origin resource fails from a LAN IP       | Browser secure-context or CORS/COEP behavior differs from `localhost`.                                         | Test with `localhost`, inspect browser console/network errors, and verify relevant response headers.                                                     |
-| PyQt6 GUI does not open                                   | `HOOK_GUI` is off, PyQt6 is missing, or no graphical desktop is available.                                     | Enable `HOOK_GUI`, install PyQt6 in the active environment, and run in a graphical session. The proxy can run without the GUI.                           |
+| Offline request returns `404`                             | The URL/query was not cached, the cache belongs to another site name, or the expected variant is missing.      | Inspect `site_src/<site-name>/`, confirm `SITE`, and fetch the resource online before switching to offline mode.                                                                  |
+| Video seeking or resuming fails                           | Upstream/client range behavior differs, the requested range is invalid, or the cached full file is missing.    | Inspect `206` and `Content-Range` in the browser/network log; verify the complete file is cached for offline playback.                                                            |
+| WebSocket fails while offline                             | Expected limitation: a live socket cannot be served from the HTTP cache.                                       | Use online mode for pages requiring real-time connections.                                                                                                                        |
+| Worker or cross-origin resource fails from a LAN IP       | Browser secure-context or CORS/COEP behavior differs from `localhost`.                                         | Test with `localhost`, inspect browser console/network errors, and verify relevant response headers.                                                                              |
+| PyQt6 GUI does not open                                   | `HOOK_GUI` is off, PyQt6 is missing, or no graphical desktop is available.                                     | Enable `HOOK_GUI`, install PyQt6 in the active environment, and run in a graphical session. The proxy can run without the GUI.                                                    |
 
 When diagnosing cache behavior, verify that a file actually exists under the expected `site_src` tree; a page rendering once does not prove that every resource was saved. An offline run is a useful coverage check but will expose missing resources as 404s. Use the browser developer tools and S2L logs together to identify the failing URL and status.
