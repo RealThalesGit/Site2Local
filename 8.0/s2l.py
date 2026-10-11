@@ -102,6 +102,12 @@ except ImportError:
     _CurlWsFlag    = None
     _CURL_CFFI_OK  = False
 
+# WAFW00F is optional; without it, proxying continues with an explicit status.
+try:
+    from wafw00f.main import WAFW00F as _WAFW00F
+except ImportError:
+    _WAFW00F = None
+
 # tqdm: progress bar library used by SCAN_PATHS to show scan progress
 # in-place (one updating line) instead of spamming a new log line per
 # batch of paths. Optional — when missing, the scanner falls back to
@@ -522,98 +528,26 @@ _STRIP_FWD_EXTRA = frozenset({
 })
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Platform / WAF detection (dynamic)
-#
-# Data-driven: each signature is (name, header_test, body_test). The detector
-# runs signatures in priority order and returns the first match, so the most
-# specific / reliable signals are listed first. `body` is optional and lets the
-# detector recognise a WAF from its challenge / block page even when the
-# headers are ambiguous (e.g. a CDN in front of a WAF strips the WAF's own
-# Server header). Callers that only have headers keep working unchanged.
+# WAFW00F detection
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Header-key signatures. `h` is the lower-cased header dict. Each test receives
-# the full lower-cased dict so it can inspect presence, not just value.
-_WAF_HEADER_SIGS: tuple[tuple[str, Callable[[dict], bool]], ...] = (
-    ("Cloudflare",        lambda h: "cf-ray" in h or "cloudflare" in h.get("server", "")
-                                    or "cf-cache-status" in h),
-    ("Akamai",            lambda h: ("akamai" in h.get("server", "") or "akamaized" in h.get("server", "")
-                                    or "akamai" in h.get("via", "") or "x-akamai-transformed" in h
-                                    or "x-akamai-request-id" in h)),
-    ("Sucuri WAF",        lambda h: "sucuri" in h.get("server", "") or "x-sucuri-id" in h
-                                    or "x-sucuri-cache" in h),
-    ("Imperva/Incapsula", lambda h: "incapsula" in h.get("server", "") or "imperva" in h.get("server", "")
-                                    or "x-iinfo" in h or "incap_ses" in str(h.get("set-cookie", ""))),
-    ("AWS CloudFront",    lambda h: "cloudfront" in h.get("server", "") or "cloudfront" in h.get("via", "")
-                                    or any("x-amz-cf" in k for k in h)),
-    ("Fastly",            lambda h: "fastly" in h.get("server", "") or "fastly" in h.get("via", "")
-                                    or "x-served-by" in h and "cache-" in h.get("x-served-by", "")),
-    ("ESF",               lambda h: "esf" in h.get("server", "").lower()
-                                    or any("x-esf" in k for k in h)
-                                    or "x-edge-security-filter" in h),
-    ("Edgecast CDN",      lambda h: "edgecast" in h.get("server", "") or "ecs" in h.get("server", "").lower()),
-    ("Section.io",        lambda h: "section.io" in h.get("via", "") or "x-section-io" in h),
-    ("StackPath",         lambda h: "stackpath" in h.get("server", "") or "x-sp-url" in h),
-    ("Reblaze",           lambda h: "reblaze" in h.get("server", "") or "rbzid" in h),
-    ("Distil",            lambda h: "distil" in h.get("server", "") or "x-distil-cs" in h),
-    ("F5 BIG-IP",         lambda h: "bigip" in h.get("server", "") or "x-f5" in h),
-    ("Citrix Netscaler",  lambda h: "netscaler" in h.get("server", "") or "via" in h and "ns-cache" in h.get("via", "")),
-    ("Oracle Cloud",      lambda h: "oracle" in h.get("server", "") or "x-oracle" in h),
-    ("Azure Front Door",  lambda h: "azure" in h.get("server", "") or "x-azure-ref" in h),
-    ("Varnish",           lambda h: "varnish" in h.get("server", "") or "varnish" in h.get("via", "")
-                                    or "x-varnish" in h),
-    ("Nginx",             lambda h: "nginx" in h.get("server", "")),
-    ("Apache",            lambda h: "apache" in h.get("server", "")),
-    ("LiteSpeed",         lambda h: "litespeed" in h.get("server", "")),
-    ("Microsoft-IIS",     lambda h: "microsoft-iis" in h.get("server", "")),
-)
+_WAF_DETECTION_RESULT = "Skipped (offline)" if OFFLINE else "Unknown"
 
-# Body signatures: substring markers that appear on a WAF's challenge / block
-# page. Lower-cased byte patterns. Checked only when `body` is supplied.
-_WAF_BODY_SIGS: tuple[tuple[str, bytes], ...] = (
-    ("Cloudflare",        b"cloudflare"),
-    ("Sucuri WAF",        b"sucuri"),
-    ("Akamai",            b"reference #"),  # Akamai reference-block pages
-    ("Imperva/Incapsula", b"incapsula"),
-    ("Edgecast CDN",      b"edgecast"),
-    ("ESF",               b"edge security filter"),
-)
+def detect_platform(target_url: str) -> str:
+    """Actively fingerprint the upstream with WAFW00F."""
+    if _WAFW00F is None:
+        return "Unavailable"
 
-def detect_platform(headers: dict, body: bytes | str | None = None) -> str:
-    """Dynamically detect the upstream platform / WAF.
+    scanner = _WAFW00F(target_url, timeout=min(TIMEOUT_READ, 10))
+    if scanner.rq is None:
+        raise RuntimeError(f"WAFW00F could not reach {target_url}")
 
-    Inspects response headers (and optionally the body) against a signature
-    table. Returns the platform name, or "Unknown". The body argument is
-    optional so existing callers that pass only headers keep working; when
-    supplied, a challenge/block page is recognised even when an upstream CDN
-    has stripped the WAF's own Server header.
-    """
-    h = {k.lower(): v.lower() if isinstance(v, str) else str(v).lower()
-         for k, v in headers.items()}
-    # Keep the original-cased CF-RAY lookup too (some servers emit it mixed-case).
-    if "cf-ray" not in h:
-        for k, v in headers.items():
-            if k.lower() == "cf-ray" and v:
-                h["cf-ray"] = str(v).lower()
-                break
-
-    for name, test in _WAF_HEADER_SIGS:
-        try:
-            if test(h):
-                return name
-        except Exception:
-            continue
-
-    if body:
-        if isinstance(body, str):
-            body_b = body.encode("utf-8", "ignore")
-        else:
-            body_b = bytes(body)
-        head = body_b[:8192].lower()
-        for name, marker in _WAF_BODY_SIGS:
-            if marker in head:
-                return name
-    return "Unknown"
+    detected, _trigger_url = scanner.identwaf()
+    if detected:
+        return ", ".join(name.split(" (", 1)[0] for name in detected)
+    if scanner.genericdetect():
+        return "Generic WAF"
+    return "No WAF detected"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hook system
@@ -5655,8 +5589,15 @@ def build_base_url(raw: str) -> str | None:
             try:
                 r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
                 if r.status_code < 500:
-                    platform = detect_platform(dict(r.headers), r.content)
-                    log(f"Resolved {raw} → {r.url}  [{platform}]  IP: {resolve_ip(urlparse(r.url).netloc)}", "INFO")
+                    global _WAF_DETECTION_RESULT
+                    try:
+                        _WAF_DETECTION_RESULT = detect_platform(r.url)
+                    except Exception as exc:
+                        _WAF_DETECTION_RESULT = "Detection failed"
+                        log(f"WAFW00F scan failed: {_short_exc(exc)}", "ERROR")
+                    if _WAF_DETECTION_RESULT == "Unavailable":
+                        log("WAFW00F is not installed; install it with `python -m pip install wafw00f`.", "ERROR")
+                    log(f"Resolved {raw} → {r.url}  [{_WAF_DETECTION_RESULT}]  IP: {resolve_ip(urlparse(r.url).netloc)}", "INFO")
                     return r.url
             except Exception as e:
                 log(f"Probing {scheme+raw}: {_short_exc(e)}", "WARN")
@@ -6381,10 +6322,7 @@ _START_TS = time.time()
 # ──────────────────────────────────────────────────────────────────────────────
 # Live WAF/platform + per-CDN-host health registries (for the web viewer)
 #
-# _last_platform: the platform/WAF name returned by the most recent
-#   detect_platform() call on an upstream response. Updated from _do_upstream
-#   so the viewer always shows what the target site is currently fronted by
-#   (Cloudflare / Akamai / Sucuri / ...) without the viewer having to fetch.
+# _last_platform: the WAFW00F result from startup, exposed to the viewer.
 #
 # _cdn_health: per-CDN-host lightweight health record:
 #   {host: {"last_seen": epoch, "requests": int, "errors": int,
@@ -6393,14 +6331,11 @@ _START_TS = time.time()
 # viewer can show a green/red health dot + last-seen relative time + RTT per
 # host. Bounded: entries are pruned when a host leaves _cdn_host_port.
 # ──────────────────────────────────────────────────────────────────────────────
-_last_platform = {"name": "Unknown", "ts": 0.0}
+_last_platform = {
+    "name": _WAF_DETECTION_RESULT,
+    "ts": time.time() if _WAF_DETECTION_RESULT not in ("Unknown", "Skipped (offline)") else 0.0,
+}
 _last_platform_lock = threading.Lock()
-
-def set_last_platform(name: str) -> None:
-    """Record the most recently detected upstream platform/WAF (thread-safe)."""
-    with _last_platform_lock:
-        _last_platform["name"] = name or "Unknown"
-        _last_platform["ts"] = time.time()
 
 def get_last_platform() -> dict:
     with _last_platform_lock:
@@ -13159,9 +13094,6 @@ def proxy(path: str) -> Response:
     ctx.resp_ct      = _ensure_wasm_content_type(
         upstream_r.headers.get("Content-Type", "application/octet-stream"),
         urlparse(target).path or "")
-    platform         = detect_platform(dict(upstream_r.headers), body)
-    set_last_platform(platform)   # surface in the web viewer header
-
     # Detect RSC wire format — re-fetch with stronger HTML signal
     if _is_wire_payload(body) and method == "GET":
         log(f"RSC detected on {urlparse(target).path} — re-fetching as full HTML", "WARN")
@@ -13432,13 +13364,15 @@ def _banner() -> None:
     _l_target  = f"  {DIM}Target:  {R}  {G}{MAIN_HOST}{R} {DIM}({ip}){R}"
     _l_proxy   = f"  {DIM}Proxy:   {R}  {W}http://{HOST}:{PORT}{R}"
     _l_device  = f"  {DIM}Device:  {R}  {device_str}"
+    _waf_name  = get_last_platform().get("name", _WAF_DETECTION_RESULT)
+    _l_waf     = f"  {DIM}WAF:     {R}  {Y}[{_waf_name}]{R}"
     _l_bypass  = f"  {DIM}Bypass:  {R}  {bypass_eng}"
     _l_workers = f"  {DIM}Workers: {R}  {W}{WORKERS}{R}"
     _l_timeout = f"  {DIM}Timeout: {R}  {W}connect={TIMEOUT_CONN}s  read={TIMEOUT_READ}s{R}"
     _l_retries = f"  {DIM}Retries: {R}  {W}{RETRIES}× backoff={BACKOFF}s{R}"
     _l_hooks   = f"  {DIM}Hooks:   {R}  {hook_str}"
     _l_flags   = f"  {DIM}Flags:   {R}  {flag_str}"
-    _body_lines = [_l_target, _l_proxy, _l_device, _l_bypass, _l_workers,
+    _body_lines = [_l_target, _l_proxy, _l_device, _l_waf, _l_bypass, _l_workers,
                    _l_timeout, _l_retries, _l_hooks, _l_flags]
 
     # Box width: max of default (54), title core, and all body visible widths
