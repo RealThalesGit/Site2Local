@@ -6,7 +6,7 @@ A **Vibe-coded** python project which makes a existent website running on localh
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
 
 # Documentary
-It's accessible in (here)[https://github.com/RealThalesGit/Site2Local/blob/main/Docs/DOCUMENTARY.md]
+It's accessible in [here](https://github.com/RealThalesGit/Site2Local/blob/main/Docs/DOCUMENTARY.md)
 
 ## What i can change on it?
 You can change if you want or don't want to use the "dump all" (only avaliable in 7.0-8.0), you can enable or disable crawling (if you have already crawled the site, or you want crawling in demand only) 
