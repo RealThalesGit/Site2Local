@@ -1,8 +1,8 @@
 # Site2Local — Technical Documentation
 
-Documented version: V8.1 · Source: `Stable/s2l.py` · Updated: 2026-10-11
+Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
 
-> This document describes the source code in `Stable/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
+> This document describes the source code in `8.0/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
 
 ## Contents
 
