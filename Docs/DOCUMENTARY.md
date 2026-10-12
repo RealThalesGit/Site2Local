@@ -1,8 +1,8 @@
 # Site2Local — Technical Documentation
 
-Documented version: V8.1 · Source: `8.0/s2l.py` · Updated: 2026-10-11
+Documented version: V8.1 · Source: `Stable/s2l.py` · Updated: 2026-10-11
 
-> This document describes the source code in `8.0/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
+> This document describes the source code in `Stable/s2l.py`. It combines source-level documentation with operational guidance. Runtime behavior can vary by browser, operating system, dependency versions, network, and upstream application.
 
 ## Contents
 
@@ -63,6 +63,7 @@ The source uses Python 3.10 or newer and requires these packages:
 
 Optional packages and tools:
 
+- `wafw00f`: active WAF fingerprinting during upstream URL resolution. Install with `python -m pip install wafw00f`.
 - `curl-cffi`: browser-like TLS fingerprints and the preferred upstream session when available.
 - `ai-cloudscraper` or `cloudscraper`: alternate upstream session implementation.
 - `brotli`: Brotli response decompression.
@@ -92,13 +93,13 @@ python -m pip install requests urllib3 beautifulsoup4 flask colorama
 Install optional packages in the same environment as needed. For example:
 
 ```sh
-python -m pip install curl-cffi
+python -m pip install curl-cffi wafw00f
 ```
 
 ### Configure and launch
 
-1. Edit the constants in the `CONFIG` section near the top of `s2l.py`. In this source version, configuration is by editing the file; there is no documented command-line configuration interface.
-2. Set `SITE` to the upstream site. Set `CRAWL = False` for browser-driven, on-demand fetching, or leave it enabled for background crawling.
+1. Edit the constants in the `CONFIG` section near the top of `s2l.py`. In this source version, configuration is by editing the file; there is no command-line configuration interface.
+2. Set `SITE` to the upstream hostname, without `http://` or `https://`. The resolver tries HTTPS and then HTTP. Although the inline source comment also says "URL", the implementation prepends its own scheme and expects a hostname here. Set `CRAWL = False` for browser-driven, on-demand fetching, or leave it enabled for background crawling.
 3. Run the script:
 
    ```sh
@@ -113,7 +114,7 @@ python -m pip install curl-cffi
 
 4. Open `http://localhost:8080` in a browser, or use the configured `PORT`.
 
-The startup banner reports the target, listening address, device profile, selected upstream engine, timeouts, retry settings, hooks, and enabled flags. If a port is already occupied, change `PORT` and restart. CDN multiport mode also needs additional available ports.
+The script resolves the configured upstream and runs the optional WAFW00F scan while Python imports the module, before entering the `__main__` startup block. This means network access and the scan can delay startup even before the banner appears; importing `s2l.py` from another Python module also performs this initialization. In offline mode, upstream probing and the WAF scan are skipped. The startup banner reports the target, listening address, device profile, WAF result, selected upstream engine, timeouts, retry settings, hooks, and enabled flags. If a port is already occupied, change `PORT` and restart. CDN multiport mode also needs additional available ports.
 
 At startup, `CACHE_CDN = True` is disabled with a warning if `PROXY_CDN = False`. `MULTIPORT` has no effect when CDN proxying is disabled.
 
@@ -134,6 +135,8 @@ These are configuration recipes, not separate modes or command-line flags:
 
 Configuration is stored in the Python source, so changing an option normally requires restarting S2L. Cache and auxiliary data paths are relative to the process working directory.
 
+Optional dependencies are checked/imported during module initialization. Install them into the same Python environment used to launch the script. WAFW00F is optional: if missing, S2L continues and reports `Unavailable`; most other optional packages similarly disable only their dependent feature or cause a feature-specific warning.
+
 ## 3. Configuration reference
 
 Values below are the defaults in the documented source. Some options interact; check the corresponding sections before changing them.
@@ -142,7 +145,7 @@ Values below are the defaults in the documented source. Some options interact; c
 
 | Setting               |         Default | Purpose                                                                                                                             |
 | --------------------- | --------------: | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `SITE`                | `"example.com"` | Upstream domain or URL to mirror.                                                                                                   |
+| `SITE`                | `"example.com"` | Upstream hostname/domain to mirror, without a URL scheme.                                                                            |
 | `HOST`                |     `"0.0.0.0"` | Local listen address. `0.0.0.0` binds to all IPv4 interfaces.                                                                       |
 | `PORT`                |          `8080` | Main proxy port.                                                                                                                    |
 | `DEVICE`              |        `"auto"` | User-Agent profile. `auto` follows the requesting browser; fixed profiles include mobile/device variants, Macintosh, IE11, and bot. |
@@ -262,6 +265,19 @@ The application is implemented in a single Python file. Runtime state is divided
 
 The source also contains URL/cache mapping, content decoding and MIME inference, response-header policy, streaming, WebSocket framing/relays, SSE handling, capture, and statistics.
 
+### Startup and process lifecycle
+
+The startup sequence is significant:
+
+1. Python imports dependencies and initializes module-level state, directories, shared sessions, and the daemon cache-save worker.
+2. `build_base_url(SITE)` probes HTTPS and then HTTP as needed. On a successful response, `detect_platform()` invokes WAFW00F synchronously when installed; this active scan is performed once for the configured main target.
+3. S2L derives `SITE_URL`, `MAIN_HOST`, `SITE_NAME`, and creates the cache/data directories.
+4. Executing the file as a script enters the main block, validates interacting CDN flags, installs signal handlers, starts enabled capture workers, and prints the banner.
+5. Startup workers are launched as configured: bot-cache cleanup, optional path scanning, optional crawl/discovery, external-asset prefetch, and CDN-health pruning.
+6. The main HTTP listener starts. If `HOOK_GUI = True`, Flask runs in a background thread and the Qt event loop occupies the main thread.
+
+Because target resolution and WAF detection happen during import, `python -c "import s2l"` is not a side-effect-free way to inspect the module. The network probe and WAF scan are for `SITE`; ordinary proxied page responses do not trigger another WAFW00F scan.
+
 ### Runtime directories
 
 At startup, the configured site is normalized into `SITE_URL`, `MAIN_HOST`, and `SITE_NAME` (the main host with a leading `www.` removed and dots replaced by underscores). The principal directories are created relative to the current working directory:
@@ -271,9 +287,15 @@ site_src/<site-name>/                 cached upstream content
 site_data/<site-name>/                captures, scanner output, and site data
 site_data/MyHooks/<host>/             persisted GUI HTTP hooks
 site_data/MyWSHooks/<host>/           persisted GUI WebSocket hooks
+site_data/<site-name>/captures/       HTTP capture JSON files
+site_data/<site-name>/captures_ws/    WebSocket message capture JSON files
+site_data/<site-name>/hidden_paths.json  last path-scanner result
+Wordlists/                            default path-scanner wordlist directory
 ```
 
 Use the same working directory when restarting if you expect S2L to find the same cache and hook data. The folder name is derived from the configured main host; changing `SITE` can therefore select a different cache tree.
+
+`site_src` is the mirror/cache tree. `site_data` is operational output rather than cache content. Captures and scanner output are not automatically merged into the mirror. GUI hook storage is host-scoped and shared by runs using the same working directory.
 
 ## 5. HTTP request lifecycle
 
@@ -287,12 +309,22 @@ The main Flask catch-all route accepts `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `D
 4. **Build context and run request hooks.** On a cache miss, S2L reads request data when applicable, builds a `HookContext`, and runs registered request hooks. `_do_upstream()` selects a client session and forwards the prepared request.
 5. **Retry selected connection failures.** The main proxy can rotate a client session and try fresh session implementations, including `curl_cffi`, cloudscraper-compatible sessions, and plain `requests`. If those attempts fail, a cached canonical copy may be used for a safe method; otherwise the client receives `502`.
 6. **Choose streaming or buffered processing.** Range/media/large-body hints and SSE request signals can cause the upstream request to use streaming. SSE is handled by `_stream_sse_resp()`; eligible media, partial, or large responses use `_stream_resp()`. Stream accumulation for disk caching is bounded by `STREAM_CACHE_MAX_BYTES`.
-7. **Normalize the upstream response.** Buffered response bodies are decompressed before applicable transformations. S2L adjusts MIME and response headers, detects selected WAF/bot pages and platforms, and handles special cases such as RSC-style payloads or unexpectedly empty bodies. A detected challenge/bot response is not saved as an ordinary cache entry.
+7. **Normalize the upstream response.** Buffered response bodies are decompressed before applicable transformations. S2L adjusts MIME and response headers, detects selected bot/challenge pages, and handles special cases such as RSC-style payloads or unexpectedly empty bodies. A detected challenge/bot response is not saved as an ordinary cache entry. WAF fingerprinting is separate: WAFW00F runs once while resolving the configured upstream URL, not for each proxied response.
 8. **Queue an eligible cache copy.** Eligible `GET` responses with a body are queued for disk saving before response hooks and browser-specific rewrites. Error responses are excluded unless `SAVE_ERRORS` is enabled; bot/challenge and recognized wire-format responses may be excluded by their dedicated checks. This allows the cache to retain the upstream representation while delivery-time behavior is applied.
 9. **Rewrite and return.** Applicable HTML/CSS/JSON/JavaScript URL transformations are applied, HTML may receive S2L browser scripts, response hooks are applied, and the final response includes the relevant CORS, security, isolation, and freshness headers.
 10. **Reprocess cache hits for delivery.** `_cached_response()` applies relevant response transformations/hooks/headers when serving a cached body, instead of assuming a prior browser-specific transformation is appropriate for every later request.
 
 CDN routes, errors, streams, and special response classes have their own paths; the sequence above describes the general proxy flow, not every branch. URLs rewritten for the browser use request-derived proxy addressing rather than always assuming `localhost`; this does not remove browser secure-context restrictions or make a network-exposed listener safe.
+
+### Upstream request and response boundaries
+
+- Request forwarding removes hop-by-hop headers and proxy/browser cache validators that are not meaningful on the upstream leg. Selected framework-specific navigation headers are also stripped where required to request ordinary document responses.
+- `OPTIONS` preflight requests are answered locally. They are not a general upstream `OPTIONS` passthrough.
+- Online cache hits principally serve safe `GET`/`HEAD` requests. Unsafe methods are not replayed from a cached GET response.
+- The cache stores the upstream representation before response hooks and delivery-time rewriting where that request path supports caching. A later cache hit is processed again for the current request/device instead of assuming previously rewritten bytes are universally reusable.
+- Upstream transport retries and session rotation are selective, not a promise that every status, method, or failure is retried. A retry of a state-changing request can repeat an operation if the upstream processed an earlier attempt.
+
+The main route and CDN route share concepts but have separate branches. Do not infer that a header, retry, hook, cache, or streaming rule is identical across ordinary HTTP, CDN, WebSocket, SSE, and tunnel traffic.
 
 ## 6. Disk cache
 
@@ -436,6 +468,29 @@ The first enabled matching hook is applied to the reassembled message. Hook defi
 
 Python hooks exist in the source code. GUI HTTP hooks and GUI WebSocket hooks are persisted separately under `site_data` for the configured target. GUI HTTP JSON import/export does not import Python functions, and GUI-managed hooks do not modify the upstream server.
 
+### 10.5 Writing Python hooks
+
+Place Python hook definitions in the marked `YOUR HOOKS GO HERE` area of `s2l.py`, after the hook decorators and `HookContext` are defined. A request hook runs before an upstream request; a response hook runs after a response has been prepared for delivery. Hook functions should mutate `ctx` in place and return normally.
+
+```python
+@on_request(pattern=r"^/api/profile$", methods="POST")
+def normalize_profile_request(ctx: HookContext) -> None:
+    payload = ctx.req_json()
+    payload["source"] = "local-test"
+    ctx.set_req_json(payload)
+
+
+@on_response(pattern=r"^/api/profile$", methods="GET")
+def add_local_profile_field(ctx: HookContext) -> None:
+    payload = ctx.json()
+    payload["local_note"] = "served through Site2Local"
+    ctx.set_json(payload)
+```
+
+`ctx.json()` and `ctx.req_json()` parse the complete corresponding body as JSON and raise if it is not valid JSON. `set_json()` serializes UTF-8 JSON, updates the response content type, and invalidates the old response content length. `set_req_json()` updates the request body and content type. Hooks are synchronous on the request path: keep them fast, avoid blocking I/O, and handle content types/empty bodies before attempting to parse JSON. Exceptions are logged per hook and later processing continues according to the normal request flow.
+
+The decorators match regular expressions against the request path, case-insensitively. Use `ctx.url` to make decisions that include the host or query string; the `pattern` argument is not matched against the full URL.
+
 ## 11. Browser rewriting and response headers
 
 ### URL rewriting
@@ -477,7 +532,7 @@ S2L has optional upstream session implementations:
 
 Import-time availability determines which optional packages can be used. A successful import or selected fingerprint does not guarantee bypass of a WAF, CAPTCHA, waiting room, authentication check, or rate limit.
 
-The source identifies some Cloudflare/block responses (including selected challenge pages that return HTTP 200) and includes platform/WAF fingerprinting based on response headers and body. Detection is heuristic: false positives, false negatives, and unknown platforms are possible. The code does not automatically solve every challenge; waiting rooms and systems such as Anubis are documented limitations.
+When available, the optional `wafw00f` package actively fingerprints the resolved upstream URL during module initialization. This happens synchronously after the initial HTTP(S) reachability probe and before `SITE_URL` is finalized and the startup banner/listener are reached, so its probes add startup time and upstream requests. WAFW00F detection is not repeated for ordinary proxy responses. The result is stored in one shared, lock-protected state: the initial `Resolved ... [WAF] IP: ...` log, the banner's `WAF:` row, and the web viewer all report the same value. If WAFW00F is missing, the proxy continues and reports `Unavailable`; in offline mode the network probe and WAF scan are skipped and the status is `Skipped (offline)`. A failed scan is logged and reported as `Detection failed`. A result of `No WAF detected` does not prove that no WAF or other traffic-control system exists. S2L's separate bot/challenge-page checks remain in place, but the code does not automatically solve challenges; waiting rooms and systems such as Anubis are documented limitations.
 
 Client sessions are separated by client identity for cookies/session state. Retry and session rotation logic is intended to recover from some connection failures; it does not make unsafe retrying of arbitrary application operations universally correct. A retry of a state-changing request can have different consequences if the upstream processed the first attempt before the connection failed.
 
@@ -529,6 +584,12 @@ site_data/<site-name>/captures_ws/
 
 Capture writers use background queues/workers. Captures may contain cookies, authorization values, tokens, personal information, request bodies, or private site data. Treat them as sensitive; inspect and redact before sharing or committing.
 
+HTTP capture JSON records `s2l`, timestamp, request metadata (method, URL, query, headers, optional request body and its encoding), and response metadata (status, content type, headers, body, encoding, and byte size). Request bodies are omitted unless `CAPTURE_BODIES = True`; response bodies are recorded for captured transactions. Bodies that decode as UTF-8 are stored as text; other bodies are base64-encoded and marked accordingly.
+
+WebSocket capture records `s2l`, timestamp, direction, opcode/name, WebSocket URL, tunnel ID, payload, encoding, and size. Text payloads are UTF-8; binary payloads are base64. Messages from a socket are grouped below a host/tunnel-specific directory. Both capture pipelines use background writer threads, so file creation is asynchronous relative to the proxied transaction.
+
+Captured request headers can contain credentials even when request-body capture is disabled. Review the whole JSON record before sharing it.
+
 ## 15. Internal endpoints
 
 | Path                                 | Purpose                                                                      |
@@ -543,7 +604,9 @@ Capture writers use background queues/workers. Captures may contain cookies, aut
 | `/__s2l_viewer_data__`               | Viewer data endpoint; requires `WEB_CDNVIEWER = True`.                       |
 | `/__s2l_reset_stats__`               | `POST` endpoint that resets statistics; requires `WEB_CDNVIEWER = True`.     |
 
-The viewer reports operational statistics such as CDN hosts/health, counters, request rate, uptime, and the last detected platform. The reset endpoint is mutating and there is no user authentication on these viewer endpoints. Keep the listener on a trusted interface/network.
+The viewer reports operational statistics such as CDN hosts/health, cumulative counters, a rolling activity rate, uptime, feature flags, and the WAFW00F startup result. Its `/__s2l_viewer_data__` JSON response includes the target/proxy address, active/pending/shared CDN counts, CDN health records, capture/proxy/CDN counters, a rolling-window breakdown, platform name/age, and configuration flags. The cumulative counters are `crawled`, `saved`, `proxied`, `conn_errors`, `http_errors`, `hooks_run`, `revealed`, `cdn_fetched`, `captured`, `ws_captured`, and `cache_304`. The `req_per_s` field is computed from all recorded counter events in the rolling window, not exclusively from HTTP requests; treat it as an activity indicator rather than a precise request-throughput metric.
+
+`POST /__s2l_reset_stats__` resets the counters and rolling-window event history and returns an `ok` flag with a time string. It does not clear the disk cache or capture files. The reset endpoint is mutating and there is no user authentication on these viewer endpoints. Keep the listener on a trusted interface/network.
 
 Opening a WebSocket/tunnel route as an ordinary HTTP URL does not create a tunnel; the Flask fallback responds `426 Upgrade Required`. Tunnel routes are disabled by default and respond with an explanatory error when an upgrade attempts to use a disabled tunnel.
 
@@ -553,26 +616,26 @@ Approximate line ranges for the documented V8.1 source; use symbol search becaus
 
 | Area                                             | Approximate lines / symbols                                     |
 | ------------------------------------------------ | --------------------------------------------------------------- |
-| Imports, logging, configuration                  | 1–420                                                           |
-| Platform/WAF detection                           | 520–620; `detect_platform()`                                    |
-| Hook system and PyQt6 GUI                        | 620–3050; `on_request()`, `on_response()`, `_launch_hook_gui()` |
-| Device profiles and upstream sessions            | 3060–3500; `_make_session()`                                    |
-| Decompression and MIME handling                  | 3500–3800                                                       |
-| CORS, response security, isolation               | 3940–4430; `filter_resp()`                                      |
-| Client-aware addressing and static URL rewriting | 4430–4530; `rewrite_abs_urls()`                                 |
-| JavaScript injector                              | 4620–5250; `_build_s2l_injector()`                              |
-| Disk cache mapping and migration                 | 5250–5630; `local_path()`                                       |
-| Path scanner                                     | 5690–6300; `_run_path_scanner()`                                |
-| CDN servers, host registration, health           | 6300–7550; `_start_cdn_server()`                                |
-| Saving, capture, crawler                         | 7550–8150; `_save_worker()`, `crawl_parallel()`                 |
-| Streaming                                        | 8150–8400; `_should_stream()`, `_stream_resp()`                 |
+| Imports, logging, configuration and hook context | 1–650; `HookContext`, `on_request()`, `on_response()`            |
+| WAFW00F detection and shared result state        | 530–565; `detect_platform()`, `set_last_platform()`              |
+| PyQt6 GUI and HTTP/WebSocket hook editors        | 650–2950; `_launch_hook_gui()`                                  |
+| Device profiles and upstream sessions            | 2960–3450; `_make_session()`                                    |
+| Decompression and MIME handling                  | 3450–3900                                                       |
+| CORS, response security, isolation               | 3900–4420; `filter_resp()`                                      |
+| Client-aware addressing and static URL rewriting | 4420–4570; `rewrite_abs_urls()`                                 |
+| JavaScript injector                              | 4570–5470; `_build_s2l_injector()`                              |
+| Disk cache mapping and migration                 | 5470–5910; `local_path()`                                       |
+| Path scanner                                     | 5910–6425; `_run_path_scanner()`                                |
+| CDN servers, host registration, health           | 6425–7490; `_start_cdn_server()`                                |
+| Saving, capture, crawler and external discovery  | 7490–8090; `_save_worker()`, `crawl_parallel()`                 |
+| Streaming                                        | 8090–8400; `_should_stream()`, `_stream_resp()`                 |
 | WebSocket frames, compression, relays            | 8400–9450; `_RawSocketUpstreamWS`, `_CffiUpstreamWS`            |
-| SSE and raw TCP/UDP tunnels                      | 9450–9800                                                       |
-| Custom WSGI server and upgrade handler           | 9790–10250; `_PooledWSGIServer`, `_S2LWSGIRequestHandler`       |
-| Upstream request and cache serving               | 10250–11020; `_do_upstream()`, `_cached_response()`             |
-| Internal routes and web viewer                   | 11020–12500                                                     |
-| Main proxy route                                 | 12500–13380; `proxy()`                                          |
-| Banner and startup                               | 13380–end                                                       |
+| SSE and raw TCP/UDP tunnels                      | 9450–9730                                                       |
+| Custom WSGI server and upgrade handler           | 9730–10220; `_PooledWSGIServer`, `_S2LWSGIRequestHandler`       |
+| Upstream request and cache serving               | 10220–11020; `_do_upstream()`, `_cached_response()`             |
+| Internal routes and web viewer                   | 11020–12435                                                     |
+| Main proxy route                                 | 12435–13315; `proxy()`                                          |
+| Banner and startup                               | 13315–end                                                       |
 
 ## 17. Limitations and operational considerations
 
