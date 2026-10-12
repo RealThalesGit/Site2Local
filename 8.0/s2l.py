@@ -13138,9 +13138,10 @@ def proxy(path: str) -> Response:
     _suppress = is_subresource(ctx.resp_ct) and not _is_api
     _host_disp = _fmt_host(urlparse(target).netloc)
     if not _suppress:
+        _waf_name = get_last_platform().get("name", "Unknown")
         log(f"{method} {sc_color}{upstream_r.status_code}{Style.RESET_ALL}"
             f" {_lbl} {_host_disp}{req_path} {_fmt_size(len(body))}"
-            + (f" [{platform}]" if platform != "Unknown" else ""), "→")
+            + (f" [{_waf_name}]" if _waf_name != "Unknown" else ""), "→")
     if upstream_r.status_code >= 400:
         stats.inc("http_errors")
     if SHOW_HIDDEN and is_html(ctx.resp_body, ctx.resp_ct):
