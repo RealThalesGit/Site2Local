@@ -531,7 +531,21 @@ _STRIP_FWD_EXTRA = frozenset({
 # WAFW00F detection
 # ──────────────────────────────────────────────────────────────────────────────
 
-_WAF_DETECTION_RESULT = "Skipped (offline)" if OFFLINE else "Unknown"
+_last_platform = {
+    "name": "Skipped (offline)" if OFFLINE else "Unknown",
+    "ts": 0.0,
+}
+_last_platform_lock = threading.Lock()
+
+def set_last_platform(name: str) -> None:
+    """Update the WAF detection result shared by logs, banner, and viewer."""
+    with _last_platform_lock:
+        _last_platform["name"] = name or "Unknown"
+        _last_platform["ts"] = time.time()
+
+def get_last_platform() -> dict:
+    with _last_platform_lock:
+        return dict(_last_platform)
 
 def detect_platform(target_url: str) -> str:
     """Actively fingerprint the upstream with WAFW00F."""
@@ -5589,15 +5603,15 @@ def build_base_url(raw: str) -> str | None:
             try:
                 r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
                 if r.status_code < 500:
-                    global _WAF_DETECTION_RESULT
                     try:
-                        _WAF_DETECTION_RESULT = detect_platform(r.url)
+                        platform = detect_platform(r.url)
                     except Exception as exc:
-                        _WAF_DETECTION_RESULT = "Detection failed"
+                        platform = "Detection failed"
                         log(f"WAFW00F scan failed: {_short_exc(exc)}", "ERROR")
-                    if _WAF_DETECTION_RESULT == "Unavailable":
+                    set_last_platform(platform)
+                    if platform == "Unavailable":
                         log("WAFW00F is not installed; install it with `python -m pip install wafw00f`.", "ERROR")
-                    log(f"Resolved {raw} → {r.url}  [{_WAF_DETECTION_RESULT}]  IP: {resolve_ip(urlparse(r.url).netloc)}", "INFO")
+                    log(f"Resolved {raw} → {r.url}  [{platform}]  IP: {resolve_ip(urlparse(r.url).netloc)}", "INFO")
                     return r.url
             except Exception as e:
                 log(f"Probing {scheme+raw}: {_short_exc(e)}", "WARN")
@@ -6331,16 +6345,6 @@ _START_TS = time.time()
 # viewer can show a green/red health dot + last-seen relative time + RTT per
 # host. Bounded: entries are pruned when a host leaves _cdn_host_port.
 # ──────────────────────────────────────────────────────────────────────────────
-_last_platform = {
-    "name": _WAF_DETECTION_RESULT,
-    "ts": time.time() if _WAF_DETECTION_RESULT not in ("Unknown", "Skipped (offline)") else 0.0,
-}
-_last_platform_lock = threading.Lock()
-
-def get_last_platform() -> dict:
-    with _last_platform_lock:
-        return dict(_last_platform)
-
 _cdn_health: dict[str, dict] = {}
 _cdn_health_lock = threading.Lock()
 
@@ -13364,7 +13368,7 @@ def _banner() -> None:
     _l_target  = f"  {DIM}Target:  {R}  {G}{MAIN_HOST}{R} {DIM}({ip}){R}"
     _l_proxy   = f"  {DIM}Proxy:   {R}  {W}http://{HOST}:{PORT}{R}"
     _l_device  = f"  {DIM}Device:  {R}  {device_str}"
-    _waf_name  = get_last_platform().get("name", _WAF_DETECTION_RESULT)
+    _waf_name  = get_last_platform().get("name", "Unknown")
     _l_waf     = f"  {DIM}WAF:     {R}  {Y}[{_waf_name}]{R}"
     _l_bypass  = f"  {DIM}Bypass:  {R}  {bypass_eng}"
     _l_workers = f"  {DIM}Workers: {R}  {W}{WORKERS}{R}"
