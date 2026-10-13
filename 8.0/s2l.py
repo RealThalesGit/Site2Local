@@ -21,6 +21,7 @@ if _s2l_sem_filter not in _s2l_existing_warnings:
     )
 # ── STDLIB ────────────────────────────────────────────────────────────────────
 import os
+import ipaddress
 import sys
 import re
 import json
@@ -322,7 +323,8 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # When False, the matching /__s2l_*__ routes return 404 and their cross-links
 # are hidden from the other page, so the proxy runs headless with zero web
 # surface. Flip either on to expose the corresponding self-contained viewer.
-WEB_CDNVIEWER    = False            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CDNVIEWER_IP_WHITELIST = []      # empty = allow anyone; otherwise e.g. ["192.168.1.20", "2001:db8::10"]
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -11026,6 +11028,32 @@ def _viewer_disabled_response() -> Response:
     r.headers["Cache-Control"] = "no-store"
     return r
 
+def _viewer_ip_denied_response() -> Response:
+    """403 for clients outside the optional viewer IP allowlist."""
+    r = Response("forbidden", status=403, content_type="text/plain; charset=utf-8")
+    r.headers["Cache-Control"] = "no-store"
+    return r
+
+def _viewer_ip_allowed() -> bool:
+    """Check the direct peer IP against the optional exact-match allowlist.
+
+    Forwarded headers are intentionally ignored: unless a trusted proxy is
+    explicitly configured, clients can spoof them.
+    """
+    if not WEB_CDNVIEWER_IP_WHITELIST:
+        return True
+    try:
+        client_ip = ipaddress.ip_address(flask_request.remote_addr or "")
+    except ValueError:
+        return False
+    for allowed in WEB_CDNVIEWER_IP_WHITELIST:
+        try:
+            if client_ip == ipaddress.ip_address(str(allowed).strip()):
+                return True
+        except ValueError:
+            log(f"Ignoring invalid WEB_CDNVIEWER_IP_WHITELIST entry: {allowed!r}", "WARN")
+    return False
+
 # ── Reset-stats endpoint ─────────────────────────────────────────────────────
 # Zeros every counter + clears the rolling-window event log so a developer
 # can start a clean benchmark window from the viewer's "Reset" button without
@@ -11034,6 +11062,8 @@ def _viewer_disabled_response() -> Response:
 def _s2l_reset_stats_endpoint() -> Response:
     if not WEB_CDNVIEWER:
         return _viewer_disabled_response()
+    if not _viewer_ip_allowed():
+        return _viewer_ip_denied_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -11059,6 +11089,8 @@ def _s2l_viewer_data_endpoint() -> Response:
     """
     if not WEB_CDNVIEWER:
         return _viewer_disabled_response()
+    if not _viewer_ip_allowed():
+        return _viewer_ip_denied_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
@@ -11142,6 +11174,8 @@ def _s2l_viewer_endpoint() -> Response:
     """Self-contained live CDN viewer page (refreshes every 50 ms)."""
     if not WEB_CDNVIEWER:
         return _viewer_disabled_response()
+    if not _viewer_ip_allowed():
+        return _viewer_ip_denied_response()
     if flask_request.method == "OPTIONS":
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
