@@ -248,13 +248,26 @@ def _lolcat_real(text: str) -> str | None:
     return None
 
 def log(msg: str, level: str = "INFO") -> None:
+    # INJECTION FIX: request paths/hosts reach the log verbatim — control
+    # chars (ESC/OSC sequences, CR/LF) could forge log lines or hijack the
+    # terminal title/clipboard on vulnerable emulators. Preserve only SGR
+    # color/style sequences used by our status formatter; neutralize every
+    # other ESC/control sequence so paths cannot inject terminal commands.
+    msg = str(msg)
+    msg = re.sub(r"\x1b(?!\[[0-9;]*m)", "?", msg)
+    msg = re.sub(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]", "?", msg)
     ts    = time.strftime("%H:%M:%S")
     color = _LEVEL_COLOR.get(level, Fore.WHITE)
     tag   = f"{color}[{level}]{Style.RESET_ALL}"
     line  = f"{Style.DIM}{ts}{Style.RESET_ALL} {tag} {msg}"
+    # PERF/LOCK FIX: the lolcat subprocess (fork+exec, up to 0.5s) used to run
+    # INSIDE _log_lock — every thread in the process (Flask workers, crawler
+    # pool, WS pumps, CDN mini-servers) serialized behind it, collapsing
+    # proxy throughput under RAINBOW_LOGS=True. Colorize OUTSIDE the lock;
+    # only the final print holds it.
+    if RAINBOW_LOGS:
+        line = _lolcat_real(line) or _lolcat_internal(line)
     with _log_lock:
-        if RAINBOW_LOGS:
-            line = _lolcat_real(line) or _lolcat_internal(line)
         # When a tqdm progress bar is active (SCAN_PATHS), route ALL log
         # output through tqdm.write() so log lines from any thread appear
         # ABOVE the bar instead of corrupting it mid-line. Without this,
@@ -291,6 +304,9 @@ DUMP_ALL = False               # extract + crawl every URL found in any response
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
+EXT_ALLOW_EXTRA: list[str] = [] # extra hosts allowed through /__s2l_ext__/ — the route
+                                # otherwise only serves MAIN_HOST, hosts seen in mirrored
+                                # content, or registered CDNs (anti-SSRF allowlist)
 HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
@@ -353,6 +369,21 @@ POOL_CONNECTIONS    = 32       # per-session connection pool slots
 DEAD_HOST_TTL       = 60       # seconds to remember a dead upstream host
 STATS_WINDOW        = 60       # seconds for rolling stats window
 GRACEFUL_SHUTDOWN   = True     # drain in-flight requests on SIGTERM
+VERIFY_TLS          = True     # verify upstream TLS certificates (anti-MITM).
+                                # On certificate errors the main fetch paths
+                                # retry ONCE unverified with a WARN so
+                                # self-signed targets keep working; set False to
+                                # restore the old always-unverified behavior.
+TRUST_PROXY_HEADERS = False    # honor X-Forwarded-For for client identity.
+                                # ONLY enable when S2L runs behind YOUR OWN
+                                # reverse proxy — with direct exposure
+                                # (default HOST=0.0.0.0) the header is
+                                # client-spoofable and enabled session hijack.
+MAX_BODY_BYTES       = 256 * 1024 * 1024  # request-body cap (Flask MAX_CONTENT_LENGTH) —
+                                        # OOM guard for the threaded server
+MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024  # BOMB GUARD: decompression output cap
+                                        # (a 10MB gzip declaring gigabytes must not
+                                        # OOM the process — see decompress_body)
 # Maximum raw (compressed) body size (bytes) we'll accumulate in RAM while
 # streaming a response so it can ALSO be cached to disk after the stream
 # finishes. Bodies larger than this are still streamed to the browser, but
@@ -746,7 +777,10 @@ def _gui_ws_push(direction: str, opcode: int, payload: bytes,
             "origin":    parsed.netloc or "",
             "path":      parsed.path or "/",
             "size":      len(payload),
-            "payload":   payload,
+            # MEMORY FIX: cap the retained payload at the editor cap — the
+            # queue (2000 slots) and row cache (800 rows) used to pin the
+            # FULL payload (up to 8 MB each) in RAM.
+            "payload":   payload[:_EDITOR_MAX_BYTES],
             "tunnel_id": tunnel_id,
         })
     except queue.Full:
@@ -796,11 +830,15 @@ def _apply_gui_ws_hooks(direction: str, opcode: int, payload: bytes,
             continue
         ho_url = (h.get("origin_url") or "*").strip().lower()
         if ho_url not in ("", "*", "any"):
+            # WWW FIX: normalize both sides (strip port + www.) — hooks
+            # auto-filled from a www-prefixed netloc never matched otherwise.
             if ho_url in ("target", "main"):
-                if _host != MAIN_HOST.lower():
+                if _host != MAIN_HOST.lower().removeprefix("www."):
                     continue
-            elif not (_host == ho_url or _host.endswith("." + ho_url)):
-                continue
+            else:
+                _ho_n = ho_url.removeprefix("www.")
+                if not (_host == _ho_n or _host.endswith("." + _ho_n)):
+                    continue
         try:
             if not re.search(h["pattern"], _path, re.IGNORECASE):
                 continue
@@ -885,7 +923,10 @@ def _gui_push(ctx: HookContext) -> None:
             "ct":       ctx.resp_ct.split(";")[0].strip() if ctx.resp_ct else "",
             "web_type": "None",            # main proxy requests have no CDN tag — show "None"
             "size":     len(body),         # real size (0 = correct)
-            "body":     display_body,      # what the editor shows
+            # MEMORY FIX: cap what the GUI retains per row at the editor cap —
+            # the Body Editor never shows more than this anyway, but the old
+            # code pinned the FULL body in RAM (queue + row cache).
+            "body":     display_body[:_EDITOR_MAX_BYTES],
             "origin":   _origin,
         })
     except queue.Full:
@@ -961,7 +1002,8 @@ def _gui_push_raw(method: str, path: str, status: int, ct: str, body: bytes,
             "ct":       ct_clean,
             "web_type": web_type,
             "size":     len(body),
-            "body":     display_body,
+            # MEMORY FIX: cap retention at the editor cap (see _gui_push).
+            "body":     display_body[:_EDITOR_MAX_BYTES],
             "origin":   origin,
         })
     except queue.Full:
@@ -994,8 +1036,16 @@ def _origin_matches(hook_origin: str, ctx: HookContext) -> bool:
     if host.startswith("www."):
         host = host[4:]
     if ho in ("target", "main"):
-        return host == MAIN_HOST.lower() or host == ("www." + MAIN_HOST).lower()
-    # Hostname suffix match: "example.com" matches "cdn.example.com"
+        # WWW FIX: MAIN_HOST itself may start with "www." — normalize both
+        # sides or hooks targeting "target"/"main" silently never fire on
+        # www-prefixed sites (the old second disjunct was unreachable: `host`
+        # can never start with www. after the strip above).
+        _mh = MAIN_HOST.lower().removeprefix("www.")
+        return host == _mh
+    # Hostname suffix match: "example.com" matches "cdn.example.com".
+    # WWW FIX: normalize the hook's origin the same way the request host is
+    # normalized, or a hook auto-filled with "www.example.com" never matched.
+    ho = ho.removeprefix("www.")
     return host == ho or host.endswith("." + ho)
 
 def _apply_gui_hooks(ctx: HookContext) -> None:
@@ -1072,6 +1122,18 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
 
     def _paths(name: str) -> tuple[str, str]:
         safe = re.sub(r"[^\w\-.]", "_", name)
+        # COLLISION FIX: distinct names ("a/b" vs "a_b") sanitized to the
+        # same file silently overwrote/deleted each other's disk records
+        # while both hooks stayed live in memory — after a restart only one
+        # survived. A short hash of the ORIGINAL name keeps files unique.
+        tag = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        p = os.path.join(hooks_dir, f"{safe}.{tag}.body")
+        return p, p + ".meta.json"
+
+    def _legacy_paths(name: str) -> tuple[str, str]:
+        # Pre-collision-fix naming — kept so delete() still removes hooks
+        # saved by older versions.
+        safe = re.sub(r"[^\w\-.]", "_", name)
         p = os.path.join(hooks_dir, f"{safe}.body")
         return p, p + ".meta.json"
 
@@ -1106,7 +1168,9 @@ def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
             return False
 
     def delete(name: str) -> None:
-        for fp in _paths(name):
+        # New naming first, then the legacy naming — hooks saved before the
+        # collision fix must remain deletable.
+        for fp in (*_paths(name), *_legacy_paths(name)):
             try:
                 os.remove(fp)
             except OSError:
@@ -1187,7 +1251,7 @@ def _editor_preview(body: bytes, ct: str = "") -> tuple[str, bool]:
     return txt, truncated
 
 
-def _launch_hook_gui() -> None:
+def _launch_hook_gui() -> bool:
     """
     Launch the PyQt6 GUI. Must be called from the MAIN thread.
     When HOOK_GUI=True, Flask moves to a daemon thread and this blocks main.
@@ -1219,7 +1283,7 @@ def _launch_hook_gui() -> None:
     except ImportError:
         log("PyQt6 not available — HOOK_GUI ignored "
             "(pip install PyQt6 --break-system-packages)", "WARN")
-        return
+        return False   # caller must keep serving — see the main block
 
     def _gui_main() -> None:
         global _s2l_qt_message_handler, _s2l_qt_previous_message_handler
@@ -1707,7 +1771,14 @@ def _launch_hook_gui() -> None:
             if data.get("body") and method not in _SAFE_METHODS:
                 body_str = data["body"].decode("utf-8", errors="replace").replace("'", "'\\''")
                 parts.append(f"  -d '{body_str}'")
-            parts.append(f"  '{url}'")
+            # SECURITY FIX (command injection): the URL is interpolated into a
+            # single-quoted shell string exactly like the headers/body above —
+            # but was NOT escaped. data['path'] arrives percent-DECODED
+            # (Werkzeug), so a mirrored page serving /x';touch /tmp/pwn;# put
+            # arbitrary shell code on the clipboard, executed the moment the
+            # user pasted the copied command.
+            safe_url = url.replace("'", "'\\''")
+            parts.append(f"  '{safe_url}'")
             curl_str = " \\\n".join(parts)
             QApplication.clipboard().setText(curl_str)
             save_status_lbl.setText("cURL command copied to clipboard.")
@@ -2615,6 +2686,15 @@ def _launch_hook_gui() -> None:
                     QMessageBox.critical(win, "S2L",
                         f"Invalid payload regex: {e}")
                     return
+            # EXACT-MATCH FIX: payloads are capped at the editor cap when
+            # captured, so a byte-for-byte "exact" hook on a larger message
+            # silently NEVER matched (truncated copy != full payload).
+            # Downgrade to "contains" (prefix) semantics with a clear warning.
+            if match_mode == "exact" and len(match_payload) >= _EDITOR_MAX_BYTES:
+                QMessageBox.warning(win, "S2L",
+                    "Payload exceeds the 512 KB editor cap — byte-for-byte exact "
+                    "matching is impossible. Saving as 'contains' (prefix) match.")
+                match_mode = "contains"
             # PERSISTENCE FIX: the WHEN panel's "Freeze" state is now part of
             # the hook itself. Previously `frozen` lived only in the checkbox,
             # so after a restart editing a saved hook left Freeze unchecked —
@@ -2636,13 +2716,20 @@ def _launch_hook_gui() -> None:
                 "match_payload": match_payload,
                 "frozen":        frozen,
             }
+            # LOCK FIX: the replace-question dialog runs OUTSIDE the lock —
+            # it used to be shown WHILE holding _gui_ws_hooks_lock, and every
+            # WS frame pump on every tunnel acquires that lock per frame, so
+            # one unnoticed dialog stalled all WebSocket traffic (idle
+            # timeouts included) until it was answered.
             with _gui_ws_hooks_lock:
                 existing = next((h for h in _gui_ws_hooks if h["name"] == name), None)
+            if existing is not None:
+                if QMessageBox.question(win, "S2L",
+                        f"A WS hook named '{name}' already exists.\nReplace it?"
+                    ) != QMessageBox.StandardButton.Yes:
+                    return
+            with _gui_ws_hooks_lock:
                 if existing is not None:
-                    if QMessageBox.question(win, "S2L",
-                            f"A WS hook named '{name}' already exists.\nReplace it?"
-                        ) != QMessageBox.StandardButton.Yes:
-                        return
                     _gui_ws_hooks[:] = [h for h in _gui_ws_hooks if h["name"] != name]
                 _gui_ws_hooks.append(hook)
             if not _ws_hook_save_to_disk(hook):
@@ -2936,7 +3023,16 @@ def _launch_hook_gui() -> None:
                         _row_data[iid] = entry
                         tree.addTopLevelItem(item)
                         if tree.topLevelItemCount() > _MAX_ROWS:
-                            tree.takeTopLevelItem(0)
+                            # MEMORY-LEAK FIX: the evicted row must also leave
+                            # _row_data — each entry retains the FULL response
+                            # body, and the queue-bounded poller only trims the
+                            # TREE. Without this pop (which the WS poller below
+                            # already does), _row_data grew unboundedly for the
+                            # process lifetime (GBs on long mirror sessions).
+                            _removed = tree.takeTopLevelItem(0)
+                            if _removed is not None:
+                                _removed_iid = _removed.data(0, Qt.ItemDataRole.UserRole)
+                                _row_data.pop(_removed_iid, None)
                         if auto_scroll_cb.isChecked():
                             tree.scrollToItem(item)
                         count += 1
@@ -2964,6 +3060,7 @@ def _launch_hook_gui() -> None:
         app.exec()   # blocks — caller must be on main thread
 
     _gui_main()
+    return True   # GUI ran and exited normally
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UA profiles + device detection
@@ -3060,10 +3157,41 @@ def _device_variant(device: str) -> str:
 _RETRY_POLICY = urllib3.util.retry.Retry(
     total            = RETRIES,
     backoff_factor   = BACKOFF,
-    status_forcelist = {429, 500, 502, 503, 504},
-    allowed_methods  = {"GET", "HEAD", "POST", "PUT", "PATCH"},
+    # RETRY FIX: only idempotent methods — the old set included POST/PUT/PATCH,
+    # so a form POST that timed out AFTER the server processed it was silently
+    # re-sent (duplicate purchases, comments, deletes). 429 was also dropped
+    # from the forcelist: retrying rate-limit responses doubles the request
+    # rate — the exact storm the code elsewhere warns about.
+    status_forcelist = {500, 502, 503, 504},
+    allowed_methods  = {"GET", "HEAD"},
     raise_on_status  = False,
 )
+
+def _request_tls_fallback(sess, method: str, url: str, **kw):
+    """TLS FIX + REDIRECT GATE: with VERIFY_TLS=True (the new default),
+    certificate failures on the main fetch paths get ONE unverified retry with
+    a WARN — keeps mirroring of self-signed/broken-cert targets working while
+    protecting the normal case from transparent MITM. All hops go through
+    _request_gated_redirects (per-hop internal-target blocking; pass
+    s2l_ext_gate=True for the full ext allowlist gate)."""
+    try:
+        return _request_gated_redirects(sess, method, url, **kw)
+    except Exception as exc:
+        if not VERIFY_TLS:
+            raise
+        # REPLAY FIX: only idempotent methods get the unverified retry — a
+        # POST that failed on TLS mid-flight must not be silently re-sent.
+        if method.upper() not in ("GET", "HEAD"):
+            raise
+        _s = str(exc).lower()
+        if not ("certificate" in _s or " ssl" in _s or "ssl:" in _s
+                or "tls" in _s or isinstance(exc, ssl.SSLError)):
+            raise
+        log(f"TLS verification failed for {urlparse(url).netloc} — "
+            f"retrying unverified ({_short_exc(exc)})", "WARN")
+        kw = dict(kw)
+        kw["verify"] = False
+        return _request_gated_redirects(sess, method, url, **kw)
 
 _proxy_local  = threading.local()
 
@@ -3117,7 +3245,7 @@ def _make_cffi_session(device: str, base_headers: dict):
     last_exc: Exception | None = None
     for target in candidates:
         try:
-            s = _cffi_requests.Session(impersonate=target, verify=False)
+            s = _cffi_requests.Session(impersonate=target, verify=VERIFY_TLS)
             s.headers.update(base_headers)
             _cffi_impersonate_cache[device] = target
             return s
@@ -3157,7 +3285,7 @@ def _make_session(device: str | None = None):
             # (often Chrome 80-83) that fail browser version checks on modern sites.
             s.headers.update(base_headers)
             s.keep_alive = True
-            s.verify     = False
+            s.verify     = VERIFY_TLS
             adapter = requests.adapters.HTTPAdapter(
                 max_retries      = _RETRY_POLICY,
                 pool_connections = POOL_CONNECTIONS,
@@ -3175,7 +3303,7 @@ def _make_session(device: str | None = None):
 
     s = requests.Session()
     s.headers.update(base_headers)
-    s.verify = False
+    s.verify = VERIFY_TLS
     adapter = requests.adapters.HTTPAdapter(
         max_retries      = _RETRY_POLICY,
         pool_connections = POOL_CONNECTIONS,
@@ -3209,7 +3337,7 @@ def _make_cloudscraper_session(device: str | None = None) -> object:
     s = cloudscraper.create_scraper(browser=cfg, delay=0)
     s.headers.update(base_headers)
     s.keep_alive = True
-    s.verify     = False
+    s.verify     = VERIFY_TLS
     adapter = requests.adapters.HTTPAdapter(
         max_retries=_RETRY_POLICY,
         pool_connections=POOL_CONNECTIONS,
@@ -3235,7 +3363,7 @@ def _make_requests_session(device: str | None = None) -> object:
     }
     s = requests.Session()
     s.headers.update(base_headers)
-    s.verify = False
+    s.verify = VERIFY_TLS
     adapter = requests.adapters.HTTPAdapter(
         max_retries=_RETRY_POLICY,
         pool_connections=POOL_CONNECTIONS,
@@ -3279,6 +3407,11 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
 
     # JS challenge / Managed Challenge — can return 200, so checked regardless
     # of status. Signature set includes the q=78 / jschl_vc challenge tokens.
+    # FALSE-POSITIVE FIX: the old set included a bare
+    # (challenges.cloudflare.com + <script) pair — that matches ANY page that
+    # legitimately EMBEDS a Turnstile widget (login/consent pages), and every
+    # hit rotated+closed the client session, destroying the user's login in a
+    # loop. Only unambiguous challenge-page markers count now.
     if (b"jschl_vc" in head
             or b"jschl_answer" in head
             or b"cf-challenge" in head
@@ -3286,14 +3419,16 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
             or b"__cf_chl_tk__" in head
             or b"__cf_chl_f_tk" in head
             or b"chl_captcha_widget" in head
-            or b"window._cf_chl_opt" in head
-            or (b"challenges.cloudflare.com" in head and b"<script" in head)):
+            or b"window._cf_chl_opt" in head):
         return True
 
     # Modern Turnstile + "Just a moment" interstitials.
     # These return 200 with a JS challenge body that doesn't always carry
     # the classic jschl_vc tokens — the CF team rotates signatures frequently.
-    if status in (200, 403, 503):
+    # FALSE-POSITIVE FIX: on 200, require COMPOUND evidence (interstitial
+    # phrase AND a cloudflare marker) — a lone Turnstile embed or an article
+    # quoting "just a moment" must NOT be treated as a block.
+    if status in (403, 503):
         if (b"just a moment" in head
                 or b"cf-turnstile" in head
                 or b"cf_turnstile" in head
@@ -3302,6 +3437,13 @@ def _is_cf_block(body: bytes, status: int, headers: dict | None = None) -> bool:
                 or (b"checking if the site connection is secure" in head)
                 or (b"enable javascript and cookies" in head)
                 or (b"cf-please-wait" in head)):
+            return True
+    elif status == 200:
+        if ((b"just a moment" in head
+                or b"checking if the site connection is secure" in head
+                or b"enable javascript and cookies" in head
+                or b"cf-please-wait" in head)
+                and b"cloudflare" in head):
             return True
 
     # Generic WAF blocks — "access denied", "blocked",
@@ -3411,20 +3553,74 @@ _CLIENT_LOCK  = threading.Lock()
 _CLIENT_TTL   = 1800  # 30 min idle before session is evicted
 
 def _client_id() -> str:
-    """Stable per-browser identifier derived from source IP."""
+    """Stable per-browser identifier derived from source IP.
+
+    SECURITY FIX: X-Forwarded-For is client-controlled whenever the proxy is
+    directly reachable (the default HOST=0.0.0.0) — trusting it let any LAN
+    peer assume another client's session by replaying its XFF (session
+    hijack), and floods of unique XFFs minted unbounded sessions. The header
+    is now honored ONLY when TRUST_PROXY_HEADERS=True (running behind your
+    own reverse proxy)."""
     try:
         ip  = flask_request.remote_addr or "unknown"
-        xff = flask_request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        return hashlib.sha1((xff or ip).encode()).hexdigest()[:16]
+        if TRUST_PROXY_HEADERS:
+            xff = flask_request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            if xff:
+                ip = xff
+        return hashlib.sha1(ip.encode()).hexdigest()[:16]
     except RuntimeError:
         return "default"
+
+# SESSION-CLOSE RACE FIX: rotated-out client sessions are shared by
+# concurrent requests from the same browser; closing one immediately (the old
+# behavior) killed in-flight requests' connection pools — spurious failures
+# exactly under parallel load. Retired sessions now close after a drain
+# window, via a single janitor thread.
+_RETIRED_SESSIONS: list[tuple[float, object]] = []
+_retired_lock      = threading.Lock()
+# DRAIN-WINDOW FIX: the window must cover in-flight STREAMING bodies too —
+# TIMEOUT_STREAM_READ (120s) is longer than the old flat 30s, so a retired
+# session could be closed under a live video/SSE stream. Cap-eviction retires
+# into the same window, so this softens that too.
+_SESSION_DRAIN_SECONDS = max(30, TIMEOUT_STREAM_READ)
+_retired_janitor_started = threading.Event()
+_MAX_CLIENT_SESSIONS = 64   # hard cap: XFF floods / many LAN devices must not
+                             # mint unbounded sessions (each holds a conn pool)
+
+def _retire_session(sess) -> None:
+    """Schedule `sess` for closing after in-flight requests drain."""
+    if sess is None:
+        return
+    with _retired_lock:
+        _RETIRED_SESSIONS.append((time.time(), sess))
+    if not _retired_janitor_started.is_set():
+        _retired_janitor_started.set()
+        threading.Thread(target=_retired_janitor, daemon=True,
+                         name="sess-drain").start()
+
+def _retired_janitor() -> None:
+    while True:
+        time.sleep(5)
+        now = time.time()
+        due: list = []
+        with _retired_lock:
+            keep: list[tuple[float, object]] = []
+            for ts, s in _RETIRED_SESSIONS:
+                if now - ts >= _SESSION_DRAIN_SECONDS:
+                    due.append(s)
+                else:
+                    keep.append((ts, s))
+            _RETIRED_SESSIONS[:] = keep
+        for s in due:
+            try: s.close()
+            except Exception: pass
 
 def _get_client_session():
     """Return a session bound to the calling browser's IP, not the thread."""
     cid  = _client_id()
     now  = time.time()
     with _CLIENT_LOCK:
-        # Evict stale sessions to avoid memory growth. Close them properly —
+        # Evict stale sessions to avoid memory growth. RETIRE them properly —
         # each session holds a connection pool (up to POOL_MAXSIZE=64 conns)
         # and leaking them accumulates file descriptors over time.
         stale = [k for k, t in _CLIENT_LAST.items() if now - t > _CLIENT_TTL]
@@ -3434,13 +3630,38 @@ def _get_client_session():
             old_sess = _CLIENT_SESSIONS.pop(k, None)
             _CLIENT_LAST.pop(k, None)
         if old_sess is not None:
-            try: old_sess.close()
-            except Exception: pass
+            _retire_session(old_sess)
     with _CLIENT_LOCK:
-        if cid not in _CLIENT_SESSIONS:
-            _CLIENT_SESSIONS[cid] = _make_session()
+        sess = _CLIENT_SESSIONS.get(cid)
+    if sess is None:
+        # DoS FIX: enforce the hard cap BEFORE constructing a new session, and
+        # construct it OUTSIDE the lock — _make_session() used to run while
+        # holding _CLIENT_LOCK, serializing every client behind session
+        # construction during XFF-floods.
+        with _CLIENT_LOCK:
+            if len(_CLIENT_SESSIONS) >= _MAX_CLIENT_SESSIONS:
+                _evict = [k for k, t in _CLIENT_LAST.items() if now - t > 60]
+                if not _evict:
+                    _evict = sorted(_CLIENT_LAST, key=_CLIENT_LAST.get)[
+                        :len(_CLIENT_SESSIONS) - _MAX_CLIENT_SESSIONS + 1]
+                for k in _evict:
+                    _old = _CLIENT_SESSIONS.pop(k, None)
+                    _CLIENT_LAST.pop(k, None)
+                    if _old is not None:
+                        _retire_session(_old)
+        sess = _make_session()
+        with _CLIENT_LOCK:
+            cur = _CLIENT_SESSIONS.get(cid)
+            if cur is None:
+                _CLIENT_SESSIONS[cid] = sess
+            else:
+                _retire_session(sess)   # lost the race — don't leak ours
+                sess = cur
+            _CLIENT_LAST[cid] = now
+            return sess
+    with _CLIENT_LOCK:
         _CLIENT_LAST[cid] = now
-        return _CLIENT_SESSIONS[cid]
+    return sess
 
 def _short_exc(exc: Exception) -> str:
     msg = str(exc)
@@ -3535,6 +3756,33 @@ def _decompress_body_impl(data: bytes, enc: str) -> bytes:
         if enc == "gzip":
             if not _looks_gzip(data):
                 return data   # curl_cffi already decoded — body is plain text
+            # MULTI-MEMBER FIX: concatenated gzip streams (legal per RFC 1952,
+            # produced by streaming servers) were silently TRUNCATED to the
+            # first member by the one-shot decompress — the tail of the asset
+            # vanished without any error. Walk members via unused_data.
+            # BOMB GUARD (round 2): bounded output — a small gzip expanding
+            # past MAX_DECOMPRESSED_BYTES aborts instead of OOM-ing the proxy.
+            try:
+                out = bytearray()
+                d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                rest = data
+                while rest:
+                    _feed = rest
+                    while _feed:
+                        out += d.decompress(_feed, 64 * 1024 * 1024)
+                        if len(out) > MAX_DECOMPRESSED_BYTES:
+                            raise MemoryError("gzip output exceeds decompression cap (bomb?)")
+                        _feed = d.unconsumed_tail
+                    rest = d.unused_data
+                    if rest:
+                        d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                if out:
+                    return bytes(out)
+            except zlib.error:
+                pass
+            except MemoryError as _bomb:
+                log(f"{_bomb} — serving raw bytes", "ERROR")
+                return data
             try:
                 return zlib.decompress(data, zlib.MAX_WBITS | 16)
             except zlib.error:
@@ -3862,6 +4110,23 @@ def _flatten_cookiejar(cookies_obj, prefer_host: str = "") -> dict:
     host = (prefer_host or "").lower()
     chosen_domain: dict[str, str] = {}
     out: dict[str, str] = {}
+    # MINI-PSL FIX: the stdlib cookiejar has no Public Suffix List, so a
+    # Domain=.github.io cookie set by an UNRELATED sibling host
+    # (evil.github.io) used to domain-match MAIN_HOST (site.github.io) and
+    # ride upstream — a session-fixation vector. Single-label TLDs are
+    # already rejected by the jar itself; block the common multi-label
+    # public suffixes whose sibling hosts are unrelated.
+    _MINI_PSL = {
+        "github.io", "gitlab.io", "netlify.app", "vercel.app", "pages.dev",
+        "workers.dev", "web.app", "firebaseapp.com", "herokuapp.com",
+        "appspot.com", "blogspot.com", "repl.co", "glitch.me",
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp",
+        "com.au", "net.au", "org.au", "com.br", "com.mx", "com.cn",
+        "co.nz", "co.za", "com.sg", "com.hk", "com.tr",
+    }
+    def _dom_match(d: str) -> bool:
+        return (bool(d) and d not in _MINI_PSL
+                and (host == d or host.endswith("." + d)))
     try:
         jar = getattr(cookies_obj, "jar", cookies_obj)  # curl_cffi wraps a .jar; requests IS the jar
         for cookie in jar:
@@ -3869,10 +4134,24 @@ def _flatten_cookiejar(cookies_obj, prefer_host: str = "") -> dict:
             if not name:
                 continue
             domain = (getattr(cookie, "domain", "") or "").lstrip(".").lower()
+            # SECURITY FIX (cookie leak): only send cookies whose domain actually
+            # matches the host we're about to call. The old walk collected
+            # cookies from EVERY domain the session had ever seen (main site,
+            # CDNs, trackers, embeds) and sent them all to whatever target the
+            # current path mapped to — session tokens and CSRF cookies of the
+            # main site rode along to unrelated third parties.
+            if host:
+                if not domain or not _dom_match(domain):
+                    continue
             if name in out and host:
+                # TIE-BREAK FIX: keep whichever value's domain matches the
+                # target host at least as specifically (longer domain wins).
+                # The old rule let an unrelated domain's same-named cookie
+                # override the actual target host's cookie — host-only cookies
+                # (empty domain) could never win it.
                 prev = chosen_domain.get(name, "")
-                if prev and host.endswith(prev) and not (domain and host.endswith(domain)):
-                    continue   # keep the previous, more domain-specific match
+                if _dom_match(prev) and (not _dom_match(domain) or len(prev) >= len(domain)):
+                    continue
             out[name] = getattr(cookie, "value", "") or ""
             chosen_domain[name] = domain
         return out
@@ -3921,26 +4200,59 @@ def _needs_isolation(body: bytes) -> bool:
     return (has_sab or has_atomics or has_xorigin_check
             or (has_worker and (has_wasm or has_sab)))
 
+def _norm_origin_host(h: str) -> str:
+    """Normalize a hostname for own-origin comparison (loopback aliases fold
+    into one canonical name)."""
+    h = (h or "").strip().lower().strip("[]")
+    return "localhost" if h in ("127.0.0.1", "::1", "ip6-localhost",
+                                "ip6-loopback") else h
+
+def _origin_is_own(origin: str) -> bool:
+    """SECURITY: True only when `origin` is one of the PROXY'S OWN origins —
+    its host matches the incoming request's Host (any port: the main port and
+    every MULTIPORT CDN port), with loopback aliases folded together.
+    Used to decide whether an Origin may be reflected with
+    Access-Control-Allow-Credentials: true. Reflecting arbitrary origins (the
+    old behavior) turned the proxy into an open cross-origin relay: any
+    website could drive credentialed requests through the user's authenticated
+    mirror session and READ the responses."""
+    try:
+        o = urlparse(origin if "://" in origin else f"http://{origin}")
+        oh = _norm_origin_host(o.hostname or "")
+        if not oh:
+            return False
+        # IPV6 FIX: "[::1]:8080".split(":")[0] was "[" — bracket-aware parse.
+        _rh = (flask_request.host or "").strip()
+        if _rh.startswith("["):
+            rh = _norm_origin_host(_rh.split("]", 1)[0].lstrip("["))
+        else:
+            rh = _norm_origin_host(_rh.split(":", 1)[0])
+        return oh == rh
+    except Exception:
+        return False
+
 def _cors_origin_pair() -> tuple[str, str | None]:
     """Return (Access-Control-Allow-Origin value, Access-Control-Allow-Credentials value or None).
 
     A browser fetch() using credentials:"include" is rejected outright if
     Access-Control-Allow-Origin is the literal wildcard "*" — the spec requires
     the exact origin to be echoed back whenever the request carries credentials
-    (cookies, HTTP auth, or client certs). We can't know in advance whether a
-    given request used credentials:"include", so the safe universal rule is:
-    whenever the browser sent an Origin header, echo it back verbatim paired
-    with Access-Control-Allow-Credentials: true. Only fall back to "*" when
-    there's no Origin header to echo (non-CORS requests, direct navigation).
-    This is the same rule filter_resp() already applies — every OTHER place
-    in this file that sets Access-Control-Allow-Origin should call this
-    instead of hardcoding "*", or it silently undoes filter_resp()'s work.
+    (cookies, HTTP auth, or client certs). MULTIPORT CDN ports serve the
+    mirrored site's assets on a DIFFERENT port than the main page, so those
+    credentialed subresource fetches legitimately need the echo.
+
+    SECURITY FIX: we reflect ONLY origins the proxy itself owns (same host as
+    the request, any port — see _origin_is_own). The old rule — echo ANY
+    Origin verbatim with credentials — made the proxy an open relay for any
+    website on the internet. Foreign origins now get the plain wildcard
+    (usable for uncredentialed reads of public assets, unable to carry the
+    user's cookies/auth upstream).
     """
     try:
         origin = flask_request.headers.get("Origin", "") if flask_request else ""
     except RuntimeError:
         origin = ""
-    if origin:
+    if origin and _origin_is_own(origin):
         return origin, "true"
     return "*", None
 
@@ -3952,19 +4264,18 @@ def _pna_allow_header() -> dict:
     making a fetch() to localhost / a private IP sends a CORS preflight with
     `Access-Control-Request-Private-Network: true`. The preflight response
     MUST include `Access-Control-Allow-Private-Network: true` or the request
-    is blocked with an opaque "CORS error" / "policy violation" — the most
-    common PNA failure mode for a localhost proxy. Since S2L listens on
-    localhost, ANY public-context fetch() triggers PNA; without this header
-    the user sees a flood of CORS errors in the devtools console.
+    is blocked with an opaque "CORS error" / "policy violation".
 
-    We only echo the header when the request asked for it (spec-compliant).
-    Sending it unconditionally is harmless in practice but produces console
-    warnings on some browsers, so we gate it on the request header.
+    SECURITY FIX: the header is only granted when the requesting Origin is
+    one of our own (see _origin_is_own). Granting it to any public page
+    blessed public→localhost fetches through the user's proxy — the first
+    step of the cross-site relay chain fixed in _cors_origin_pair.
     """
     try:
         if flask_request and flask_request.headers.get(
                 "Access-Control-Request-Private-Network", "").lower() == "true":
-            return {"Access-Control-Allow-Private-Network": "true"}
+            if _origin_is_own(flask_request.headers.get("Origin", "")):
+                return {"Access-Control-Allow-Private-Network": "true"}
     except (RuntimeError, AttributeError):
         pass
     return {}
@@ -4252,8 +4563,22 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
         "access-control-allow-methods",
         "access-control-expose-headers",
         "access-control-max-age",
+        # VALIDATOR FIX (round 2): upstream ETag/Last-Modified on LIVE
+        # responses never matched the disk validators used for 304s — the
+        # browser re-downloaded every asset once (and ping-ponged whenever a
+        # response flipped between live and cached paths). Drop them; the
+        # disk-backed validators take over once the file is cached.
+        "etag", "last-modified",
     }
     out = {k: v for k, v in headers.items() if k.lower() not in skip}
+    # CE/CL FIX: when the upstream body was compressed, requests/curl_cffi
+    # auto-DECOMPRESS it — the forwarded Content-Length still describes the
+    # old COMPRESSED size, so the browser truncated/hung on the longer
+    # decoded body (corrupt scripts/wasm served from CDN assets). Drop the
+    # stale length and let the Response recompute it for the actual bytes.
+    if any(k.lower() == "content-encoding" for k in headers):
+        for _k in [k for k in out if k.lower() == "content-length"]:
+            del out[_k]
     # CORS + CORP — centralized in _apply_cors_headers() so every response path
     # (filter_resp here, cache-hit helpers, 304/206/error fallbacks) gets the
     # identical concrete Access-Control-Expose-Headers list for credentialed
@@ -5211,12 +5536,30 @@ def _safe_seg(name: str) -> str:
     # names — a URL path containing HTML (e.g. from a malformed API response)
     # would produce cache paths like "vue_app_<!DOCTYPE html>..." which breaks
     # on Windows and creates unusable cache entries on Linux.
+    #
+    # SECURITY FIX (path traversal): a segment made ONLY of dots ("..",
+    # "...", ".") survives the character whitelist below — dots are allowed
+    # so extensions keep working — and os.path.join() then walks OUT of the
+    # cache tree. Neutralize pure-dot segments into "_" before anything else.
+    if name and set(name) <= {"."}:
+        name = "_"
     name = re.sub(r"[^\w.\-]", "_", name)
     if len(name) <= MAX_FNAME:
+        # EXT CAP FIX (round 2): cap the extension in the FAST path too — a
+        # 180-char name that is mostly "extension" ("a."+177 chars) passed
+        # the length check untouched and later broke the query-name budget
+        # (room < 0 → ENAMETOOLONG on every write, URL never cached).
+        _b, _e = os.path.splitext(name)
+        if len(_e) > 16:
+            return _b + _e[:16]
         return name
     base, ext = os.path.splitext(name)
     h = hashlib.sha1(name.encode()).hexdigest()[:12]
-    return f"{base[:32]}_{h}{ext}"
+    # FIX (ENAMETOOLONG): cap the EXTENSION too. Only `base` was truncated, so
+    # a URL with a 300-char "extension" still produced 300+-char names that
+    # blow past the 255-byte filesystem component limit — every write failed
+    # with ENAMETOOLONG and those URLs never cached (re-fetched forever).
+    return f"{base[:32]}_{h}{ext[:16]}"
 
 def _sanitize_query_for_filename(qs: str) -> str:
     """LEGACY (09/10) query → filename mapping. LOSSY — do not use for new files.
@@ -5281,9 +5624,18 @@ def _encode_query_for_filename(qs: str, bare: bool) -> str:
     i, n = 0, len(qs)
     while i < n:
         ch = qs[i]
-        if ch == "%" and _QS_PCT_RE.fullmatch(qs[i:i + 3]):
-            out.append(qs[i:i + 3])
-            i += 3
+        if ch == "%":
+            # INJECTIVITY FIX (round 2): a literal "%XX" escape and a raw
+            # char that ENCODES to the same "%XX" used to collide (?a/b ≡
+            # ?a%2Fb, ?q=1.2 ≡ ?q=1%2E2) — two DISTINCT resources sharing one
+            # cache file (first fetch served for both, forever). Escape the %
+            # of literal escapes to %25XX so the mapping is injective.
+            if _QS_PCT_RE.fullmatch(qs[i:i + 3]):
+                out.append("%25" + qs[i + 1:i + 3])
+                i += 3
+                continue
+            out.append("%25")
+            i += 1
             continue
         if ch == ".":
             out.append("%2E" if bare else ".")
@@ -5330,6 +5682,9 @@ def _legacy_cache_paths(u: str, device: str = "") -> list[str]:
     path = p.path or "/"
     host_dir = p.netloc.split("@")[-1].split(":")[0]
     host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
+    # SECURITY FIX: same netloc sanitization as local_path() — legacy
+    # migration paths must never escape the cache tree either.
+    host_dir = _safe_seg(host_dir) or "_"
     if not p.query:
         return []
 
@@ -5521,6 +5876,21 @@ def local_path(u: str, device: str = "") -> str:
     """
     p = urlparse(normalize_url(u))
     path = p.path or "/"
+    # DOT-SEGMENT FIX (RFC 3986 §5.2.4): resolve "."/".." BEFORE mapping.
+    # /a/../b used to map to a/_/b/index.html (the ".." became a literal
+    # "_" folder) while /b mapped to b/index.html — two cache entries for
+    # one resource, and hand edits landed in the tree the hits never read.
+    # ".." above the root is a no-op (leading "" segment is never popped).
+    _segs: list[str] = []
+    for _seg in path.split("/"):
+        if _seg == ".":
+            continue
+        if _seg == "..":
+            if _segs and _segs[-1] != "":
+                _segs.pop()
+            continue
+        _segs.append(_seg)
+    path = "/".join(_segs) or "/"
     # ``splitext`` returns ('', '') for '/', ('/a/b', '') for '/a/b', and
     # ('/a/b', '.js') for '/a/b.js'. A trailing '/' means "directory" → no
     # extension.
@@ -5563,7 +5933,31 @@ def local_path(u: str, device: str = "") -> str:
     # Stripping the port avoids ":" in directory names (invalid on Windows).
     host_dir = p.netloc.split("@")[-1].split(":")[0]   # strip user:pass@ and :port
     host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
+    # CASE FIX (round 2): normalize the host to lowercase — SITE="Example.com"
+    # used to split the cache into Example.com/ and example.com/ trees
+    # (duplicate fetches; hand-mods in one tree invisible to the other).
+    host_dir = host_dir.lower()
+    # SECURITY FIX: the netloc-derived host_dir must pass through _safe_seg
+    # too — a crafted netloc ("..", ".", control chars) must never become a
+    # path component or it escapes the cache tree from the host side.
+    host_dir = _safe_seg(host_dir) or "_"
     new_lp = os.path.join(SRC_FOLDER, host_dir, *parts)
+
+    # SECURITY FIX (containment, defense in depth): after normalization the
+    # cache path must stay INSIDE the cache root. Anything that would escape
+    # (odd netloc, future sanitization regressions, dot-segment leftovers) is
+    # remapped to a flat hashed name inside the root instead of touching
+    # files outside it. Lexical check only (normpath) — no syscalls on this
+    # hot path; the tool never creates symlinks inside the cache tree.
+    try:
+        _norm_root = os.path.normpath(SRC_FOLDER)
+        _norm_lp   = os.path.normpath(new_lp)
+        if not (_norm_lp == _norm_root or _norm_lp.startswith(_norm_root + os.sep)):
+            _h = hashlib.sha1(u.encode("utf-8", "ignore")).hexdigest()[:24]
+            _dev_sfx = f"__s2l_{device}" if device else ""
+            new_lp = os.path.join(SRC_FOLDER, host_dir, f"__unsafe_{_h}{_dev_sfx}.bin")
+    except Exception:
+        pass
 
     # Auto-migrate legacy caches on first request. Idempotent and
     # fast-path-gated — when the new file already exists this is a single
@@ -5586,11 +5980,11 @@ def build_base_url(raw: str) -> str | None:
     Default to https:// (the common case) and return immediately without any
     network call.
 
-    verify=False is mandatory here: curl_cffi's Session defaults to real
-    certificate verification, and targets with a self-signed cert, a hostname
-    mismatch, or a CA bundle libcurl can't find (common on Termux) would fail
-    silently. The session itself is built with verify=False too — this is
-    belt-and-suspenders.
+    TLS: the probe verifies certificates first (VERIFY_TLS) and falls back
+    to one unverified attempt per scheme with a WARN — targets with a
+    self-signed cert, a hostname mismatch, or a CA bundle libcurl can't find
+    (common on Termux) still resolve, while properly-certified sites are
+    protected from MITM.
     """
     if OFFLINE:
         # No upstream — don't probe. Default to https:// (the common case),
@@ -5603,7 +5997,23 @@ def build_base_url(raw: str) -> str | None:
     try:
         for scheme in ("https://", "http://"):
             try:
-                r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
+                # NOTE (round-3 review): do NOT route this probe through
+                # _request_tls_fallback — build_base_url(SITE) runs at MODULE
+                # SCOPE (SITE_URL = …) and _request_gated_redirects is defined
+                # ~1,000 lines LATER; the helper's call-time name resolution
+                # would NameError (swallowed by the per-scheme except → probe
+                # silently dead for BOTH schemes → SITE_URL always falls back
+                # to http://). Verified empirically by the adversarial review.
+                try:
+                    r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ),
+                              verify=VERIFY_TLS)
+                except Exception:
+                    if not VERIFY_TLS:
+                        raise
+                    log(f"TLS verification failed probing {scheme + raw} — "
+                        "retrying unverified", "WARN")
+                    r = s.get(scheme + raw, timeout=(TIMEOUT_CONN, TIMEOUT_READ),
+                              verify=False)
                 if r.status_code < 500:
                     try:
                         platform = detect_platform(r.url)
@@ -6082,11 +6492,23 @@ def _run_path_scanner() -> None:
                     _rate_limit_sleep()
                     url = f"{origin}/{p}"
                     try:
-                        r = sess.head(url, timeout=(TIMEOUT_CONN, TIMEOUT_READ),
-                                      allow_redirects=False, verify=False)
+                        # TLS-FALLBACK FIX: self-signed targets used to die
+                        # here (head → SSLError → host marked dead) with no
+                        # one-shot unverified retry like every other fetch.
+                        # s2l_follow=False keeps the scanner's original
+                        # semantics: 3xx handed back as-is ("Redirect:"
+                        # evidence), nothing followed.
+                        r = _request_tls_fallback(sess, "HEAD", url,
+                                                  timeout=(TIMEOUT_CONN, TIMEOUT_READ),
+                                                  allow_redirects=False,
+                                                  s2l_follow=False,
+                                                  verify=VERIFY_TLS)
                         if r.status_code == 405:
-                            r = sess.get(url, timeout=(TIMEOUT_CONN, min(TIMEOUT_READ, 6)),
-                                         allow_redirects=False, verify=False)
+                            r = _request_tls_fallback(sess, "GET", url,
+                                                      timeout=(TIMEOUT_CONN, min(TIMEOUT_READ, 6)),
+                                                      allow_redirects=False,
+                                                      s2l_follow=False,
+                                                      verify=VERIFY_TLS)
                         sc = r.status_code
                         ct = r.headers.get("Content-Type", "")
                         with _counters_lock:
@@ -6169,11 +6591,19 @@ def _run_path_scanner() -> None:
                 _rate_limit_sleep()
                 url = f"{origin}/{p}"
                 try:
-                    r = sess.head(url, timeout=(TIMEOUT_CONN, TIMEOUT_READ),
-                                  allow_redirects=False, verify=False)
+                    # TLS-FALLBACK FIX: same as the tqdm path above
+                    # (s2l_follow=False keeps 3xx handed back as-is).
+                    r = _request_tls_fallback(sess, "HEAD", url,
+                                              timeout=(TIMEOUT_CONN, TIMEOUT_READ),
+                                              allow_redirects=False,
+                                              s2l_follow=False,
+                                              verify=VERIFY_TLS)
                     if r.status_code == 405:
-                        r = sess.get(url, timeout=(TIMEOUT_CONN, min(TIMEOUT_READ, 6)),
-                                     allow_redirects=False, verify=False)
+                        r = _request_tls_fallback(sess, "GET", url,
+                                                  timeout=(TIMEOUT_CONN, min(TIMEOUT_READ, 6)),
+                                                  allow_redirects=False,
+                                                  s2l_follow=False,
+                                                  verify=VERIFY_TLS)
                     sc = r.status_code
                     ct = r.headers.get("Content-Type", "")
                     if sc not in (404, 410):
@@ -6386,7 +6816,10 @@ def record_cdn_health(host: str, status: int, rtt_ms: int,
 
 def snapshot_cdn_health() -> dict:
     """Return a copy of all CDN host health records (thread-safe)."""
-    with _cdn_health_lock:
+    # LOCK FIX: _cdn_host_port is mutated under _cdn_port_lock — reading it
+    # under _cdn_health_lock raised "dictionary changed size during iteration"
+    # (intermittent viewer 500s). Both locks, consistent order (port, health).
+    with _cdn_port_lock, _cdn_health_lock:
         # Only return hosts still in the active registry — stale entries from
         # hosts that were deregistered are dropped here so the viewer never
         # shows a health row for a CDN port that no longer exists.
@@ -6415,7 +6848,9 @@ def prune_cdn_health() -> int:
     """
     now = time.time()
     cutoff = now - _CDN_HEALTH_MAX_AGE
-    with _cdn_health_lock:
+    # LOCK FIX: same as snapshot_cdn_health — _cdn_host_port belongs to
+    # _cdn_port_lock; the old wrong lock crashed the pruner cycle silently.
+    with _cdn_port_lock, _cdn_health_lock:
         active = set(_cdn_host_port.keys())
         victims = [h for h, r in _cdn_health.items()
                    if h not in active or r.get("last_seen", 0) < cutoff]
@@ -6424,6 +6859,24 @@ def prune_cdn_health() -> int:
         return len(victims)
 
 _health_pruner_started = False
+def _sweep_tmp_cache_files() -> int:
+    """ORPHAN FIX (round 2): remove .s2l_tmp leftovers — a crash between the
+    tmp-write and os.replace() in the save flush left them behind forever
+    (disk leak; never servable, just dead weight). Run once at startup."""
+    n = 0
+    try:
+        for root, _dirs, files in os.walk(SRC_FOLDER):
+            for fn in files:
+                if fn.endswith(".s2l_tmp"):
+                    try:
+                        os.remove(os.path.join(root, fn))
+                        n += 1
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    return n
+
 def _start_health_pruner() -> None:
     """Start the periodic CDN-health prune daemon (idempotent)."""
     global _health_pruner_started
@@ -6453,6 +6906,210 @@ def _start_health_pruner() -> None:
 _cdn_host_port: dict[str, int] = {}
 _cdn_port_lock  = threading.Lock()
 _cdn_next_port  = PORT + 1
+
+# SECURITY FIX (open relay / SSRF): the /__s2l_ext__/<host>/... route used to
+# fetch ANY host a client put in the URL — making the tool an unauthenticated
+# proxy for arbitrary destinations (cloud metadata endpoints, internal IPs,
+# attacker hosts). Only hosts the proxy itself has legitimate reason to
+# contact may be fetched through it:
+#   * MAIN_HOST (and its www/apex variants),
+#   * hosts the URL rewriter actually EMITTED as /__s2l_ext__/<host>/... (the
+#     host appeared in real page content),
+#   * hosts registered as CDNs (seen via a successful fetch or pre-registered
+#     from the disk cache),
+#   * anything the user explicitly allowlists in EXT_ALLOW_EXTRA below.
+_EXT_ALLOWED_HOSTS: set[str] = set()
+_ext_allowed_lock  = threading.Lock()
+
+def _norm_ext_host(host: str) -> str:
+    """Normalize a host for allowlist comparison: lowercase, strip port and
+    leading www. (the cache layout strips www. too)."""
+    h = (host or "").strip().lower().split("/", 1)[0]
+    h = h.split("@")[-1].split(":", 1)[0]
+    return h.removeprefix("www.")
+
+def _mark_ext_allowed(host: str) -> None:
+    h = _norm_ext_host(host)
+    if not h:
+        return
+    with _ext_allowed_lock:
+        _EXT_ALLOWED_HOSTS.add(h)
+
+def _ext_host_allowed(host: str) -> bool:
+    h = _norm_ext_host(host)
+    if not h:
+        return False
+    if h == _norm_ext_host(MAIN_HOST):
+        return True
+    if h in EXT_ALLOW_EXTRA or any(h == _norm_ext_host(e) for e in EXT_ALLOW_EXTRA):
+        return True
+    if h in _EXT_ALLOWED_HOSTS:
+        return True
+    with _cdn_port_lock:
+        if h in _cdn_host_port or _norm_ext_host(h) in _cdn_host_port:
+            return True
+    return False
+
+def _is_internal_target(host: str) -> bool:
+    """SECURITY: True for loopback/private/link-local/reserved/metadata targets.
+    Blocks the ext/tunnel routes from ever being used as an SSRF pivot into
+    the operator's network (cloud metadata, internal panels, printers...)."""
+    try:
+        h = (host or "").strip().lower()
+        h = h.split("/", 1)[0].split("@")[-1]
+        # PORT FIX: strip an optional :port (bracket-aware) BEFORE the literal
+        # check — "10.0.0.5:6443" used to reach ip_address() with a colon in
+        # it, raise ValueError, and fall through as NOT internal (bypass of
+        # the whole gate for every ported target).
+        h_scan = h.strip("[]")
+        if "]" in h_scan:
+            _before, _, _after = h_scan.rpartition("]")
+            h_scan = _before                      # [v6]:port → v6
+        elif h_scan.count(":") == 1:
+            h_scan = h_scan.rsplit(":", 1)[0]      # v4:port → v4
+        if h_scan in ("localhost", "ip6-localhost", "ip6-loopback",
+                      "metadata", "metadata.google.internal"):
+            return True
+        # is_global excludes shared address space (100.64.0.0/10), but retain
+        # explicit special-range checks and block transition prefixes whose
+        # embedded IPv4 address may be private or loopback.
+        _nat64 = ipaddress.ip_network("64:ff9b::/96")
+        _6to4 = ipaddress.ip_network("2002::/16")
+        _bad = lambda ip: (
+            not ip.is_global or ip.is_private or ip.is_loopback
+            or ip.is_link_local or ip.is_reserved or ip.is_multicast
+            or ip.is_unspecified
+            or (ip.version == 6 and (ip in _nat64 or ip in _6to4))
+        )
+        if _is_ip_literal(h_scan):
+            return _bad(ipaddress.ip_address(h_scan))
+        # REBINDING/IPv6 FIX: resolve ALL address families here — the old
+        # gethostbyname is AF_INET-only, so AAAA-only names pointing at
+        # private IPv6 slipped through, and check-time-vs-connect-time DNS
+        # answers enabled classic rebinding.
+        try:
+            for _ai in socket.getaddrinfo(h_scan, None):
+                _ip_s = str(_ai[4][0]).split("%")[0]
+                if _is_ip_literal(_ip_s):
+                    if _bad(ipaddress.ip_address(_ip_s)):
+                        return True
+        except Exception:
+            # Fail closed when DNS cannot be checked: proceeding would make
+            # this gate ineffective during resolver failures.
+            return True
+    except Exception:
+        pass
+    return False
+
+def _request_from_own_page(headers, req_host: str) -> bool:
+    """SECURITY: True when the request provably originates from a page THIS
+    proxy served — i.e. Sec-Fetch-Site is same-origin/none, or the Origin /
+    Referer host matches the request's own Host (any port — MULTIPORT CDN
+    origins included). Used to gate ext-route fetches of dynamic (non-
+    allowlisted) public hosts: mirrored SPAs keep working, while cross-site
+    drive-bys and bare scripts/curl are refused."""
+    try:
+        get = headers.get if hasattr(headers, "get") else (lambda k, d="": None)
+        sfs = (get("Sec-Fetch-Site", "") or "").lower()
+        if sfs and sfs not in ("same-site",):
+            # "same-site" is cross-PORT same-host (MULTIPORT CDN documents,
+            # iframes, workers) — fall through to the Origin/Referer hostname
+            # check below instead of denying outright (SAME-SITE FIX).
+            return sfs in ("same-origin", "none")
+        rh = (req_host or "").split(":")[0].strip().lower().strip("[]")
+        for hdr in ("Origin", "Referer"):
+            v = (get(hdr, "") or "").strip()
+            if not v:
+                continue
+            try:
+                o = urlparse(v if "://" in v else f"http://{v}")
+            except Exception:
+                continue
+            oh = (o.hostname or "").strip().lower()
+            if not oh:
+                continue
+            if oh.strip("[]") in ("localhost", "127.0.0.1", "::1"):
+                return True
+            if oh == rh:
+                return True
+    except Exception:
+        pass
+    return False
+
+_MAX_REDIRECT_HOPS = 5
+
+def _request_gated_redirects(sess, method: str, url: str, **kw):
+    """SECURITY (redirect-chain SSRF): fetch `url` following redirects
+    MANUALLY, re-validating every hop. requests' allow_redirects=True happily
+    followed an attacker-controlled public host's 30x straight into internal
+    / cloud-metadata targets — resurrecting the SSRF the ext allowlist was
+    built to kill. Two gate modes:
+      * ext_mode=True  — every hop must pass the FULL ext gate (internal
+        blocked + allowlist/own-page),
+      * ext_mode=False — only INTERNAL targets are blocked (the main-host
+        fetch: cross-domain public redirects must keep working for SSO
+        logins, but nothing may pivot into the operator's network).
+    """
+    kw = dict(kw)
+    kw["allow_redirects"] = False
+    _ext_gate = bool(kw.pop("s2l_ext_gate", False))
+    # NO-FOLLOW ESCAPE (round-3 review): callers that deliberately hand 3xx
+    # responses back as-is (the path scanner's "Redirect:" evidence) pass
+    # s2l_follow=False — nothing is followed, so no redirect-SSRF surface
+    # exists either; the TLS fallback still applies.
+    _follow = bool(kw.pop("s2l_follow", True))
+    cur = url
+    r = None
+    for _hop in range(_MAX_REDIRECT_HOPS + 1):
+        r = sess.request(method, cur, **kw)
+        if not (300 <= r.status_code < 400):
+            return r
+        if not _follow:
+            return r   # caller wants the 3xx itself (scanner semantics)
+        loc = r.headers.get("Location", "")
+        if not loc:
+            return r
+        _next = urljoin(cur, loc)
+        _pu = urlparse(_next)
+        if _pu.scheme not in ("http", "https") or not _pu.netloc:
+            return r
+        if _is_internal_target(_pu.netloc):
+            log(f"Blocked redirect to INTERNAL target: {_pu.netloc} (from {urlparse(cur).netloc})", "WARN")
+            return r
+        if _ext_gate:
+            _own = False
+            try:
+                _own = _request_from_own_page(flask_request.headers, flask_request.host)
+            except Exception:
+                pass
+            if not _ext_host_allowed(_pu.netloc) and not _own:
+                log(f"Blocked redirect to non-allowed host: {_pu.netloc}", "WARN")
+                return r
+        # Match requests' redirect semantics for method and credential changes.
+        _m = method.upper()
+        if (r.status_code == 303 and _m != "HEAD") or (r.status_code in (301, 302) and _m == "POST"):
+            method = "GET"
+            for _k in ("data", "json", "files"):
+                kw.pop(_k, None)
+            kw["headers"] = {
+                k: v for k, v in (kw.get("headers") or {}).items()
+                if k.lower() not in ("content-type", "content-length", "transfer-encoding")
+            }
+        if urlparse(cur).netloc.lower() != _pu.netloc.lower():
+            kw["headers"] = {
+                k: v for k, v in (kw.get("headers") or {}).items()
+                if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+            }
+            kw.pop("cookies", None)
+        # Release the intermediate 3xx — with stream=True its body is never
+        # consumed and the pooled connection would leak per hop (round-3
+        # review finding on the CDN fetch path).
+        try:
+            r.close()
+        except Exception:
+            pass
+        cur = _next
+    return r
 
 def _real_origin_for(incoming: str | None) -> str:
     """Translate the Origin/Referer header the BROWSER actually sent for an
@@ -6517,6 +7174,8 @@ def _real_origin_for(incoming: str | None) -> str:
 
 def _start_cdn_server(cdn_host: str, port: int) -> None:
     cdn_app = Flask(f"cdn_{cdn_host}", static_folder=None)
+    # OOM FIX: bound request bodies on the CDN mini-servers too.
+    cdn_app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
     @cdn_app.after_request
     def _cdn_security_headers(response: Response) -> Response:
@@ -6559,11 +7218,14 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
 
         # OPTIONS — fast CORS preflight
         if method == "OPTIONS":
-            _req_origin = flask_request.headers.get("Origin", "")
+            # SECURITY FIX (round 2): this per-CDN OPTIONS handler still reflected
+            # ANY Origin with credentials — foreign preflights succeeded here,
+            # enabling CSRF-style credentialed drives through the CDN ports.
+            _aco, _acc = _cors_origin_pair()
             r = Response(status=204)
             r.headers.update({
-                "Access-Control-Allow-Origin":  _req_origin if _req_origin else "*",
-                "Access-Control-Allow-Credentials": "true" if _req_origin else None,
+                "Access-Control-Allow-Origin":  _aco,
+                "Access-Control-Allow-Credentials": _acc,
                 "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
                 "Access-Control-Allow-Headers": _cors_allow_headers(),
                 "Access-Control-Expose-Headers": "*",
@@ -6579,8 +7241,26 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         # In OFFLINE mode, always check cache regardless of CACHE_CDN —
         # the flag governs WRITES, not reads; a previously-cached asset
         # should still be served when offline.
-        lp = local_path(cdn_url)
+        # DEVICE-AWARE LOOKUP FIX: saves carry the device tag (save_queue.put
+        # with _effective_device()) — the lookup must try the device variant
+        # FIRST and fall back to the canonical file, or mobile/tablet users
+        # got 0% cache hits (every asset re-fetched per request; OFFLINE
+        # 404'd variants that were on disk).
+        _dev_c = _device_variant(_effective_device())
+        lp = local_path(cdn_url, _dev_c) if _dev_c else local_path(cdn_url)
+        if _dev_c and not os.path.isfile(lp):
+            _canon_c = local_path(cdn_url)
+            if os.path.isfile(_canon_c):
+                lp = _canon_c
+        _has_range_c = bool(flask_request.headers.get("Range", ""))
         if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
+            # RANGE FIX: honor Range on cache hits — answering every Range
+            # with a full 200 makes HTML5 <video> players loop/stall on the
+            # second play (a full 200 reads as a truncated stream).
+            if _has_range_c:
+                _rr = _serve_range_from_disk(lp, cdn_url, method, req_path="/" + p.lstrip("/"))
+                if _rr is not None:
+                    return _rr
             _c304 = _conditional_304(lp, _resolve_mime_with_sniff(lp))
             if _c304 is not None:
                 stats.inc("cache_304")
@@ -6639,7 +7319,6 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             # The CDN path used to hardcode TIMEOUT_READ=12s for ALL requests,
             # which truncated large WASM/asset downloads (>5MB) on slow CDNs
             # and produced "Failed to fetch" errors in the browser.
-            _has_range_c = bool(flask_request.headers.get("Range", ""))
             _guess_ct_c = guess_mime("/" + p)
             # Also force-stream paths that look like large binary assets even
             # when they have no file extension (e.g. /objects/builds/.../2026-05-10).
@@ -6659,17 +7338,29 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             _do_stream_c = method in _SAFE_METHODS and (
                 _has_range_c or _should_stream(_guess_ct_c) or _looks_large_binary)
             _read_timeout_c = TIMEOUT_STREAM_READ if _do_stream_c else TIMEOUT_READ
+            # ENCODING FIX (round 2): see the matching comment in _do_upstream.
+            _supported_ae_c = "gzip, deflate"
+            if _BROTLI_OK:
+                _supported_ae_c += ", br"
+            if _ZSTD_OK:
+                _supported_ae_c += ", zstd"
+            ctx.req_headers["Accept-Encoding"] = _supported_ae_c
 
             kw: dict = {
                 "headers":         ctx.req_headers,
                 "timeout":         (TIMEOUT_CONN, _read_timeout_c),
                 "allow_redirects": True,
-                "verify":          False,
+                "verify":          VERIFY_TLS,
             }
             if method in _BODY_METHODS:
                 kw["data"] = ctx.req_body
             kw["stream"] = _do_stream_c
-            r    = _get_client_session().request(method, cdn_url, **kw)
+            # REDIRECT-GATE + TLS-FALLBACK FIX: this direct .request() with
+            # allow_redirects=True bypassed _request_gated_redirects — a CDN
+            # host 30x-ing into an internal/cloud-metadata target was
+            # followed blindly (redirect-chain SSRF window on MULTIPORT
+            # ports), and self-signed CDN targets 502'd with no fallback.
+            r    = _request_tls_fallback(_get_client_session(), method, cdn_url, **kw)
             # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
             # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
             # large binary files (.tar bundles, .wasm, video, etc), producing
@@ -6698,10 +7389,10 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                         _proxy_local.in_cdn_refetch = True
                         _retry_hdrs = dict(ctx.req_headers)
                         _retry_hdrs["Accept-Encoding"] = "identity"
-                        _retry_r = _get_client_session().request(
-                            method, cdn_url, headers=_retry_hdrs,
+                        _retry_r = _request_tls_fallback(
+                            _get_client_session(), method, cdn_url, headers=_retry_hdrs,
                             timeout=(TIMEOUT_CONN, TIMEOUT_READ),
-                            allow_redirects=True, verify=False, stream=False)
+                            allow_redirects=True, verify=VERIFY_TLS, stream=False)
                         _retry_body = _retry_r.content
                         if _retry_body:
                             body = _retry_body
@@ -6763,15 +7454,30 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         except Exception as exc:
             log(f"CDN error: {cdn_host}/{p} — {_short_exc(exc)}", "WARN")
             record_cdn_health(cdn_host, 502, 0, is_error=True)
-            return Response(str(exc), status=502)
+            # TEXT/PLAIN FIX: exception text can embed attacker-influenced
+            # URLs/hosts — never reflect diagnostics as text/html.
+            return Response(str(exc), status=502,
+                            content_type="text/plain; charset=utf-8")
 
     def _run():
         _wz = logging.getLogger("werkzeug")
         _wz.setLevel(logging.ERROR)
         try:
-            server = make_server(HOST, port, cdn_app, threaded=True,
-                                 request_handler=_S2LWSGIRequestHandler)
-            server.__class__ = _PooledWSGIServer   # swap to use pool
+            # SERVER-BIND FIX (CDN ports): construct _PooledWSGIServer
+            # DIRECTLY — the make_server + __class__ swap bound the socket
+            # with the PARENT's server_bind, so the dual-stack IPv6 upgrade
+            # never ran for CDN ports (localhost stayed unreachable on
+            # ::1-first systems). Same pattern as the main port's
+            # _make_pooled_server().
+            try:
+                server = _PooledWSGIServer(HOST, port, cdn_app,
+                                           handler=_S2LWSGIRequestHandler)
+            except Exception as _pe:
+                log(f"Direct _PooledWSGIServer construction failed for {cdn_host} "
+                    f"({_short_exc(_pe)}) — falling back to make_server + swap", "WARN")
+                server = make_server(HOST, port, cdn_app, threaded=True,
+                                     request_handler=_S2LWSGIRequestHandler)
+                server.__class__ = _PooledWSGIServer   # swap (dual-stack lost)
             # _S2LWSGIRequestHandler intercepts WS upgrades at the raw-socket
             # layer for ALL server instances (see class docstring). It needs
             # to know THIS server's upstream host for its "not a special
@@ -6806,6 +7512,9 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
 
 def _register_cdn_host(netloc: str) -> None:
     global _cdn_next_port
+    # SECURITY: a registered CDN is by definition fetchable through the ext
+    # route (it earned registration via real content or a real fetch).
+    _mark_ext_allowed(netloc)
     if not MULTIPORT:
         with _cdn_port_lock:
             if netloc not in _cdn_host_port:
@@ -6844,6 +7553,9 @@ def _preregister_cdn_hosts_from_disk() -> int:
             if not already:
                 _register_cdn_host(host_dir)
                 n += 1
+            # SECURITY: hosts with cached content were legitimately fetched
+            # before — allow the ext route to keep serving them offline.
+            _mark_ext_allowed(host_dir)
     except Exception as e:
         log(f"CDN pre-registration error: {_short_exc(e)}", "WARN")
     return n
@@ -6903,6 +7615,11 @@ def _proxy_target(host: str, tail: str) -> str | None:
     # Flask app, while each CDN mini-server only proxies its own host.
     # Using the current request's port can send rewritten cross-CDN URLs
     # to a mini-server that cannot route them.
+    # SECURITY: remember that THIS host was legitimately emitted by the
+    # rewriter — the ext_asset route only serves hosts we ourselves sent
+    # the browser to (see _ext_host_allowed).
+    _mark_ext_allowed(host)
+    _mark_ext_allowed(host_no_port)
     return f"http://{_request_hostname()}:{PORT}{_EXT_PREFIX}/{host}{tail}"
 
 def _rewrite_json_urls(data: bytes) -> bytes:
@@ -6920,13 +7637,20 @@ def _rewrite_json_urls(data: bytes) -> bytes:
     """
     if not PROXY_CDN or not data:
         return data
+    # ENCODING FIX (round 2): JSON is UTF-8 by spec — strict decode; non-UTF-8
+    # payloads pass through UNTOUCHED (the old "ignore" decode silently
+    # dropped every byte >= 0x80 and re-encoded the corrupted text).
     try:
-        text = data.decode("utf-8", "ignore")
+        text = data.decode("utf-8")
     except Exception:
         return data
 
     def _rep(m: re.Match) -> str:
         host, tail = m.group(1), m.group(2) or ""
+        # DONT_REWRITE FIX: the attr/srcset/CSS passes honor the config;
+        # JSON-embedded URLs silently ignored it.
+        if _is_dont_rewrite_host(host):
+            return m.group(0)
         r = _proxy_target(host, tail)
         return f'"{r}"' if r else m.group(0)
 
@@ -6976,8 +7700,20 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
     """
     if not PROXY_CDN or not html_bytes:
         return html_bytes
+    # ENCODING FIX: decode("utf-8", "ignore") SILENTLY DROPPED every byte
+    # >=0x80 on windows-1252/latin-1 pages ("Café" → "Caf") and the corrupted
+    # text was then served + cached. Strict-decode first; latin-1 (byte-
+    # transparent 1:1 round-trip) preserves non-UTF-8 pages exactly — the
+    # ASCII URL rewrites still apply, everything else survives byte-for-byte.
+    _rw_enc = "utf-8"
     try:
-        html = html_bytes.decode("utf-8", "ignore")
+        html = html_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            html = html_bytes.decode("latin-1")
+            _rw_enc = "latin-1"
+        except Exception:
+            return html_bytes
     except Exception:
         return html_bytes
 
@@ -7203,6 +7939,9 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
             return tag
         def _content_rep(cm):
             host, tail = cm.group(2), cm.group(3) or ""
+            # DONT_REWRITE FIX: meta-refresh navigations ignored the config.
+            if _is_dont_rewrite_host(host):
+                return cm.group(0)
             r = _proxy_target(host, tail)
             return f"{cm.group(1)}{r}{cm.group(4)}" if r else cm.group(0)
         return re.sub(
@@ -7225,6 +7964,9 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
         # concatenates its own path. Keep it empty so concatenation works.
         tail = m2.group(2) or ""
         if any(bad in host for bad in CDN_BLOCK):
+            return m2.group(0)
+        # DONT_REWRITE FIX: script-block URLs ignored the config.
+        if _is_dont_rewrite_host(host):
             return m2.group(0)
         r = _proxy_target(host, tail)
         return r if r else m2.group(0)
@@ -7294,13 +8036,17 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
     for _i, _body in enumerate(_style_bodies):
         html = html.replace(f"\x00S2LSTYLE{_i}\x00", _body)
 
-    return html.encode("utf-8")
+    return html.encode(_rw_enc)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Queues & shared state  (MUST be defined before _save_worker thread starts)
 # ──────────────────────────────────────────────────────────────────────────────
 
-visited:        set = set()
+# ORDERED-SET FIX: a plain set has no insertion order — the old "clear
+# oldest half" eviction removed a RANDOM half, letting live pages re-enqueue
+# evicted URLs in a self-sustaining duplicate-fetch storm. dict preserves
+# insertion order → true FIFO eviction (see _crawl).
+visited:        dict[str, None] = {}
 _VISITED_MAX = 100000  # cap to prevent unbounded memory growth
 saved_paths:    set = set()
 _SAVED_PATHS_MAX = 50000  # cap to prevent unbounded memory growth
@@ -7454,15 +8200,15 @@ def _fetch_external_asset(u: str) -> None:
         with visited_lock:
             if u in visited:
                 return
-            visited.add(u)
+            visited[u] = None
         if _is_host_dead(netloc):
             return
         try:
             # Use TIMEOUT_STREAM_READ (120s) — background CDN fetches may
             # download large WASM/asset bundles that timeout at 12s.
-            r    = _get_proxy_session().get(u,
-                                             timeout=(TIMEOUT_CONN, TIMEOUT_STREAM_READ),
-                                             verify=False)
+            r = _request_tls_fallback(_get_proxy_session(), "GET", u,
+                                       timeout=(TIMEOUT_CONN, TIMEOUT_STREAM_READ),
+                                       verify=VERIFY_TLS)
             body = decompress_body(r.content, r.headers.get("Content-Encoding", ""))
             # Never cache bot/CAPTCHA pages — they would poison the asset cache
             if _is_bot_page(body, r.status_code, urlparse(u).path):
@@ -7494,6 +8240,12 @@ def _fetch_external_asset(u: str) -> None:
 
 def _save_worker() -> None:
     batch:      list  = []
+    # PENDING-BATCH FIX: paths queued in `batch` are already in saved_paths
+    # but not yet on disk (the flush writes up to SAVE_INTERVAL/SAVE_BATCH
+    # later). The self-heal below used to see "not isfile()" for exactly
+    # those paths, discard their marker and let a concurrent duplicate
+    # re-fetch + re-write the same file.
+    _batch_paths: set = set()
     last_flush: float = time.time()
     while True:
         try:
@@ -7515,71 +8267,101 @@ def _save_worker() -> None:
             # kill the single save-worker thread — without task_done() the
             # save_queue.join() in crawl_parallel() hangs forever, blocking
             # startup entirely.
+            # DATA-LOSS FIX: task_done() now fires IMMEDIATELY only for items
+            # that were skipped (bot page / dedup / error — nothing of theirs
+            # is pending on disk). Items appended to the batch are released
+            # AFTER the flush writes their bytes, so save_queue.join() (both
+            # the SIGINT drain and crawl_parallel) only returns once every
+            # enqueued body is actually on disk. The old code marked items
+            # done at append-time — Ctrl+C during traffic killed the daemon
+            # worker with up to SAVE_BATCH files still in RAM (silently lost
+            # or truncated mid-write).
+            _batched = False
             try:
                 # Safety gate: never cache bot-detection / CAPTCHA pages.
                 # These can arrive from background CDN fetches or upstream retries.
-                if _is_bot_page(data):
-                    log(f"Bot page detected — NOT caching {urlparse(u).netloc}{urlparse(u).path}", "WARN")
-                    continue
-                _dev_tag = _device_variant(rest[0]) if rest and rest[0] else ""
-                p = local_path(u, _dev_tag)
-                h = hashlib.sha1(data).hexdigest()
-                _link_src: str | None = None
-                with content_lock:
-                    _first = content_hashes.get(h)
-                    if _first is not None:
-                        # Identical bytes were already saved for another path.
-                        # DON'T drop this file — every fetched URL must
-                        # materialize at its own cache path, otherwise:
-                        #   (a) a device variant whose content equals the
-                        #       canonical copy would never be written → the
-                        #       device would re-fetch this URL on EVERY
-                        #       request (cache can never hit), and
-                        #   (b) OFFLINE mode would 404 any second URL whose
-                        #       content duplicates the first.
-                        # Hardlink to the first copy: zero extra disk. The
-                        # flush falls back to a plain write if linking is
-                        # impossible (cross-device, exotic filesystem).
-                        _link_src = _first
-                    else:
-                        content_hashes[h] = p
-                    # Cap memory — clear if too large (prevents OOM on long runs)
-                    if len(content_hashes) > _CONTENT_HASHES_MAX:
-                        content_hashes.clear()
-                        content_hashes[h] = p
-                # NOTE: we track saved_paths by the ORIGINAL path here. If the
-                # write later remaps p to p/index.html (directory collision),
-                # _save_worker updates saved_paths with the final write path
-                # after a successful write. This ensures a failed write does NOT
-                # permanently mark the URL as saved (which would make it
-                # uncacheable for the rest of the run).
-                original_p = p
-                with save_lock:
-                    # Cache self-heal: the path is tracked as already
-                    # saved, but the FILE ITSELF is gone from disk (the user
-                    # deleted it while the server runs). Forget the dedup
-                    # entry so the freshly fetched body re-materializes the
-                    # file instead of being silently dropped — otherwise a
-                    # deleted-then-re-fetched file would serve live ONCE and
-                    # never return to the disk mirror.
-                    if original_p in saved_paths and not os.path.isfile(original_p):
-                        saved_paths.discard(original_p)
-                    if original_p in saved_paths:
-                        continue
-                    # Tentatively mark as in-progress; removed on write failure.
-                    saved_paths.add(original_p)
-                    # Cap memory — clear if too large (prevents OOM on long runs)
-                    if len(saved_paths) > _SAVED_PATHS_MAX:
-                        saved_paths.clear()
-                        saved_paths.add(original_p)
-                batch.append((original_p, p, data, _link_src))
+                if not _is_bot_page(data):
+                    _dev_tag = _device_variant(rest[0]) if rest and rest[0] else ""
+                    p = local_path(u, _dev_tag)
+                    h = hashlib.sha1(data).hexdigest()
+                    _link_src: str | None = None
+                    with content_lock:
+                        _first = content_hashes.get(h)
+                        _link_sz = -1
+                        if _first is not None:
+                            # Identical bytes were already saved for another path.
+                            # DON'T drop this file — every fetched URL must
+                            # materialize at its own cache path, otherwise:
+                            #   (a) a device variant whose content equals the
+                            #       canonical copy would never be written → the
+                            #       device would re-fetch this URL on EVERY
+                            #       request (cache can never hit), and
+                            #   (b) OFFLINE mode would 404 any second URL whose
+                            #       content duplicates the first.
+                            # Hardlink to the first copy: zero extra disk. The
+                            # flush falls back to a plain write if linking is
+                            # impossible (cross-device, exotic filesystem) or
+                            # the entry went STALE (see the flush's guards).
+                            # STALE-ENTRY FIX (round 2): we now also remember
+                            # the SIZE, so the flush can verify the source
+                            # still holds the same bytes before linking.
+                            _link_src, _link_sz = _first
+                        else:
+                            content_hashes[h] = (p, len(data))
+                        # Cap memory — clear if too large (prevents OOM on long runs)
+                        if len(content_hashes) > _CONTENT_HASHES_MAX:
+                            content_hashes.clear()
+                            content_hashes[h] = (p, len(data))
+                    # NOTE: we track saved_paths by the ORIGINAL path here. If the
+                    # write later remaps p to p/index.html (directory collision),
+                    # _save_worker updates saved_paths with the final write path
+                    # after a successful write. This ensures a failed write does NOT
+                    # permanently mark the URL as saved (which would make it
+                    # uncacheable for the rest of the run).
+                    original_p = p
+                    _skip = False
+                    with save_lock:
+                        # Cache self-heal: the path is tracked as already
+                        # saved, but the FILE ITSELF is gone from disk (the user
+                        # deleted it while the server runs). Forget the dedup
+                        # entry so the freshly fetched body re-materializes the
+                        # file instead of being silently dropped — otherwise a
+                        # deleted-then-re-fetched file would serve live ONCE and
+                        # never return to the disk mirror.
+                        if (original_p in saved_paths
+                                and original_p not in _batch_paths
+                                and not os.path.isfile(original_p)):
+                            saved_paths.discard(original_p)
+                        if original_p in saved_paths:
+                            _skip = True
+                        else:
+                            # Tentatively mark as in-progress; removed on write failure.
+                            saved_paths.add(original_p)
+                            # Cap memory — clear if too large (prevents OOM on long runs)
+                            if len(saved_paths) > _SAVED_PATHS_MAX:
+                                saved_paths.clear()
+                                saved_paths.add(original_p)
+                    if not _skip:
+                        batch.append((original_p, p, data, _link_src, _link_sz))
+                        _batch_paths.add(original_p)
+                        _batched = True
             except Exception as e:
                 log(f"Save-worker item error: {u} — {e}", "ERROR")
             finally:
-                save_queue.task_done()
+                if not _batched:
+                    # Skipped or errored — nothing of this item is pending on
+                    # disk, release its join() token right away.
+                    save_queue.task_done()
         now = time.time()
         if batch and (len(batch) >= SAVE_BATCH or now - last_flush >= SAVE_INTERVAL):
-            for original_p, p, data, link_src in batch:
+            # ATOMIC-WRITE FIX: every batched item leaves the queue's
+            # accounting only after this flush — and the flush itself now
+            # writes tmp+os.replace so concurrent readers (_serve_cached,
+            # _serve_range_from_disk) never observe a truncated mid-write
+            # body, and a crash can no longer leave a partial file behind
+            # while saved_paths claims it was saved.
+            _n_released = len(batch)
+            for original_p, p, data, link_src, link_sz in batch:
                 try:
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     if os.path.isdir(p):
@@ -7591,17 +8373,40 @@ def _save_worker() -> None:
                     if link_src and not os.path.isfile(p):
                         try:
                             if os.path.isfile(link_src):
-                                os.link(link_src, p)
-                                if p != original_p:
-                                    with save_lock:
-                                        saved_paths.discard(original_p)
-                                        saved_paths.add(p)
-                                stats.inc("saved")
-                                continue
+                                # STALE-ENTRY + DEVICE FIX (round 2): (a) verify the
+                                # source still holds the SAME bytes (size) — the
+                                # path's content may have been replaced since the
+                                # hash entry was written (self-heal re-fetch, user
+                                # hand-mod), and linking would cache WRONG content;
+                                # (b) never hardlink across device variants — the
+                                # canonical file is the user's hand-edit home, and
+                                # an in-place edit of a shared inode silently
+                                # mutated every linked variant.
+                                def _dev_of(fn):
+                                    _m = re.search(r"__s2l_([A-Za-z0-9]+)", fn)
+                                    return _m.group(1) if _m else ""
+                                _ok_link = (link_sz < 0 or os.path.getsize(link_src) == link_sz)
+                                _ok_link = _ok_link and (_dev_of(os.path.basename(link_src))
+                                                          == _dev_of(os.path.basename(p)))
+                                if _ok_link:
+                                    os.link(link_src, p)
+                                    if p != original_p:
+                                        with save_lock:
+                                            saved_paths.discard(original_p)
+                                            saved_paths.add(p)
+                                    stats.inc("saved")
+                                    continue
                         except OSError:
                             pass   # fall through to a plain byte write
-                    with open(p, "wb") as f:
+                    # ATOMIC WRITE: tmp file in the same directory +
+                    # os.replace() — readers see the old or the NEW complete
+                    # file, never a half-written mix; a crash mid-write can
+                    # only leave a .s2l_tmp orphan, never a truncated cache
+                    # entry that saved_paths believes is valid.
+                    _tmp = p + ".s2l_tmp"
+                    with open(_tmp, "wb") as f:
                         f.write(data)
+                    os.replace(_tmp, p)
                     # Write succeeded — record the FINAL write path in saved_paths
                     # (may differ from original_p due to directory-collision remap).
                     if p != original_p:
@@ -7618,7 +8423,12 @@ def _save_worker() -> None:
                         saved_paths.discard(original_p)
                         saved_paths.discard(p)
             batch.clear()
+            _batch_paths.clear()
             last_flush = now
+            # The batch is now on disk (or permanently failed) — release the
+            # join() tokens for exactly the items that were flushed.
+            for _ in range(_n_released):
+                save_queue.task_done()
 
 threading.Thread(target=_save_worker, daemon=True, name="save-worker").start()
 
@@ -7654,9 +8464,16 @@ def _capture_path(method: str, url: str, qs: str) -> str:
     qs hash only keeps different query variants from colliding.
     """
     parsed = urlparse(url)
+    # SECURITY FIX (path traversal): same hardening as local_path() — the
+    # regex keeps dots, so a URL path with ../../ escaped the captures tree
+    # and wrote attacker-influenced JSON anywhere under site_data/..
     host = re.sub(r"[^\w.\-]", "_",
                   parsed.netloc.split("@")[-1].split(":")[0]) or "_nohost_"
-    segs = [re.sub(r"[^\w.\-]", "_", s) for s in parsed.path.strip("/").split("/") if s]
+    if set(host) <= {"."}:
+        host = "_"
+    segs = [re.sub(r"[^\w.\-]", "_", s) for s in parsed.path.strip("/").split("/")
+            if s and set(s) != {"."}]
+    segs = [_safe_seg(s) for s in segs]
     # Last 2 segments identify the endpoint (they go into the filename); the
     # remaining ones become directory levels.
     tail = segs[-2:] if len(segs) >= 2 else (segs or ["_root_"])
@@ -7754,6 +8571,8 @@ _ws_capture_queue: queue.Queue = queue.Queue()
 def _ws_capture_dir(ws_url: str, tunnel_id: int) -> str:
     parsed = urlparse(ws_url)
     host = re.sub(r"[^\w.\-]", "_", parsed.netloc or "tunnel") or "tunnel"
+    if set(host) <= {"."}:
+        host = "tunnel"
     return os.path.join(DATA_FOLDER, "captures_ws", host, f"t{tunnel_id}")
 
 def _ws_capture_worker() -> None:
@@ -7780,6 +8599,14 @@ def _ws_capture_worker() -> None:
                   f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1000) % 1000:03d}"
                   f".t{rec.tunnel_id}.json")
             path = os.path.join(out_dir, fn)
+            # COLLISION FIX: two frames processed within the same millisecond
+            # produced identical names and the second open(path, "w") silently
+            # destroyed the first record. Same uniqueness loop _capture_path
+            # has always used.
+            _n = 0
+            while os.path.exists(path):
+                _n += 1
+                path = os.path.join(out_dir, f"{fn[:-5]}_{_n}.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(doc, f, ensure_ascii=False, indent=2)
             stats.inc("ws_captured")
@@ -7807,25 +8634,30 @@ def _maybe_capture_ws(direction: str, opcode: int, payload: bytes,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def enqueue(u: str) -> None:
-    # Only feed the crawler during the initial crawl phase.
-    # After crawl finishes, the proxy serves fresh from upstream — no need
-    # to re-crawl. In procedural mode (CRAWL=False), _crawl_done is never
-    # set and no workers are running, so this is always a no-op.
-    if not _crawl_done.is_set():
+    # WORKER-AWARE GATE FIX: the old `if not _crawl_done.is_set()` disabled
+    # enqueue() forever AFTER the initial crawl — but the persistent discovery
+    # workers exist precisely to honor post-crawl enqueues from the proxy
+    # handler (see _discovery_worker's docstring). Worse, in procedural mode
+    # (CRAWL=False) _crawl_done is never set and no workers run, so the open
+    # gate queued URLs into an undrained queue forever (unbounded memory).
+    # Gate on actual worker availability instead: during the initial crawl,
+    # or while the discovery workers are running.
+    if (not _crawl_done.is_set()) or _discovery_started.is_set():
         url_queue.put(normalize_url(u))
 
 def _crawl(u: str) -> None:
     with visited_lock:
         if u in visited:
             return
-        visited.add(u)
-        # Cap memory — if visited set grows too large, clear oldest half
+        visited[u] = None
+        # Cap memory — evict the OLDEST entries (FIFO). Sets are unordered,
+        # so the old discard-loop evicted a RANDOM half and live pages kept
+        # re-enqueueing them (self-sustaining duplicate-fetch storm on
+        # >100k-URL sites).
         if len(visited) > _VISITED_MAX:
             _to_remove = len(visited) - _VISITED_MAX // 2
-            for _i, _u in enumerate(list(visited)):
-                if _i >= _to_remove:
-                    break
-                visited.discard(_u)
+            for _u in list(visited)[:_to_remove]:
+                del visited[_u]
 
     if url_depth(u) > CRAWL_DEPTH:
         return
@@ -7854,7 +8686,8 @@ def _crawl(u: str) -> None:
         if _is_host_dead(netloc):
             return
         try:
-            r = _get_proxy_session().get(u, timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=False)
+            r = _request_tls_fallback(_get_proxy_session(), "GET", u,
+                                      timeout=(TIMEOUT_CONN, TIMEOUT_READ), verify=VERIFY_TLS)
         except _CONN_ERRORS as e:
             log(f"Skipping {netloc} — {_short_exc(e)}", "WARN")
             _mark_host_dead(netloc)
@@ -8002,12 +8835,18 @@ def _discovery_worker() -> None:
     Started after the initial crawl finishes. The initial crawl's WORKERS
     threads all exit (via None sentinels); these workers take over and keep
     draining the queue so enqueue() calls from the proxy handler are honored.
+    SENTINEL FIX (round 2): None no longer kills a discovery worker — it is
+    skipped and drained. This closes the link-loss window between
+    _crawl_done.set() and _start_discovery_workers() in crawl_parallel (both
+    gate arms were momentarily False there) and makes stray initial-round
+    sentinels harmless (any initial worker that misses its sentinel simply
+    lives on as an extra discovery worker — same queue, same logic).
     """
     while True:
         u = url_queue.get()
         if u is None:
             url_queue.task_done()
-            return
+            continue
         try:
             _crawl(u)
         except Exception as e:
@@ -8063,14 +8902,15 @@ def crawl_parallel() -> None:
         w.start()
     url_queue.join()
     # Enqueue sentinels so all INITIAL workers exit cleanly (one per worker).
-    # The persistent discovery workers are started AFTER, so they never see
-    # these sentinels.
     for _ in range(WORKERS):
         url_queue.put(None)
     save_queue.join()
-    _crawl_done.set()   # signals initial crawl is complete
-    # Start persistent discovery workers so newly-discovered URLs keep flowing.
+    # Start persistent discovery workers BEFORE flipping _crawl_done — the
+    # gate `(not _crawl_done) or _discovery_started` had a momentary both-
+    # False window here that silently dropped links. Discovery workers now
+    # skip None sentinels, so ordering is safe.
     _start_discovery_workers()
+    _crawl_done.set()   # signals initial crawl is complete
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streaming helper  (large binary responses — video, WASM, big downloads)
@@ -8183,17 +9023,23 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                 elif _enc_name == "zstd":
                     data = _decomp.decompress(data)
                 elif _enc_name == "deflate":
-                    out = _decomp.decompress(data)
-                    if not out and _deflate_fallback is None:
-                        # First chunk produced nothing — maybe raw deflate (no zlib header).
-                        # Create a PERSISTENT raw-deflate decompressor (NOT per-chunk:
-                        # raw deflate is a stream, each chunk depends on prior state).
+                    if _deflate_fallback is None:
                         try:
+                            out = _decomp.decompress(data)
+                            _deflate_fallback = False   # zlib-wrapped stream confirmed
+                        except zlib.error:
+                            # RAW-DEFLATE FIX: servers sending raw deflate (no
+                            # zlib header) made the zlib decompressor RAISE —
+                            # the old "empty output" fallback never fired and
+                            # the outer except passed STILL-COMPRESSED bytes
+                            # through as if they were identity (garbled pages).
+                            # Switch to a PERSISTENT raw-deflate decompressor
+                            # on the first error instead.
                             _deflate_fallback = zlib.decompressobj(-zlib.MAX_WBITS)
                             out = _deflate_fallback.decompress(data)
-                        except Exception:
-                            _deflate_fallback = None
-                    elif _deflate_fallback is not None:
+                    elif _deflate_fallback is False:
+                        out = _decomp.decompress(data)
+                    else:
                         out = _deflate_fallback.decompress(data)
                     data = out
                 else:  # gzip
@@ -8471,11 +9317,22 @@ class _WSTunnel:
         # the pump call frame) so reconnect rounds can verify it's still alive
         # and restart it if it gave up during a long upstream outage.
         self.c2s_thread = None
+        # KEEPALIVE-DUP FIX: the current keepalive thread, so a reconnect
+        # round can join the old one before spawning a fresh one — the old
+        # thread's except-path stop.set() used to kill the NEW round when
+        # both overlapped.
+        self.keepalive_t = None
         # Bookkeeping for the deflate direction flag — RFC 7692 says the
         # RSV1 bit on the FIRST frame of a message indicates compression.
         # Continuation frames never carry it.
         self._client_deflate_seen = False
         self._srv_deflate_seen    = False
+        # SEND-LOCK FIX: socket.sendall is NOT atomic/thread-safe — the c2s
+        # relay (PONG/CLOSE) and the s2c relay (data frames) both write the
+        # BROWSER socket; without a lock their bytes could interleave mid-frame
+        # and permanently desync the browser's parser (the upstream side got
+        # _send_lock long ago — the browser side was simply missed).
+        self.client_send_lock = threading.Lock()
 
     def close(self, keep_client: bool = False):
         """Close both sides and release deflate contexts.
@@ -8575,14 +9432,21 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
         tunnel.stop.clear()
         log(f"WS tunnel resumed → {ws_url}", "INFO")
 
-    # Start keepalive thread (fresh round each reconnect — old one exited when
-    # the upstream died; joining it here is unnecessary, it's daemon + short).
+    # Start keepalive thread. KEEPALIVE-DUP FIX: a reconnect round joins the
+    # previous round's keepalive (if still alive past its stop) before
+    # spawning a fresh one — the old code could end up with two pingers, and
+    # the stale one's except-path tunnel.stop.set() then tore down the NEW
+    # round spuriously. WS_PING_INTERVAL=0 (default) never starts one.
     keepalive_t = None
     if WS_PING_INTERVAL > 0:
+        _old_ka = getattr(tunnel, "keepalive_t", None)
+        if _old_ka is not None and _old_ka.is_alive():
+            _old_ka.join(timeout=3.0)
         keepalive_t = threading.Thread(
             target=_ws_keepalive_loop, args=(tunnel,),
             daemon=True, name=f"ws-keepalive-{tunnel.tunnel_id}",
         )
+        tunnel.keepalive_t = keepalive_t
         keepalive_t.start()
 
     def _fwd_client_to_srv():
@@ -8613,7 +9477,8 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 # handshake completes cleanly, then forward it upstream.
                 tunnel.client_gone = True
                 try:
-                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
+                    with tunnel.client_send_lock:
+                        client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
                 except Exception:
                     pass
                 tunnel.srv.send_frame(_WS_OPCODE_CLOSE, payload)
@@ -8688,7 +9553,8 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
             elif opcode == _WS_OPCODE_PING:
                 # Browser pings us → respond with pong directly
                 try:
-                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
+                    with tunnel.client_send_lock:
+                        client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
                 except Exception:
                     tunnel.client_gone = True
                     break
@@ -8723,7 +9589,16 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                 log(f"WS← {ws_url} fin={fin} rsv1={int(rsv1)} op={_op_name} len={len(payload)}", "DEBUG")
             if opcode == _WS_OPCODE_CLOSE:
                 try:
-                    client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
+                    with tunnel.client_send_lock:
+                        client_sock.sendall(_ws_make_frame(_WS_OPCODE_CLOSE, payload))
+                except Exception:
+                    pass
+                # RFC 6455 §5.5.1 CLOSE-HANDSHAKE FIX: reply to the upstream
+                # that initiated the close handshake (the c2s handler already
+                # mirrors browser-initiated closes at the twin site). The old
+                # path broke out and raw-closed the socket instead.
+                try:
+                    srv.send_frame(_WS_OPCODE_CLOSE, payload)
                 except Exception:
                     pass
                 break
@@ -8780,8 +9655,9 @@ def _pump_ws_frames_v2(client_sock, srv, ws_url: str, use_deflate: bool = False,
                     out_payload = _ws_deflate_msg(tunnel.tunnel_id, msg)
                     out_rsv1    = True
                 try:
-                    client_sock.sendall(_ws_make_frame(
-                        frag_opcode or opcode, out_payload, fin=fin, rsv1=out_rsv1))
+                    with tunnel.client_send_lock:
+                        client_sock.sendall(_ws_make_frame(
+                            frag_opcode or opcode, out_payload, fin=fin, rsv1=out_rsv1))
                 except Exception:
                     break
                 frag_opcode, frag_buf = None, bytearray()
@@ -9003,12 +9879,13 @@ class _RawSocketUpstreamWS:
         sni_hostname = host if host and not _is_ip_literal(host) else None
 
         raw = socket.create_connection((host, port), timeout=15)
-        # After the TCP connect succeeds, clear the timeout so the WS
-        # handshake AND all subsequent frame reads block until either side
-        # closes the socket. The 15s connect timeout above is intentional
-        # (we want to fail fast on unreachable hosts), but no socket-level
-        # timeout should apply once we're connected.
-        raw.settimeout(None)
+        # HANG FIX: a timeout MUST cover the WS handshake exchange — a server
+        # that accepts TCP but never answers used to block the handshake
+        # recv() FOREVER (plain ws:// path), pinning a worker per connection
+        # (128 of them froze the whole tool). The timeout is cleared only
+        # AFTER the 101 handshake completes (settimeout(None) at the end of
+        # __init__ — frame reads must stay untimed for idle tunnels).
+        raw.settimeout(max(TIMEOUT_CONN, 15))
         srv = raw
         try:
             if use_ssl:
@@ -9040,11 +9917,10 @@ class _RawSocketUpstreamWS:
                 # user saw in the log.
                 raw.settimeout(30)
                 srv = ctx.wrap_socket(raw, server_hostname=sni_hostname)
-                # Back to NO timeout for the WS handshake AND for the subsequent
-                # frame reads — the tunnel should outlive idle periods (chat,
-                # push, dashboards). The handshake itself is fast; once it's
-                # done, recv blocks until either side closes the socket.
-                raw.settimeout(None)
+                # Keep the handshake timeout active after the TLS wrap — the
+                # 101-response read below must stay bounded too (HANG FIX).
+                # The end of __init__ clears the timeout for the frame pumps
+                # (tunnels should outlive idle periods: chat, push, dashboards).
 
             # RFC 6455 §4.1: Sec-WebSocket-Key is 16 random bytes, base64-encoded
             # DIRECTLY — no hashing. SHA1 only enters the picture on the SERVER
@@ -9566,12 +10442,22 @@ def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
         finally:
             # Client disconnected (GeneratorExit) or stream ended — release the
             # upstream connection so curl_cffi doesn't leak the socket.
+            # LEAK FIX: flag upstream_done as well — the old code set it only
+            # in the reader's finally, so a full buf_q + dead consumer left
+            # the reader thread looping put/Full/continue FOREVER (one zombie
+            # thread + 256 buffered chunks per disconnected SSE client).
+            try: upstream_done.set()
+            except Exception: pass   # heartbeat-off path: undefined — fine
             try: upstream_r.close()
             except Exception: pass
 
     headers = filter_resp(_resp_headers_dict(upstream_r))
-    # Force chunked: Werkzeug doesn't auto-chunk generators with no Content-Length
-    headers.pop("content-length", None)
+    # Force chunked: Werkzeug doesn't auto-chunk generators with no Content-Length.
+    # CL FIX: pop BOTH casings — requests/urllib3 emit "Content-Length" and
+    # the injected ": ping" keepalives grow the body past any advertised
+    # length, making browsers truncate the SSE stream at N bytes.
+    for _k in [k for k in headers if k.lower() == "content-length"]:
+        headers.pop(_k, None)
     headers["Cache-Control"] = "no-cache, no-transform"
     headers["X-Accel-Buffering"] = "no"   # disable nginx buffering if behind one
     ct = upstream_r.headers.get("Content-Type", "text/event-stream")
@@ -9619,6 +10505,10 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
     """
     stop = threading.Event()
     tunnel_id = id(client_sock)
+    # SEND-LOCK FIX (see _WSTunnel.client_send_lock): serialize ALL writes to
+    # the browser socket — the PONG from the reader thread and the data frames
+    # from the writer thread used to race and interleave mid-frame.
+    _client_send_lock = threading.Lock()
     # Shared last-activity timestamp — makes TUNNEL_TIMEOUT (idle teardown)
     # actually enforceable: without it the 5.0s poll timeout below just loops
     # forever on an idle tunnel and the config value is dead code.
@@ -9649,7 +10539,8 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
                     # Browsers send keepalive PINGs on long-lived tunnels —
                     # without a PONG response they tear down the connection.
                     try:
-                        client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
+                        with _client_send_lock:
+                            client_sock.sendall(_ws_make_frame(_WS_OPCODE_PONG, payload))
                     except Exception:
                         break
                 # PONG (opcode 10): unsolicited from browser, ignore.
@@ -9688,7 +10579,8 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
                     last_activity[0] = time.time()
                     # Send as binary WS frame (server→client, unmasked)
                     try:
-                        client_sock.sendall(_ws_make_frame(_WS_OPCODE_BINARY, data))
+                        with _client_send_lock:
+                            client_sock.sendall(_ws_make_frame(_WS_OPCODE_BINARY, data))
                     except Exception:
                         break
                     with _active_tunnels_lock:
@@ -9727,8 +10619,31 @@ def _pump_tcp_over_ws(client_sock, upstream_sock, label: str,
 # The pool caps total concurrent request threads at MAX_HTTP_THREADS; excess
 # requests queue instead of crashing.
 MAX_HTTP_THREADS = 128
+# Seconds allowed for EACH request-line / header read on the raw socket.
+# SLOWLORIS FIX: there was no socket timeout at all on the request-parse
+# path — a client sending a partial request line pinned an _http_pool worker
+# forever, and 128 such connections froze the entire tool (main app + every
+# CDN mini-server + viewer share that pool). Per-read bound, like Apache's
+# Timeout directive; cleared after parsing (long-lived WS/SSE handlers
+# manage their own socket lifecycles).
+HTTP_HEADER_TIMEOUT = 30
+# Per-read timeout kept on the socket DURING request processing (body reads,
+# response writes). SLOW-BODY FIX: the header timeout alone left a dribbling
+# upload body able to pin a worker forever (Content-Length: 256MB, 1 byte/min
+# → 128 frozen workers). Cleared to None only by detached WS pumps (idle
+# tunnels must live forever).
+HTTP_BODY_TIMEOUT = 60
 _http_pool = ThreadPoolExecutor(max_workers=MAX_HTTP_THREADS, thread_name_prefix="http")
 _link_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="link-ext")
+
+# POOL-STARVATION FIX: a pumped WebSocket or raw tunnel occupies its worker
+# for the tunnel's ENTIRE LIFETIME (hours for chat/push apps, up to 3
+# reconnect rounds each). Running the pumps inline on _http_pool meant ~128
+# concurrent tunnels starved every HTTP request into the unbounded queue —
+# the proxy just stopped responding. The pumps now run on their own pool and
+# the HTTP worker is released as soon as the upgrade is handed off.
+MAX_TUNNEL_THREADS = 512
+_tunnel_pool = ThreadPoolExecutor(max_workers=MAX_TUNNEL_THREADS, thread_name_prefix="ws-tun")
 
 class _PooledWSGIServer(ThreadedWSGIServer):
     """ThreadedWSGIServer that uses a bounded thread pool instead of spawning
@@ -9747,10 +10662,6 @@ class _PooledWSGIServer(ThreadedWSGIServer):
         try:
             host = self.server_address[0] if isinstance(self.server_address, tuple) else ""
             if self.socket.family == socket.AF_INET and host in ("0.0.0.0", ""):
-                try:
-                    self.socket.close()
-                except OSError:
-                    pass
                 v6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
                 # IPV6_V6ONLY=0 is what turns an IPv6 socket into dual-stack.
                 # On every Linux kernel >= 2.4 this is supported; the try/except
@@ -9763,9 +10674,14 @@ class _PooledWSGIServer(ThreadedWSGIServer):
                     v6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 except OSError:
                     pass
+                old_socket = self.socket
                 self.socket = v6
                 self.address_family = socket.AF_INET6
                 self.server_address = ("::", self.server_address[1])
+                try:
+                    old_socket.close()
+                except OSError:
+                    pass
         except Exception:
             # Any failure here falls through to werkzeug's default IPv4 bind.
             pass
@@ -9773,6 +10689,25 @@ class _PooledWSGIServer(ThreadedWSGIServer):
 
     def process_request(self, request, client_address):
         _http_pool.submit(self.process_request_thread, request, client_address)
+
+    # DETACHED-WS FIX: sockets handed to the tunnel pool are closed by the
+    # pump itself (see _S2LWSGIRequestHandler._run_ws_direct_detached) — the
+    # base teardown must skip them.
+    _s2l_detached_sockets: set = set()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            try:
+                if request in self._s2l_detached_sockets:
+                    self._s2l_detached_sockets.discard(request)
+                else:
+                    self.shutdown_request(request)
+            except Exception:
+                pass
     def server_close(self):
         # Don't shut down the shared pool on one server's close — other CDN
         # mini-servers may still be using it. Pool is cleaned up at exit.
@@ -9805,6 +10740,14 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
     def handle_one_request(self):
         """Override to intercept WebSocket upgrades BEFORE WSGI processing."""
         try:
+            # SLOWLORIS FIX: bound every request-line/header read (see
+            # HTTP_HEADER_TIMEOUT above). Cleared in the finally so WSGI body
+            # reads and the WS/SSE handlers below keep their own (untimed or
+            # self-managed) socket semantics.
+            try:
+                self.connection.settimeout(HTTP_HEADER_TIMEOUT)
+            except Exception:
+                pass
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
                 self.requestline = ''
@@ -9818,13 +10761,39 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             if not self.parse_request():
                 return
         except Exception:
+            # Timeout mid-parse (slowloris), reset, garbage — close the
+            # connection instead of spinning on another eternal read.
+            self.close_connection = True
             return
+        finally:
+            try:
+                # Keep a bounded timeout DURING request processing (body reads
+                # + response writes — slow-body slowloris guard); cleared to
+                # None only by the detached WS pump wrapper.
+                self.connection.settimeout(HTTP_BODY_TIMEOUT)
+            except Exception:
+                pass
 
         # ── WS upgrade detection — BEFORE WSGI ──────────────────────────
         # Werkzeug 3.x 400s on Connection: Upgrade before reaching Flask
         upgrade_hdr = self.headers.get("Upgrade", "").lower().strip()
         if upgrade_hdr == "websocket":
-            self._handle_ws_direct()
+            # POOL FIX: hand the pump to the dedicated tunnel pool and return
+            # immediately — the HTTP worker is freed while the long-lived
+            # tunnel runs. The socket is marked detached so the base classes
+            # skip their finish()/shutdown_request() teardown (ownership moved
+            # to the pump, which closes it when done).
+            self.close_connection = True
+            self._s2l_ws_detached = True
+            try:
+                self.server._s2l_detached_sockets.add(self.connection)
+                _tunnel_pool.submit(self._run_ws_direct_detached)
+            except Exception:
+                # Pool rejected/exhausted — fall back to the old inline path
+                # (blocks this worker, but the connection still works).
+                self._s2l_ws_detached = False
+                self.server._s2l_detached_sockets.discard(self.connection)
+                self._handle_ws_direct()
             return
 
         # Normal request — use Werkzeug's WSGI path (do_* → run_wsgi)
@@ -9835,6 +10804,40 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
         method = getattr(self, mname)
         method()
         self.wfile.flush()
+
+    def finish(self):
+        # DETACHED-WS FIX: once the WS pump owns the socket, the base-class
+        # finish() (wfile flush + stream teardown) must not touch it.
+        if getattr(self, "_s2l_ws_detached", False):
+            return
+        try:
+            super().finish()
+        except Exception:
+            pass
+
+    def _run_ws_direct_detached(self):
+        """Pump wrapper for the detached (own-pool) WS path — guarantees the
+        browser socket is fully closed when the pump finishes (the base
+        server teardown no longer runs for detached sockets)."""
+        try:
+            # Idle tunnels must live forever — clear the request-phase
+            # timeout the handler left on the socket (see HTTP_BODY_TIMEOUT).
+            try:
+                self.connection.settimeout(None)
+            except Exception:
+                pass
+            self._handle_ws_direct()
+        except Exception as exc:
+            log(f"WS-direct error: {exc}", "ERROR")
+        finally:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.connection.close()
+            except Exception:
+                pass
 
     def _handle_ws_direct(self):
         """Handle WS upgrade directly — NO Flask context needed.
@@ -9877,6 +10880,20 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
                 ws_path_q = wspath[len(ws_host):] or "/"
                 if query:
                     ws_path_q += f"?{query}"
+                # SECURITY (SSRF pivot): never dial internal targets through the
+                # WS-ext route; non-allowlisted public hosts only from our own
+                # pages (mirrored SPA dynamic WS endpoints keep working).
+                if _is_internal_target(ws_host):
+                    self.connection.sendall(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 23\r\n\r\n"
+                        b"Blocked internal target")
+                    return
+                if not _ext_host_allowed(ws_host) and not _request_from_own_page(
+                        self.headers, self.headers.get("Host", "")):
+                    self.connection.sendall(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 24\r\n\r\n"
+                        b"Blocked host (allowlist)")
+                    return
                 # plain ws:// targets (original page used ws://, not wss://)
                 # must be dialed without TLS, keeping their explicit port.
                 target = f"{'http' if _plain else 'https'}://{ws_host}{ws_path_q}"
@@ -10055,21 +11072,19 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
                 # a closed client_sock means the browser navigated away or
                 # closed the tab; no point reconnecting. (The pump no longer
                 # closes it in this path, so the probe is meaningful.)
-                # FIX: sendall(b"") is a no-op on most platforms (returns 0
-                # immediately without calling send(2)), so it can't detect a
-                # closed browser socket. Use a non-blocking MSG_PEEK recv
-                # instead — returns b"" if the browser closed, raises on error.
-                try:
-                    client_sock.setblocking(False)
-                    _probe = client_sock.recv(1, socket.MSG_PEEK)
-                    client_sock.setblocking(True)
-                    if not _probe:
-                        break   # browser closed the connection
-                except (BlockingIOError, InterruptedError):
-                    # No data ready → socket is still open → restore blocking
-                    client_sock.setblocking(True)
-                except Exception:
-                    break   # probe failed → socket is dead
+                # PROBE-RACE FIX: the c2s reader thread is the single reader
+                # on this fd and stays blocked in recv() during reconnect
+                # rounds — toggling the fd's blocking mode here raced it
+                # (BlockingIOError inside _recv_exact → spurious client_gone,
+                # or the reader's settimeout(None) un-did our non-blocking
+                # flag and the probe blocked forever). The c2s reader sets
+                # tunnel.client_gone the moment the browser actually closes;
+                # poll THAT instead of touching the fd.
+                if _ws_tunnel.client_gone:
+                    break
+                time.sleep(0.05)   # let a just-closed browser surface
+                if _ws_tunnel.client_gone:
+                    break
                 if _ws_attempts >= _ws_max_reconnects:
                     log(f"WS upstream dropped — reconnect limit reached "
                         f"({_ws_max_reconnects}): {ws_url}", "WS")
@@ -10123,6 +11138,21 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             port = int(port_s)
             if not (1 <= port <= 65535):
                 self.connection.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            # SECURITY (network pivot): the raw TCP/UDP tunnel must never
+            # reach internal targets (metadata services, internal panels),
+            # and non-allowlisted public targets are only reachable from
+            # pages this proxy itself served.
+            if _is_internal_target(host):
+                self.connection.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 23\r\n\r\n"
+                    b"Blocked internal target")
+                return
+            if not _ext_host_allowed(host) and not _request_from_own_page(
+                    self.headers, self.headers.get("Host", "")):
+                self.connection.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 24\r\n\r\n"
+                    b"Blocked host (allowlist)")
                 return
 
             client_sock = self.connection
@@ -10179,6 +11209,10 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             log(f"Tunnel error: {exc}", "ERROR")
             self.close_connection = True
 app = Flask(__name__, static_folder=None)
+# OOM FIX: no MAX_CONTENT_LENGTH meant a multi-hundred-MB upload (or a few
+# concurrent ones — the server is a thread pool) was fully buffered in RAM
+# via get_data(). Bound it; raise the config for unusual legit upload sizes.
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
 @app.after_request
 def _main_security_headers(response: Response) -> Response:
@@ -10430,11 +11464,23 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
     # downloads) — the default TIMEOUT_READ=12s is too short for slow CDNs
     # and causes playback to stall after ~30-40s.
     _read_timeout = TIMEOUT_STREAM_READ if stream else TIMEOUT_READ
+    # ENCODING FIX: only advertise what we can actually DECODE. If upstream
+    # picked an encoding we lack a decompressor for (br/zstd without the
+    # module), _stream_resp strips the CE header but passes STILL-COMPRESSED
+    # bytes through as identity — corrupt .wasm/video downloads. curl_cffi's
+    # impersonation may still override AE at the libcurl level (see the
+    # _stream_resp docstring), so this is best-effort + the WARN stays.
+    _supported_ae = "gzip, deflate"
+    if _BROTLI_OK:
+        _supported_ae += ", br"
+    if _ZSTD_OK:
+        _supported_ae += ", zstd"
+    fwd["Accept-Encoding"] = _supported_ae
     kwargs: dict = {
         "headers":         fwd,
         "timeout":         (TIMEOUT_CONN, _read_timeout),
         "allow_redirects": True,
-        "verify":          False,
+        "verify":          VERIFY_TLS,
         "stream":          stream,
     }
 
@@ -10462,8 +11508,15 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
             existing_ct = {k.lower() for k in fwd}
             if "content-type" not in existing_ct and ct:
                 fwd["Content-Type"] = ct
-    response = sess.request(method, target, **kwargs)
-    if not stream:
+    response = _request_tls_fallback(sess, method, target, **kwargs)
+    # SSE AMPLIFIER FIX: when a text/event-stream response arrives on a
+    # stream=False request (URL didn't match the SSE heuristics), do NOT
+    # force-consume .content — an endless SSE body blocks until TIMEOUT_READ
+    # and the factory cascade repeats that ~4× before the proxy layer's SSE
+    # branch re-fetches with stream=True (the designed recovery). SSE bodies
+    # are never CF-block HTML either, so the sniff below is skipped too.
+    _sse_ct = "text/event-stream" in (response.headers.get("Content-Type") or "").lower()
+    if not stream and not _sse_ct:
         try:
             _ = response.content   # force-consume so connection is reusable
         except Exception:
@@ -10478,19 +11531,26 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
     # create a fresh unauthenticated session, which returns 401 and we would
     # mistakenly serve that 401 body instead of the real 200 data.
     _resp_cl_raw = response.headers.get("Content-Length", None) if not stream else None
-    _resp_cl_explicit_zero = (_resp_cl_raw is not None and int(_resp_cl_raw or 0) == 0)
+    # MALFORMED-CL FIX: a corrupt upstream Content-Length (non-numeric) used
+    # to raise ValueError here → unhandled → Flask 500.
+    try:
+        _resp_cl_int = int(_resp_cl_raw or 0)
+    except (ValueError, TypeError):
+        _resp_cl_int = 0
+    _resp_cl_explicit_zero = (_resp_cl_raw is not None and _resp_cl_int == 0)
     if (not stream
+            and not _sse_ct
             and not _resp_cl_explicit_zero
             and response.status_code in (200, 201)
             and response.content == b""
-            and method in _SAFE_METHODS | {"POST"}):
+            and method in _SAFE_METHODS):
         try:
             # Retry with the SAME authenticated session + identity encoding
             retry_fwd = dict(fwd)
             retry_fwd["Accept-Encoding"] = "identity"
             retry_kwargs = dict(kwargs)
             retry_kwargs["headers"] = retry_fwd
-            retry_response = sess.request(method, target, **retry_kwargs)
+            retry_response = _request_tls_fallback(sess, method, target, **retry_kwargs)
             try:
                 _ = retry_response.content
             except Exception:
@@ -10508,7 +11568,7 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
     # causing an empty response. Classic 403/503 blocks are always HTML, never
     # binary, but Managed Challenge can also return 200 with a JS challenge body
     # (the q=78/jschl_vc family) — _is_cf_block checks for both via headers+body.
-    if not stream and _is_cf_block(
+    if not stream and not _sse_ct and _is_cf_block(
             response.content[:8192] if response.content else b"",
             response.status_code,
             dict(response.headers)):
@@ -10524,9 +11584,12 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
         if _cid is not None:
             with _CLIENT_LOCK:
                 _old_sess = _CLIENT_SESSIONS.get(_cid)
-            if _old_sess is not None:
-                try: _old_sess.close()
-                except Exception: pass
+            # RACE FIX: retire the old session instead of closing it — it is
+            # SHARED by concurrent requests from the same browser, and an
+            # immediate close killed their connection pools (spurious
+            # failures under parallel load). _retire_session closes it after
+            # a drain window.
+            _retire_session(_old_sess)
             _fresh = _make_session()
             _fresh.headers["User-Agent"] = fwd.get("User-Agent",
                 _sanitize_ua(UA_PROFILES["macintosh"]))
@@ -10536,19 +11599,21 @@ def _do_upstream(method: str, target: str, ctx: HookContext,
         else:
             # Background thread (no flask context) — fall back to _proxy_local.s
             _old_sess = getattr(_proxy_local, "s", None)
-            if _old_sess is not None:
-                try: _old_sess.close()
-                except Exception: pass
+            _retire_session(_old_sess)
             _proxy_local.s = _make_session()
             sess = _proxy_local.s
             sess.headers["User-Agent"] = fwd.get("User-Agent",
                 _sanitize_ua(UA_PROFILES["macintosh"]))
-        response = sess.request(method, target, **kwargs)
-        if not stream:
-            try:
-                _ = response.content
-            except Exception:
-                pass
+        # REPLAY FIX: re-send after rotation ONLY for idempotent methods — a
+        # POST hitting a false-positive block must not be duplicated; the
+        # rotated session is picked up by the NEXT request instead.
+        if method in _SAFE_METHODS:
+            response = _request_tls_fallback(sess, method, target, **kwargs)
+            if not stream:
+                try:
+                    _ = response.content
+                except Exception:
+                    pass
 
     return response
 
@@ -10602,7 +11667,11 @@ def _parse_range_header(range_hdr: str, file_size: int) -> tuple[int, int] | Non
     if not range_hdr or file_size <= 0:
         return None
     try:
-        m = re.match(r"bytes=(\d*)-(\d*)", range_hdr.strip())
+        # MULTI-RANGE FIX: anchor the match — "bytes=0-1,5-9" used to match
+        # "0-1" and served a first-range-only 206 (invalid for multi-range).
+        # Now it returns None → the caller serves a legal full 200 (a server
+        # MAY ignore Range entirely).
+        m = re.match(r"bytes=(\d*)-(\d*)\s*$", range_hdr.strip())
         if not m:
             return None
         start_s, end_s = m.group(1), m.group(2)
@@ -10757,6 +11826,23 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
         return None
     rng_parsed = _parse_range_header(rng, file_size)
     if rng_parsed is None:
+        # 416 FIX (RFC 9110 §14.2): a SINGLE well-formed range whose start is
+        # beyond EOF must get 416 with Content-Range: bytes */size — the old
+        # fall-through served a full 200, which <video> interprets as a
+        # truncated stream (stall/loop). Multi-range ("bytes=0-1,5-9") and
+        # malformed headers do not match the guard; inverted ranges
+        # (start>end) only 416 when start is ALSO beyond EOF — everything
+        # else falls through to the caller's full-200 fallback (a server MAY
+        # ignore Range entirely).
+        _m416 = re.match(r"^bytes=\s*(\d+)\s*-\s*(\d+)?\s*$", rng.strip())
+        if _m416 and int(_m416.group(1)) >= file_size:
+            resp = Response(status=416)
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            _apply_cors_headers(resp.headers)
+            _apply_isolation_headers(resp.headers,
+                                     is_worker_script=_is_worker_request())
+            _apply_security_headers(resp.headers)
+            return resp
         return None
     start, end = rng_parsed
     try:
@@ -10972,8 +12058,14 @@ def _s2l_hp_endpoint() -> Response:
     with _cdn_port_lock:
         hp = {h: p for h, p in _cdn_host_port.items() if p > 0}
     resp = Response(json.dumps(hp), content_type="application/json")
-    resp.headers["Cache-Control"]               = "no-store"
-    _apply_cors_headers(resp.headers)
+    resp.headers["Cache-Control"] = "no-store"
+    # INFO-LEAK FIX: the generic CORS helper echoes "*" for foreign origins —
+    # any website could enumerate the live CDN host/port map (operational
+    # data). Only the proxy's OWN origins (the proxied pages running the
+    # injector) may read it.
+    _origin = flask_request.headers.get("Origin", "")
+    if _origin and _origin_is_own(_origin):
+        resp.headers["Access-Control-Allow-Origin"] = _origin
     _apply_security_headers(resp.headers)
     return resp
 
@@ -10995,14 +12087,18 @@ def _s2l_hp_endpoint() -> Response:
 _S2L_VIEWER_REFRESH_MS = 50
 
 def _viewer_cors_headers(origin: str) -> dict:
-    """CORS headers shared by all /__s2l_*__ viewer/dashboard routes."""
+    """CORS headers shared by all /__s2l_*__ viewer/dashboard routes.
+
+    SECURITY FIX: credentials are only granted to the proxy's OWN origins
+    (see _origin_is_own) — the old verbatim reflection let any website poll
+    the viewer data / reset stats cross-origin with the user's cookies."""
     h = {
         "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
         "Access-Control-Allow-Headers": _cors_allow_headers(),
         "Access-Control-Max-Age": "86400",
         "Vary": "Origin",
     }
-    if origin:
+    if origin and _origin_is_own(origin):
         h["Access-Control-Allow-Origin"] = origin
         h["Access-Control-Allow-Credentials"] = "true"
         # Concrete expose list (not "*") so credentialed dashboard embeds can
@@ -11013,9 +12109,7 @@ def _viewer_cors_headers(origin: str) -> dict:
     else:
         h["Access-Control-Allow-Origin"] = "*"
         h["Access-Control-Expose-Headers"] = "*"
-    # Private Network Access: allow public-context fetches to localhost so an
-    # embedding dashboard served from a real https origin can still poll the
-    # viewer's data endpoint without a CORS policy violation.
+    # Private Network Access: only for our own origins (see _pna_allow_header).
     h.update(_pna_allow_header())
     return h
 
@@ -11068,6 +12162,12 @@ def _s2l_reset_stats_endpoint() -> Response:
         r = Response(status=204)
         r.headers.update(_viewer_cors_headers(flask_request.headers.get("Origin", "")))
         return r
+    # CSRF FIX: stats.reset() is a mutating side effect reachable as a CORS
+    # "simple request" (no preflight) from any website. Require provably-
+    # own-page evidence; the legit viewer is same-origin and passes.
+    if not _request_from_own_page(flask_request.headers, flask_request.host):
+        return Response("forbidden", status=403,
+                        content_type="text/plain; charset=utf-8")
     stats.reset()
     log("Stats reset via /__s2l_reset_stats__", "INFO")
     resp = Response(json.dumps({"ok": True, "ts": time.strftime("%H:%M:%S")}),
@@ -12266,6 +13366,27 @@ def ext_asset(extpath: str) -> Response:
     if qs:
         real_url += f"?{qs}"
 
+    # ── SECURITY FIX (SSRF / open relay) ──────────────────────────────────
+    # This route used to dial ANY host the client named, returning the body
+    # to the caller — a full-read SSRF pivot (cloud metadata, internal
+    # panels) reachable from the LAN (HOST=0.0.0.0) and from any website
+    # (pre-CORS-fix). Now:
+    #   1. internal/private/loopback targets are ALWAYS refused;
+    #   2. allowlisted hosts (MAIN_HOST, hosts emitted by the rewriter,
+    #      registered CDNs, EXT_ALLOW_EXTRA) are always allowed;
+    #   3. any other PUBLIC host is allowed only when the request provably
+    #      comes from a page this proxy served (mirrored SPA dynamic hosts).
+    if _is_internal_target(ext_host):
+        log(f"Blocked ext fetch to INTERNAL target: {ext_host}", "WARN")
+        return Response("Blocked internal target", status=403)
+    if not _ext_host_allowed(ext_host):
+        _own_page = _request_from_own_page(flask_request.headers, flask_request.host)
+        if not _own_page:
+            log(f"Blocked ext fetch to non-allowed host: {ext_host}", "WARN")
+            return Response(
+                "Blocked host (not in ext allowlist; add to EXT_ALLOW_EXTRA if trusted)",
+                status=403)
+
     if method == "OPTIONS":
         _aco, _acc = _cors_origin_pair()
         r = Response(status=204)
@@ -12284,8 +13405,21 @@ def ext_asset(extpath: str) -> Response:
         r.headers = {k: v for k, v in r.headers.items() if v is not None}
         return r
 
-    lp = local_path(real_url)
+    # DEVICE-AWARE LOOKUP FIX: mirror the main route's device-variant-first
+    # lookup (saves carry the device tag — see the CDN cache-hit block above).
+    _dev_e = _device_variant(_effective_device())
+    lp = local_path(real_url, _dev_e) if _dev_e else local_path(real_url)
+    if _dev_e and not os.path.isfile(lp):
+        _canon_e = local_path(real_url)
+        if os.path.isfile(_canon_e):
+            lp = _canon_e
+    _has_range = bool(flask_request.headers.get("Range", ""))
     if method in _SAFE_METHODS and (CACHE_CDN or OFFLINE) and os.path.isfile(lp):
+        # RANGE FIX: honor Range on cache hits (see the CDN cache-hit block).
+        if _has_range:
+            _rr_e = _serve_range_from_disk(lp, real_url, method, req_path=ext_path)
+            if _rr_e is not None:
+                return _rr_e
         _probe_ct_e = _resolve_mime_with_sniff(lp)
         _c304 = _conditional_304(lp, _probe_ct_e)
         if _c304 is not None:
@@ -12331,6 +13465,16 @@ def ext_asset(extpath: str) -> Response:
             if _kl == "origin": ctx.req_headers[_k] = _real_origin
             elif _kl == "referer": ctx.req_headers[_k] = _real_origin + "/"
         ctx.req_headers["Host"] = ext_host
+        # ── SECURITY FIX (credential exfiltration) ──────────────────────
+        # The browser's Cookie/Authorization for the PROXY origin are meant
+        # for the mirrored site, never for arbitrary third-party hosts. The
+        # old code forwarded them verbatim — a single crafted URL delivered
+        # the user's live session cookies to an attacker host. The per-domain
+        # session cookie jar still applies (cookies the ext host itself set
+        # stay between us and that host).
+        for _k in list(ctx.req_headers.keys()):
+            if _k.lower() in ("cookie", "authorization", "proxy-authorization"):
+                ctx.req_headers.pop(_k, None)
 
         if _REQ_HOOKS:
             stats.inc("hooks_run", _run_hooks(_REQ_HOOKS, ctx))
@@ -12343,7 +13487,6 @@ def ext_asset(extpath: str) -> Response:
         # TIMEOUT_STREAM_READ for streamed (large/binary) responses. See the
         # matching comment in _cdn_serve for why extensionless large binary
         # paths need the path-level heuristic.
-        _has_range = bool(flask_request.headers.get("Range", ""))
         _guess_ct_e = guess_mime(ext_path)
         _path_lower_e = ext_path.lower()
         _looks_large_binary_e = (
@@ -12355,17 +13498,26 @@ def ext_asset(extpath: str) -> Response:
         _do_stream_ext = method in _SAFE_METHODS and (
             _has_range or _should_stream(_guess_ct_e) or _looks_large_binary_e)
         _read_timeout_e = TIMEOUT_STREAM_READ if _do_stream_ext else TIMEOUT_READ
+        # ENCODING FIX (round 2): only advertise encodings we can DECODE — see
+        # the matching comment in _do_upstream (br/zstd without their modules
+        # made _stream_resp serve still-compressed bytes as identity).
+        _supported_ae_e = "gzip, deflate"
+        if _BROTLI_OK:
+            _supported_ae_e += ", br"
+        if _ZSTD_OK:
+            _supported_ae_e += ", zstd"
+        ctx.req_headers["Accept-Encoding"] = _supported_ae_e
 
         kw: dict = {
             "headers":         ctx.req_headers,
             "timeout":         (TIMEOUT_CONN, _read_timeout_e),
             "allow_redirects": True,
-            "verify":          False,
+            "verify":          VERIFY_TLS,
         }
         if method in _BODY_METHODS:
             kw["data"] = ctx.req_body
         kw["stream"] = _do_stream_ext
-        r    = _get_client_session().request(method, real_url, **kw)
+        r = _request_tls_fallback(_get_client_session(), method, real_url, s2l_ext_gate=True, **kw)
         # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
         # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
         # large binary files (.tar bundles, .wasm, video, etc), producing
@@ -12425,9 +13577,11 @@ def ext_asset(extpath: str) -> Response:
             _maybe_capture(ctx)
         return Response(ctx.resp_body, status=ctx.resp_status, headers=ctx.resp_headers, content_type=ctx.resp_ct)
     except _CONN_ERRORS as exc:
-        return Response(f"CDN unreachable: {_short_exc(exc)}", status=502)
+        return Response(f"CDN unreachable: {_short_exc(exc)}", status=502,
+                        content_type="text/plain; charset=utf-8")
     except Exception as exc:
-        return Response(f"CDN error: {_short_exc(exc)}", status=502)
+        return Response(f"CDN error: {_short_exc(exc)}", status=502,
+                        content_type="text/plain; charset=utf-8")
 
 # ── /__s2l_ws_ext__/<host:port>/<path>  —  WebSocket proxy to arbitrary external hosts ──
 # ── /__s2l_tcp__/<host:port>             —  raw TCP tunnel via WebSocket transport ──
@@ -12511,11 +13665,13 @@ def proxy(path: str) -> Response:
         _gui_push_raw("OPTIONS", req_path, 204, "text/plain", b"",
                       origin=MAIN_HOST)
         r = Response(status=204)
-        _req_origin = flask_request.headers.get("Origin", "")
+        # SECURITY FIX: use the central origin policy (own-origins only) —
+        # this handler used to reflect ANY Origin verbatim with credentials.
+        _aco, _acc = _cors_origin_pair()
         r.headers.update({
             "Allow":                        ", ".join(_ALL_METHODS),
-            "Access-Control-Allow-Origin":  _req_origin if _req_origin else "*",
-            "Access-Control-Allow-Credentials": "true" if _req_origin else None,
+            "Access-Control-Allow-Origin":  _aco,
+            "Access-Control-Allow-Credentials": _acc,
             "Access-Control-Allow-Methods": ", ".join(_ALL_METHODS),
             # Concrete list (never bare "*") so credentialed preflights pass.
             "Access-Control-Allow-Headers": _cors_allow_headers(),
@@ -12575,7 +13731,14 @@ def proxy(path: str) -> Response:
                     _cdn_url = f"https://{_cdn_host}{req_path_cdn}"
                     if req_qs:
                         _cdn_url += f"?{req_qs}"
-                    _cdn_lp = local_path(_cdn_url)
+                    # DEVICE-AWARE FIX: the fallback SAVES with the request's
+                    # device tag but looked up canonical-only — phones got 0%
+                    # offline fallback hits (and mobile-only-cached assets
+                    # 404'd). Variant first, canonical second.
+                    _cdn_lp = (local_path(_cdn_url, _dev_tag)
+                               if _dev_tag else None)
+                    if not _cdn_lp or not os.path.isfile(_cdn_lp):
+                        _cdn_lp = local_path(_cdn_url)
                     if os.path.isfile(_cdn_lp):
                         _cdn_r = _cached_response(_cdn_lp, _cdn_url, method, req_path)
                         if _cdn_r is not None:
@@ -12682,9 +13845,10 @@ def proxy(path: str) -> Response:
         if _cid is not None:
             with _CLIENT_LOCK:
                 _old_sess = _CLIENT_SESSIONS.get(_cid)
-            if _old_sess is not None:
-                try: _old_sess.close()
-                except Exception: pass
+            # RACE FIX (same as the other rotation sites): retire, don't close
+            # — the session is shared by all concurrent requests from this
+            # client; _retire_session closes it after a drain window.
+            _retire_session(_old_sess)
         upstream_r = None
         last_exc = exc
         # Primary: fresh curl_cffi session
@@ -12744,7 +13908,8 @@ def proxy(path: str) -> Response:
     except Exception as exc:
         log(f"{method} {urlparse(target).path} — {_short_exc(exc)}", "ERROR")
         stats.inc("conn_errors")
-        _r502 = Response(f"Upstream error: {_short_exc(exc)}", status=502)
+        _r502 = Response(f"Upstream error: {_short_exc(exc)}", status=502,
+                         content_type="text/plain; charset=utf-8")
         _apply_cors_headers(_r502.headers)
         _apply_security_headers(_r502.headers)
         return _r502
@@ -12776,7 +13941,12 @@ def proxy(path: str) -> Response:
     # Check the actual Content-Type now that we have the response headers.
     # If it should be streamed, do it NOW before consuming any body bytes.
     _real_ct = upstream_r.headers.get("Content-Type", "")
-    _real_cl = int(upstream_r.headers.get("Content-Length", "0") or 0)
+    # MALFORMED-CL FIX: non-numeric upstream Content-Length used to raise
+    # ValueError → unhandled → Flask 500.
+    try:
+        _real_cl = int(upstream_r.headers.get("Content-Length", "0") or 0)
+    except ValueError:
+        _real_cl = 0
     # SSE: detect text/event-stream and use the dedicated SSE streamer
     # which re-buffers to event boundaries and injects keepalives.
     if SSE_PROXY and _is_sse_response(_real_ct) and method in _SAFE_METHODS:
@@ -12842,7 +14012,13 @@ def proxy(path: str) -> Response:
             and not getattr(_proxy_local, "in_refetch", False)):
         _cl_check = upstream_r.headers.get("Content-Length", "")
         _ct_check = upstream_r.headers.get("Content-Type", "")
-        if (_cl_check and int(_cl_check or 0) > 0) or "text/html" in _ct_check:
+        # MALFORMED-CL FIX: guard the int() — a corrupt header raised
+        # ValueError → Flask 500 on this recovery path.
+        try:
+            _cl_ok = int(_cl_check or 0) > 0
+        except ValueError:
+            _cl_ok = False
+        if (_cl_check and _cl_ok) or "text/html" in _ct_check:
             log(f"Stream-mode empty body on {req_path} — re-fetching with stream=False", "WARN")
             try:
                 _proxy_local.in_refetch = True
@@ -12894,13 +14070,11 @@ def proxy(path: str) -> Response:
             with _CLIENT_LOCK:
                 _cid = _client_id()
                 _CLIENT_SESSIONS[_cid] = _fresh
-            # FIX: close the OLD session before it's orphaned. Without this,
-            # its connection pool (up to POOL_MAXSIZE=64 conns) and file
-            # descriptors leak — repeated WAF blocks accumulate leaked sessions.
-            try:
-                _old_client_sess.close()
-            except Exception:
-                pass
+            # FIX: retire the OLD session before it's orphaned — immediate
+            # close killed in-flight requests sharing it; the janitor closes
+            # it after a drain window. Without retiring at all, its pool (up
+            # to POOL_MAXSIZE=64 conns) and FDs leaked per WAF rotation.
+            _retire_session(_old_client_sess)
             upstream_r2 = _do_upstream(method, target, ctx)
             body2 = decompress_body(upstream_r2.content,
                                     upstream_r2.headers.get("Content-Encoding", ""))
@@ -12930,13 +14104,13 @@ def proxy(path: str) -> Response:
                 return cached
         log(f"304 without local cache — re-fetching {req_path}", "WARN")
         try:
-            forced_r = _get_proxy_session().get(
+            forced_r = _request_tls_fallback(_get_proxy_session(), "GET",
                 target,
                 headers={"Host": MAIN_HOST, "Cache-Control": "no-cache", "Pragma": "no-cache"},
                 cookies=flask_request.cookies,
                 timeout=(TIMEOUT_CONN, TIMEOUT_READ),
                 allow_redirects=True,
-                verify=False,
+                verify=VERIFY_TLS,
             )
             body       = decompress_body(forced_r.content, forced_r.headers.get("Content-Encoding", ""))
             upstream_r = forced_r
@@ -12965,7 +14139,13 @@ def proxy(path: str) -> Response:
     #   • Responses where Content-Length is explicitly 0
     _ct_now     = upstream_r.headers.get("Content-Type", "")
     _cl_raw     = upstream_r.headers.get("Content-Length", None)
-    _cl_header  = int(_cl_raw or 0)
+    # MALFORMED-CL FIX: a corrupt header raised ValueError → Flask 500. A
+    # malformed CL reads as unknown/0 — conservative: skips the re-fetch
+    # storms instead of triggering them.
+    try:
+        _cl_header = int(_cl_raw or 0)
+    except ValueError:
+        _cl_header = 0
     _cl_explicit_zero = (_cl_raw is not None and _cl_header == 0)
     _is_html_ct = "text/html" in _ct_now or not _ct_now.strip()
     _is_json_ct = "application/json" in _ct_now or "application/javascript" in _ct_now
@@ -12981,6 +14161,12 @@ def proxy(path: str) -> Response:
         and _cl_header > 0
         and 200 <= upstream_r.status_code < 300
         and upstream_r.status_code != 204
+        # REPLAY FIX: idempotent methods only — this case-A re-fetch re-sends
+        # the whole request (incl. body); a POST answered 2xx-with-empty-body
+        # was EXECUTED TWICE (duplicate side effects).
+        # HEAD FIX: HEAD responses NEVER carry a body — CL>0 with an empty
+        # body is normal for HEAD, so re-fetching was guaranteed waste.
+        and method == "GET"
     )
 
     # Case B: JSON API endpoint, empty body, chunked (no Content-Length), status 200
@@ -12991,7 +14177,7 @@ def proxy(path: str) -> Response:
     # explicitly require 200 (or 206 for partial content) AND Content-Type
     # starts with application/json.
     _empty_api = (
-        method in _SAFE_METHODS
+        method == "GET"   # HEAD FIX: HEAD bodies are always empty by spec
         and upstream_r.status_code in (200, 206)
         and len(body) == 0
         and not _cl_explicit_zero
@@ -13005,7 +14191,7 @@ def proxy(path: str) -> Response:
     # document that's almost always a bug (CF challenge, decompression failure,
     # curl_cffi stream issue) — re-fetch with identity encoding to recover.
     _empty_html = (
-        method in _SAFE_METHODS
+        method == "GET"   # HEAD FIX: HEAD bodies are always empty by spec
         and upstream_r.status_code == 200
         and len(body) == 0
         and _is_html_ct
@@ -13057,52 +14243,29 @@ def proxy(path: str) -> Response:
             cdn_url = f"https://{cdn_host}{req_path_cdn}"
             if req_qs:
                 cdn_url += f"?{req_qs}"
-            cdn_lp = local_path(cdn_url)
+            # FULL-PIPELINE + DEVICE-AWARE FIX: this disk hit used to serve
+            # RAW cached bytes — no rewrite/injector pipeline, so cached CDN
+            # HTML/CSS/JSON went out with absolute upstream URLs (broken
+            # links when offline) — and it looked up canonical-only while
+            # the save side tags devices (phones got 0% hits). Route through
+            # _cached_response like every other disk-hit seam: 304
+            # validators + MIME sniff + rewrites + injector.
+            _dev_tag_cdn = _device_variant(_effective_device())
+            cdn_lp = (local_path(cdn_url, _dev_tag_cdn)
+                      if _dev_tag_cdn else None)
+            if not cdn_lp or not os.path.isfile(cdn_lp):
+                cdn_lp = local_path(cdn_url)
             if os.path.isfile(cdn_lp):
-                try:
-                    # Read directly instead of send_file: send_file's mimetype
-                    # guessing can disagree with our sidecar-resolved type, and it
-                    # doesn't let us set CORP/Cache-Control in one place. A direct
-                    # read also avoids a TOCTOU crash if the file is deleted by the
-                    # save worker between the isfile() check above and the open.
-                    with open(cdn_lp, "rb") as _cdnf:
-                        cdn_data = _cdnf.read()
-                except OSError as e:
-                    log(f"CDN disk hit unreadable: {cdn_lp} — {_short_exc(e)}", "WARN")
-                else:
+                _cr = _cached_response(cdn_lp, cdn_url, method, req_path)
+                if _cr is not None:
                     log(f"{_CACHE_HIT_MARKER} CDN disk hit {_fmt_host(cdn_host)}{req_path_cdn}", "CDN")
-                    # For no-extension cache files (the 09/10 "asset/?id=N"
-                    # layout), guess_mime() can't tell a PNG from a JSON
-                    # from a WASM — sniff the leading bytes so the browser
-                    # gets the right Content-Type and the JS consumer can
-                    # pick a parser. A generic binary MIME type on an
-                    # extensionless response can make clients reject valid data.
-                    _cdn_ct = _resolve_mime_with_sniff(cdn_lp, cdn_data)
-                    _cdn_ct = _ensure_wasm_content_type(_cdn_ct, cdn_lp)
-                    _c304 = _conditional_304(cdn_lp, _cdn_ct)
-                    if _c304 is not None:
-                        stats.inc("cache_304")
-                        return _c304
-                    resp = Response(cdn_data, content_type=_cdn_ct)
-                    _apply_cors_headers(resp.headers)
-                    _apply_isolation_headers(resp.headers,
-                                             is_worker_script=_is_worker_request())
-                    _apply_security_headers(resp.headers)
-                    if _cdn_ct.startswith("text/html") or "json" in _cdn_ct:
-                        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                    else:
-                        resp.headers["Cache-Control"] = "no-cache"
-                        _val = _disk_validators(cdn_lp)
-                        if _val:
-                            resp.headers["ETag"] = _val[0]
-                            resp.headers["Last-Modified"] = _val[1]
-                    return resp
+                    return _cr
             try:
                 # Use TIMEOUT_STREAM_READ (120s) — CDN fallback may download large
                 # WASM/asset bundles that would timeout at TIMEOUT_READ=12s.
-                cdn_r    = _get_proxy_session().get(cdn_url,
+                cdn_r = _request_tls_fallback(_get_proxy_session(), "GET", cdn_url,
                                                      timeout=(TIMEOUT_CONN, TIMEOUT_STREAM_READ),
-                                                     verify=False)
+                                                     verify=VERIFY_TLS)
                 cdn_body = decompress_body(cdn_r.content, cdn_r.headers.get("Content-Encoding", ""))
                 ct       = _ensure_wasm_content_type(
                     cdn_r.headers.get("Content-Type", "application/octet-stream"),
@@ -13145,13 +14308,13 @@ def proxy(path: str) -> Response:
                 "Pragma":          "no-cache",
                 "Upgrade-Insecure-Requests": "1",
             }
-            refetch_r = refetch_sess.get(
+            refetch_r = _request_tls_fallback(refetch_sess, "GET",
                 target,
                 headers=refetch_hdrs,
                 cookies=flask_request.cookies,
                 timeout=(TIMEOUT_CONN, TIMEOUT_READ),
                 allow_redirects=True,
-                verify=False,
+                verify=VERIFY_TLS,
             )
             refetch_body = decompress_body(refetch_r.content, refetch_r.headers.get("Content-Encoding", ""))
             if not _is_wire_payload(refetch_body) and _is_valid_html(refetch_body):
@@ -13159,6 +14322,12 @@ def proxy(path: str) -> Response:
                 ctx.resp_body = body
                 ctx.resp_ct   = refetch_r.headers.get("Content-Type", "text/html")
                 ctx.resp_headers = filter_resp(_resp_headers_dict(refetch_r), body, is_top_level_html=True)
+                # FRESHNESS FIX: the swap above replaced headers that
+                # _apply_freshness had already normalized (it ran on the
+                # ORIGINAL RSC response) — upstream immutable/max-age could
+                # freeze the recovered page in the browser cache. Re-normalize
+                # on the new headers.
+                _apply_freshness(ctx.resp_headers, ctx.resp_ct)
                 log(f"RSC re-fetch succeeded: {urlparse(target).path}", "INFO")
             else:
                 log("RSC re-fetch also returned RSC payload — serving as-is", "WARN")
@@ -13232,7 +14401,7 @@ def proxy(path: str) -> Response:
         # but _crawl() will skip it immediately via the visited set.
         _norm_target = normalize_url(target)
         with visited_lock:
-            visited.add(_norm_target)
+            visited[_norm_target] = None   # ordered-dict visited set (FIFO eviction)
         enqueue(target)
         # Extract links from served HTML so the discovery workers pre-cache
         # sub-pages and assets — this is what makes the FIRST page load work
@@ -13300,9 +14469,27 @@ def proxy(path: str) -> Response:
                 ctx.resp_ct = _last_r.headers.get("Content-Type", "text/html")
                 ctx.resp_headers = filter_resp(_resp_headers_dict(_last_r), _last_body,
                                                 is_top_level_html=True)
+                # PIPELINE FIX (round 2): the recovered body MUST go through the
+                # same rewrite/injector/freshness pipeline the normal path uses.
+                # Serving it raw shipped absolute real-internet URLs (dead
+                # links, cookies leaking to real hosts) with no injector, and
+                # upstream immutable/max-age headers froze the broken copy.
+                _lr_ct = ctx.resp_ct or ""
+                if is_html(_last_body, _lr_ct):
+                    _lrb = _rewrite_ext_urls(_last_body, html_doc=True)
+                    _lrb = rewrite_abs_urls(_lrb)
+                    _lrb = _inject_sw_clear(_lrb)
+                    ctx.resp_body = _lrb
+                elif "text/css" in _lr_ct.lower():
+                    ctx.resp_body = _rewrite_ext_urls(_last_body, html_doc=False)
+                elif "json" in _lr_ct.lower():
+                    ctx.resp_body = _rewrite_json_urls(_last_body)
+                _apply_freshness(ctx.resp_headers, _lr_ct)
                 ctx.resp_headers.pop("content-length", None)
                 ctx.resp_headers.pop("Content-Length", None)
-                log(f"Last-resort re-fetch OK for {req_path}: {_fmt_size(len(_last_body))}", "INFO")
+                if ctx.resp_body:
+                    ctx.resp_headers["Content-Length"] = str(len(ctx.resp_body))
+                log(f"Last-resort re-fetch OK for {req_path}: {_fmt_size(len(ctx.resp_body))}", "INFO")
             else:
                 log(f"Last-resort re-fetch also returned empty body for {req_path}", "WARN")
         except Exception as e:
@@ -13616,30 +14803,43 @@ if __name__ == "__main__":
 
     if CRAWL and not OFFLINE:
         def _bg_crawl() -> None:
-            enqueue(SITE_URL)
-            crawl_parallel()
-            s = stats.snapshot()
-            with _cdn_port_lock:
-                cdn_map = dict(_cdn_host_port)
-            log(f"Crawl done — {s['crawled']} fetched · {s['saved']} cached · "
-                f"{s['cdn_fetched']} cdn · {s['captured']} captured · "
-                f"{s['ws_captured']} ws-captured · "
-                f"{s['revealed']} revealed · {s['conn_errors']} unreachable · "
-                f"{s['http_errors']} HTTP errors")
-            for host, port in cdn_map.items():
-                log(f"  CDN {host} → http://localhost:{port}", "CDN")
+            try:
+                enqueue(SITE_URL)
+                crawl_parallel()
+                s = stats.snapshot()
+                with _cdn_port_lock:
+                    cdn_map = dict(_cdn_host_port)
+                log(f"Crawl done — {s['crawled']} fetched · {s['saved']} cached · "
+                    f"{s['cdn_fetched']} cdn · {s['captured']} captured · "
+                    f"{s['ws_captured']} ws-captured · "
+                    f"{s['revealed']} revealed · {s['conn_errors']} unreachable · "
+                    f"{s['http_errors']} HTTP errors")
+                for host, port in cdn_map.items():
+                    log(f"  CDN {host} → http://localhost:{port}", "CDN")
+            finally:
+                # Crash-safety: whatever happens, mark the crawl phase done so
+                # enqueue()'s worker-aware gate can never leave an undrained
+                # queue growing behind a dead crawl.
+                _crawl_done.set()
         threading.Thread(target=_bg_crawl, daemon=True, name="crawl-main").start()
         log("Crawler started in background.")
     elif CRAWL and OFFLINE:
         log("CRAWL ignored in OFFLINE mode — no upstream available", "WARN")
+        _crawl_done.set()   # no crawl phase will ever complete it
+    if not CRAWL:
+        # Procedural mode (online OR OFFLINE — the 4th quadrant was missed):
+        # enqueue() must be a clean no-op, not an undrained-queue leak.
+        # (The CRAWL+OFFLINE case set it above.)
+        _crawl_done.set()
 
-    # Discovery workers: only start in bulk mode (CRAWL=True). In procedural
-    # mode (CRAWL=False), there is NO background crawling — the proxy serves
-    # pages on-demand from upstream, caching them as they're requested. This
-    # is the original "proxy-on-demand only" behavior.
-    if CRAWL and not OFFLINE and not _discovery_started.is_set():
-        _start_discovery_workers()
-        log(f"Discovery workers started ({_DISCOVERY_WORKERS} threads).", "INFO")
+    # Discovery workers: only in bulk mode (CRAWL=True), and only AFTER the
+    # initial crawl finishes — crawl_parallel() starts them. Starting them at
+    # BOOT let them steal the initial workers' None sentinels at crawl end
+    # (both worker kinds share the sentinel protocol), permanently shrinking
+    # the "persistent" pool. In procedural mode (CRAWL=False) there is NO
+    # background crawling — the proxy serves pages on-demand from upstream,
+    # caching them as they're requested (original "proxy-on-demand").
+    # (The non-crawl cases already set _crawl_done above.)
 
     # External asset prefetch pool — always start (used by proxy in any mode
     # except OFFLINE). Bounded pool prevents thread exhaustion.
@@ -13649,25 +14849,63 @@ if __name__ == "__main__":
     # Periodic prune of stale CDN health records (keeps _cdn_health bounded).
     _start_health_pruner()
 
+    # ORPHAN FIX: sweep tmp leftovers from crashes mid-write (see the atomic
+    # write in _save_worker).
+    _n_tmp = _sweep_tmp_cache_files()
+    if _n_tmp:
+        log(f"Startup sweep: removed {_n_tmp} orphaned .s2l_tmp file(s)", "INFO")
+
     log(f"Listening on http://{HOST}:{PORT}", "INFO")
     if PROXY_CDN and MULTIPORT:
         if WEB_CDNVIEWER:
             log(f"MULTIPORT web viewer → http://localhost:{PORT}/__s2l_viewer__ (50 ms live refresh)", "INFO")
 
-    if HOOK_GUI:
-        # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
-        # dispatches via the main thread; creating QApplication off-main
-        # is unreliable across Wayland/X11 compositors).
-        # Flask moves to a daemon thread so the main thread is free for the GUI.
-        def _flask_thread():
+    def _make_pooled_server():
+        # SERVER-BIND FIX: construct _PooledWSGIServer DIRECTLY. The old
+        # make_server(...)+__class__ swap bound the socket with the PARENT's
+        # server_bind during __init__ — our dual-stack IPv6 upgrade never
+        # ran (dead code), so http://localhost:PORT was unreachable on
+        # ::1-first systems. Fall back to the old swap if direct construction
+        # ever fails on an exotic werkzeug build.
+        try:
+            return _PooledWSGIServer(HOST, PORT, app,
+                                     handler=_S2LWSGIRequestHandler)
+        except Exception as _e:
+            log(f"Direct _PooledWSGIServer construction failed ({_short_exc(_e)}) "
+                "— falling back to make_server + class swap (IPv6 dual-stack bind disabled)", "WARN")
             srv = make_server(HOST, PORT, app, threaded=True,
                               request_handler=_S2LWSGIRequestHandler)
             srv.__class__ = _PooledWSGIServer   # swap to use pool
-            srv.serve_forever()
-        threading.Thread(target=_flask_thread, daemon=True, name="flask").start()
-        _launch_hook_gui()   # blocks main thread — GUI event loop runs here
+            return srv
+
+    if HOOK_GUI:
+        # PRE-CHECK FIX (round 2): probe PyQt6 availability BEFORE starting
+        # the Flask thread. The old fallback bound the SAME port twice (the
+        # daemon thread had already claimed it → OSError 98 → crash) when
+        # PyQt6 was missing — exactly the config the fallback exists for.
+        _pyqt_ok = True
+        try:
+            import PyQt6  # noqa: F401
+        except Exception:
+            _pyqt_ok = False
+        if not _pyqt_ok:
+            log("HOOK_GUI=True but PyQt6 is not installed — serving without the GUI "
+                "(pip install PyQt6 --break-system-packages to enable it)", "WARN")
+            _make_pooled_server().serve_forever()
+        else:
+            # On Linux/X11 PyQt6 MUST run on the main thread (Qt's event loop
+            # dispatches via the main thread; creating QApplication off-main
+            # is unreliable across Wayland/X11 compositors).
+            # Flask moves to a daemon thread so the main thread is free for the GUI.
+            def _flask_thread():
+                _make_pooled_server().serve_forever()
+            threading.Thread(target=_flask_thread, daemon=True, name="flask").start()
+            # STARTUP FIX: if the GUI never starts (PyQt6 missing), the old code
+            # returned from here, fell off the end of __main__, and the daemon
+            # Flask thread died with the process — banner printed, then instant
+            # exit under a supported configuration. Keep serving on the terminal.
+            if not _launch_hook_gui():   # blocks main thread — GUI event loop runs here
+                log("HOOK_GUI exited without running — serving without the GUI.", "WARN")
+                _make_pooled_server().serve_forever()
     else:
-        srv = make_server(HOST, PORT, app, threaded=True,
-                          request_handler=_S2LWSGIRequestHandler)
-        srv.__class__ = _PooledWSGIServer   # swap to use pool
-        srv.serve_forever()
+        _make_pooled_server().serve_forever()
