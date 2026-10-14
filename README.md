@@ -5,6 +5,8 @@ A **Vibe-coded** python project which makes a existent website running on localh
 
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
 
+> **SECOND WARNING: This is a testing branch for V8.0!, expect lots of bugs and experimental things!!**
+
 # Documentary
 It's accessible in [here!](https://github.com/RealThalesGit/Site2Local/blob/main/DOCUMENTARY.md)
 
