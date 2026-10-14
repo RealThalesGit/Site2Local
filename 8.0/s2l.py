@@ -299,14 +299,13 @@ RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
 CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
+PREMAP_CDN = False             # pre-start ports for CDN hosts already cached on disk
+S2L_EXT_PROTECTOR = True       # restrict /__s2l_ext__ to known hosts; private IPs stay blocked either way
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-EXT_ALLOW_EXTRA: list[str] = [] # extra hosts allowed through /__s2l_ext__/ — the route
-                                # otherwise only serves MAIN_HOST, hosts seen in mirrored
-                                # content, or registered CDNs (anti-SSRF allowlist)
 HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
@@ -339,7 +338,7 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # When False, the matching /__s2l_*__ routes return 404 and their cross-links
 # are hidden from the other page, so the proxy runs headless with zero web
 # surface. Flip either on to expose the corresponding self-contained viewer.
-WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
+WEB_CDNVIEWER    = False           # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
 WEB_CDNVIEWER_IP_WHITELIST = []      # empty = allow anyone; otherwise e.g. ["192.168.1.20", "2001:db8::10"]
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
@@ -6917,7 +6916,6 @@ _cdn_next_port  = PORT + 1
 #     host appeared in real page content),
 #   * hosts registered as CDNs (seen via a successful fetch or pre-registered
 #     from the disk cache),
-#   * anything the user explicitly allowlists in EXT_ALLOW_EXTRA below.
 _EXT_ALLOWED_HOSTS: set[str] = set()
 _ext_allowed_lock  = threading.Lock()
 
@@ -6940,8 +6938,6 @@ def _ext_host_allowed(host: str) -> bool:
     if not h:
         return False
     if h == _norm_ext_host(MAIN_HOST):
-        return True
-    if h in EXT_ALLOW_EXTRA or any(h == _norm_ext_host(e) for e in EXT_ALLOW_EXTRA):
         return True
     if h in _EXT_ALLOWED_HOSTS:
         return True
@@ -7076,7 +7072,7 @@ def _request_gated_redirects(sess, method: str, url: str, **kw):
         if _is_internal_target(_pu.netloc):
             log(f"Blocked redirect to INTERNAL target: {_pu.netloc} (from {urlparse(cur).netloc})", "WARN")
             return r
-        if _ext_gate:
+        if _ext_gate and S2L_EXT_PROTECTOR:
             _own = False
             try:
                 _own = _request_from_own_page(flask_request.headers, flask_request.host)
@@ -7529,8 +7525,9 @@ def _register_cdn_host(netloc: str) -> None:
     _start_cdn_server(netloc, port)
 
 def _preregister_cdn_hosts_from_disk() -> int:
-    """OFFLINE-mode safety: bring up MULTIPORT servers for every host we
-    already have cached assets for, so URL rewrites have a live destination.
+    """Bring up MULTIPORT servers for cached hosts before offline serving or
+    an explicitly requested crawler premap, so rewritten CDN URLs have live
+    destinations before the crawl starts.
 
     In OFFLINE mode, _register_cdn_host is only called from upstream-fetch
     success paths — which never run. Without this pre-registration, every
@@ -12255,6 +12252,8 @@ def _s2l_viewer_data_endpoint() -> Response:
             "PROXY_CDN":         PROXY_CDN,
             "CACHE_CDN":         CACHE_CDN,
             "OFFLINE":           OFFLINE,
+            "PREMAP_CDN":        PREMAP_CDN,
+            "S2L_EXT_PROTECTOR": S2L_EXT_PROTECTOR,
             "SSE_PROXY":         SSE_PROXY,
             "TCP_TUNNEL":        TCP_TUNNEL,
             "UDP_TUNNEL":        UDP_TUNNEL,
@@ -12804,7 +12803,7 @@ def _s2l_viewer_endpoint() -> Response:
 
   function renderFlags(flags){
     var el=$("flags"), order=["CAPTURE","CAPTURE_WS","HOOK_GUI","MULTIPORT","PROXY_CDN","CACHE_CDN",
-                              "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
+                              "OFFLINE","PREMAP_CDN","S2L_EXT_PROTECTOR","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
                               "WEB_CDNVIEWER"];
     var html=[];
     for(var i=0;i<order.length;i++){
@@ -13373,18 +13372,18 @@ def ext_asset(extpath: str) -> Response:
     # (pre-CORS-fix). Now:
     #   1. internal/private/loopback targets are ALWAYS refused;
     #   2. allowlisted hosts (MAIN_HOST, hosts emitted by the rewriter,
-    #      registered CDNs, EXT_ALLOW_EXTRA) are always allowed;
+    #      registered CDNs) are always allowed;
     #   3. any other PUBLIC host is allowed only when the request provably
     #      comes from a page this proxy served (mirrored SPA dynamic hosts).
     if _is_internal_target(ext_host):
         log(f"Blocked ext fetch to INTERNAL target: {ext_host}", "WARN")
         return Response("Blocked internal target", status=403)
-    if not _ext_host_allowed(ext_host):
+    if S2L_EXT_PROTECTOR and not _ext_host_allowed(ext_host):
         _own_page = _request_from_own_page(flask_request.headers, flask_request.host)
         if not _own_page:
             log(f"Blocked ext fetch to non-allowed host: {ext_host}", "WARN")
             return Response(
-                "Blocked host (not in ext allowlist; add to EXT_ALLOW_EXTRA if trusted)",
+                "Blocked host (not in ext allowlist)",
                 status=403)
 
     if method == "OPTIONS":
@@ -14546,6 +14545,8 @@ def _banner() -> None:
     flags = []
     if CRAWL:         flags.append(f"{G}crawl{R}")
     if OFFLINE:       flags.append(f"{Y}offline{R}")
+    if PREMAP_CDN:    flags.append(f"{C}premap-cdn{R}")
+    if S2L_EXT_PROTECTOR: flags.append(f"{G}s2l-ext-protector{R}")
     if DUMP_ALL:      flags.append(f"{M}dump-all{R}")
     if PROXY_CDN and CACHE_CDN:   flags.append(f"{M}cdn:cache{R}")
     elif PROXY_CDN:               flags.append(f"{Y}cdn:live{R}")
@@ -14786,20 +14787,22 @@ if __name__ == "__main__":
     elif SCAN_PATHS and OFFLINE:
         log("SCAN_PATHS ignored in OFFLINE mode — no upstream available", "WARN")
 
-    # OFFLINE: pre-register CDN hosts from disk so MULTIPORT servers start
-    # and URL rewrites point at live destinations instead of dead ports.
-    if OFFLINE and PROXY_CDN and MULTIPORT:
+    # Register cached CDN hosts before offline serving or crawler startup so
+    # MULTIPORT rewrites point at live destinations instead of dead ports.
+    if (OFFLINE or (PREMAP_CDN and CRAWL)) and PROXY_CDN and MULTIPORT:
         _n_pre = _preregister_cdn_hosts_from_disk()
         if _n_pre:
-            log(f"OFFLINE: pre-registered {_n_pre} CDN host(s) from disk cache", "INFO")
-        try:
-            _cached_count = sum(len(files) for _, _, files in os.walk(SRC_FOLDER))
-        except Exception:
-            _cached_count = 0
-        if _cached_count == 0:
-            log(f"OFFLINE mode enabled but {SRC_FOLDER} has 0 cached files — every request will 404.", "ERROR")
-        else:
-            log(f"OFFLINE mode serving {_cached_count} cached file(s) from {SRC_FOLDER}", "INFO")
+            _premap_mode = "OFFLINE" if OFFLINE else "PREMAP_CDN"
+            log(f"{_premap_mode}: pre-registered {_n_pre} CDN host(s) from disk cache", "INFO")
+        if OFFLINE:
+            try:
+                _cached_count = sum(len(files) for _, _, files in os.walk(SRC_FOLDER))
+            except Exception:
+                _cached_count = 0
+            if _cached_count == 0:
+                log(f"OFFLINE mode enabled but {SRC_FOLDER} has 0 cached files — every request will 404.", "ERROR")
+            else:
+                log(f"OFFLINE mode serving {_cached_count} cached file(s) from {SRC_FOLDER}", "INFO")
 
     if CRAWL and not OFFLINE:
         def _bg_crawl() -> None:
