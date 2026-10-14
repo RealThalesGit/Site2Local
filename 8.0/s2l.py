@@ -285,7 +285,7 @@ def log(msg: str, level: str = "INFO") -> None:
 SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
-DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
+DEVICE = "auto"                # UA profile: auto|desktop|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
 TIMEOUT_READ = 12              # upstream read timeout (s)
 TIMEOUT_CONN = 6               # upstream connect timeout (s)
 TIMEOUT_STREAM_READ = 120      # streaming read timeout (s) — longer for video/audio
@@ -300,15 +300,18 @@ BACKOFF = 0.4                  # exponential backoff base (s)
 CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 PREMAP_CDN = False             # pre-start ports for CDN hosts already cached on disk
-S2L_EXT_PROTECTOR = True       # restrict /__s2l_ext__ to known hosts; private IPs stay blocked either way
+S2L_EXT_PROTECTOR = True       # Controls which DESTINATIONS the proxy may fetch through /__s2l_ext__/<host>/...:
+                               # True  = allow known hosts and public hosts requested by a page served by S2L.
+                               # False = also allow any other public host; internal/private targets remain blocked.
+                               # This does not change HOST (the local address S2L listens on) or who can connect.
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
-PROXY_CDN = True                # proxy external CDN/third-party assets
-CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
-MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
-HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
-RAINBOW_LOGS = False            # lolcat-style terminal output
-SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
+PROXY_CDN = True               # proxy external CDN/third-party assets
+CACHE_CDN = True               # cache CDN assets to disk (False = live-proxy, no disk)
+MULTIPORT = True               # each CDN host gets a dedicated port (False = /__s2l_ext__/)
+HOOK_GUI = False               # PyQt6 traffic inspector + live hook editor (Fusion theme)
+RAINBOW_LOGS = False           # lolcat-style terminal output
+SHOW_HIDDEN = False            # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
                                 #   "all"        — every wordlist under wordlists/ (recursive)
                                 #   "all-in-dir" — every wordlist in wordlists/ top-level only
@@ -14789,7 +14792,7 @@ if __name__ == "__main__":
 
     # Register cached CDN hosts before offline serving or crawler startup so
     # MULTIPORT rewrites point at live destinations instead of dead ports.
-    if (OFFLINE or (PREMAP_CDN and CRAWL)) and PROXY_CDN and MULTIPORT:
+    if (OFFLINE or PREMAP_CDN) and PROXY_CDN and MULTIPORT:
         _n_pre = _preregister_cdn_hosts_from_disk()
         if _n_pre:
             _premap_mode = "OFFLINE" if OFFLINE else "PREMAP_CDN"
