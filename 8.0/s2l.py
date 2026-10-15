@@ -286,6 +286,7 @@ RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
 CRAWL = True                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
+PREMAP_CDN = False             # pre-start ports for CDN hosts already cached on disk
 SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
@@ -353,6 +354,11 @@ POOL_CONNECTIONS    = 32       # per-session connection pool slots
 DEAD_HOST_TTL       = 60       # seconds to remember a dead upstream host
 STATS_WINDOW        = 60       # seconds for rolling stats window
 GRACEFUL_SHUTDOWN   = True     # drain in-flight requests on SIGTERM
+MAX_BODY_BYTES       = 256 * 1024 * 1024  # request-body cap (Flask MAX_CONTENT_LENGTH) —
+                                        # OOM guard for the threaded server
+MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024  # BOMB GUARD: decompression output cap
+                                        # (a 10MB gzip declaring gigabytes must not
+                                        # OOM the process — see decompress_body)
 # Maximum raw (compressed) body size (bytes) we'll accumulate in RAM while
 # streaming a response so it can ALSO be cached to disk after the stream
 # finishes. Bodies larger than this are still streamed to the browser, but
@@ -3535,6 +3541,33 @@ def _decompress_body_impl(data: bytes, enc: str) -> bytes:
         if enc == "gzip":
             if not _looks_gzip(data):
                 return data   # curl_cffi already decoded — body is plain text
+            # MULTI-MEMBER FIX: concatenated gzip streams (legal per RFC 1952,
+            # produced by streaming servers) were silently TRUNCATED to the
+            # first member by the one-shot decompress — the tail of the asset
+            # vanished without any error. Walk members via unused_data.
+            # BOMB GUARD (round 2): bounded output — a small gzip expanding
+            # past MAX_DECOMPRESSED_BYTES aborts instead of OOM-ing the proxy.
+            try:
+                out = bytearray()
+                d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                rest = data
+                while rest:
+                    _feed = rest
+                    while _feed:
+                        out += d.decompress(_feed, 64 * 1024 * 1024)
+                        if len(out) > MAX_DECOMPRESSED_BYTES:
+                            raise MemoryError("gzip output exceeds decompression cap (bomb?)")
+                        _feed = d.unconsumed_tail
+                    rest = d.unused_data
+                    if rest:
+                        d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                if out:
+                    return bytes(out)
+            except zlib.error:
+                pass
+            except MemoryError as _bomb:
+                log(f"{_bomb} — serving raw bytes", "ERROR")
+                return data
             try:
                 return zlib.decompress(data, zlib.MAX_WBITS | 16)
             except zlib.error:
@@ -3686,17 +3719,6 @@ def _ensure_wasm_content_type(ct: str, path: str) -> str:
 
 def _ct_base(ct: str) -> str:
     return ct.split(";")[0].strip().lower()
-
-def resolve_mime(lp: str) -> str:
-    """Resolve a MIME type for a cached file path.
-
-    With the dynamic-detection refactor, sidecar .s2l-ctype files are no
-    longer written or read — the upstream Content-Type is captured on the
-    first fetch and is already encoded in the cached response headers.
-    This function now delegates entirely to guess_mime().
-    """
-    return guess_mime(lp)
-
 
 def _resolve_mime_with_sniff(lp: str, data: bytes | None = None) -> str:
     """Resolve a MIME type for a cached file, sniffing HTML for no-ext files.
@@ -6517,6 +6539,8 @@ def _real_origin_for(incoming: str | None) -> str:
 
 def _start_cdn_server(cdn_host: str, port: int) -> None:
     cdn_app = Flask(f"cdn_{cdn_host}", static_folder=None)
+    # OOM FIX: bound request bodies on the CDN mini-servers too.
+    cdn_app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
     @cdn_app.after_request
     def _cdn_security_headers(response: Response) -> Response:
@@ -10179,6 +10203,10 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
             log(f"Tunnel error: {exc}", "ERROR")
             self.close_connection = True
 app = Flask(__name__, static_folder=None)
+# OOM FIX: no MAX_CONTENT_LENGTH meant a multi-hundred-MB upload (or a few
+# concurrent ones — the server is a thread pool) was fully buffered in RAM
+# via get_data(). Bound it; raise the config for unusual legit upload sizes.
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
 @app.after_request
 def _main_security_headers(response: Response) -> Response:
@@ -11155,6 +11183,7 @@ def _s2l_viewer_data_endpoint() -> Response:
             "PROXY_CDN":         PROXY_CDN,
             "CACHE_CDN":         CACHE_CDN,
             "OFFLINE":           OFFLINE,
+            "PREMAP_CDN":        PREMAP_CDN,
             "SSE_PROXY":         SSE_PROXY,
             "TCP_TUNNEL":        TCP_TUNNEL,
             "UDP_TUNNEL":        UDP_TUNNEL,
@@ -11704,7 +11733,7 @@ def _s2l_viewer_endpoint() -> Response:
 
   function renderFlags(flags){
     var el=$("flags"), order=["CAPTURE","CAPTURE_WS","HOOK_GUI","MULTIPORT","PROXY_CDN","CACHE_CDN",
-                              "OFFLINE","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
+                              "OFFLINE","PREMAP_CDN","SSE_PROXY","TCP_TUNNEL","UDP_TUNNEL","WS_DEFLATE","WS_AUTO_RECONNECT",
                               "WEB_CDNVIEWER"];
     var html=[];
     for(var i=0;i<order.length;i++){
@@ -13359,6 +13388,7 @@ def _banner() -> None:
     flags = []
     if CRAWL:         flags.append(f"{G}crawl{R}")
     if OFFLINE:       flags.append(f"{Y}offline{R}")
+    if PREMAP_CDN:    flags.append(f"{C}premap-cdn{R}")
     if DUMP_ALL:      flags.append(f"{M}dump-all{R}")
     if PROXY_CDN and CACHE_CDN:   flags.append(f"{M}cdn:cache{R}")
     elif PROXY_CDN:               flags.append(f"{Y}cdn:live{R}")
@@ -13599,20 +13629,22 @@ if __name__ == "__main__":
     elif SCAN_PATHS and OFFLINE:
         log("SCAN_PATHS ignored in OFFLINE mode — no upstream available", "WARN")
 
-    # OFFLINE: pre-register CDN hosts from disk so MULTIPORT servers start
-    # and URL rewrites point at live destinations instead of dead ports.
-    if OFFLINE and PROXY_CDN and MULTIPORT:
+    # Register cached CDN hosts before offline serving or crawler startup so
+    # MULTIPORT rewrites point at live destinations instead of dead ports.
+    if (OFFLINE or PREMAP_CDN) and PROXY_CDN and MULTIPORT:
         _n_pre = _preregister_cdn_hosts_from_disk()
         if _n_pre:
-            log(f"OFFLINE: pre-registered {_n_pre} CDN host(s) from disk cache", "INFO")
-        try:
-            _cached_count = sum(len(files) for _, _, files in os.walk(SRC_FOLDER))
-        except Exception:
-            _cached_count = 0
-        if _cached_count == 0:
-            log(f"OFFLINE mode enabled but {SRC_FOLDER} has 0 cached files — every request will 404.", "ERROR")
-        else:
-            log(f"OFFLINE mode serving {_cached_count} cached file(s) from {SRC_FOLDER}", "INFO")
+            _premap_mode = "OFFLINE" if OFFLINE else "PREMAP_CDN"
+            log(f"{_premap_mode}: pre-registered {_n_pre} CDN host(s) from disk cache", "INFO")
+        if OFFLINE:
+            try:
+                _cached_count = sum(len(files) for _, _, files in os.walk(SRC_FOLDER))
+            except Exception:
+                _cached_count = 0
+            if _cached_count == 0:
+                log(f"OFFLINE mode enabled but {SRC_FOLDER} has 0 cached files — every request will 404.", "ERROR")
+            else:
+                log(f"OFFLINE mode serving {_cached_count} cached file(s) from {SRC_FOLDER}", "INFO")
 
     if CRAWL and not OFFLINE:
         def _bg_crawl() -> None:
