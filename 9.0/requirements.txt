@@ -1,0 +1,28 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Site2Local — dependencies
+#
+#  Install:  pip install -r requirements.txt
+#
+#  The proxy STARTS with just the core four. Every optional package below
+#  unlocks an extra feature and the code degrades gracefully without it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Core (required — the proxy does not start without these) ────────────────
+flask>=3.0               # WSGI app, routes, Response objects
+requests>=2.31           # upstream HTTP client (plain tier)
+beautifulsoup4>=4.12     # HTML parsing (crawler, link extraction, rewrites)
+colorama>=0.4            # cross-platform ANSI colors for the console log
+
+# ── Optional (uncomment what you need) ──────────────────────────────────────
+# Cloudflare / WAF bypass tiers (best → worst):
+# curl-cffi>=0.7           # real Chrome TLS fingerprint — best CF bypass (DEFAULT engine when installed)
+# ai-cloudscraper          # maintained cloudscraper fork — fallback tier
+# cloudscraper             # original (unmaintained since 2023) — last-resort fallback
+
+# Content handling:
+# brotli                   # native Brotli decompression (falls back to gzip/identity without it)
+# wafw00f                  # WAF fingerprinting shown in stats / viewer
+
+# Tools:
+# tqdm                     # in-place progress bar for SCAN_PATHS (falls back to periodic log lines)
+# PyQt6                    # HOOK_GUI=True — traffic inspector + live hook editor (Fusion theme)
