@@ -230,9 +230,14 @@ for node in ast.walk(ast.parse(rw_src)):
         warn_ok = (isinstance(level, ast.Constant)
                    and level.value == "WARN")
 err_left = []
+_REPO_ONLY = {"scripts", "archive"}  # repo-only extras: dev batteries, old releases
 for p in ROOT.rglob("*.py"):
+    rel = p.relative_to(ROOT)
     if p.name == "s2l.py":
         continue  # FROZEN parity monolith — fixes never land there
+    if rel.parts and rel.parts[0].lower() in _REPO_ONLY:
+        continue  # GitHub layout ships batteries inside the tree — the OD6
+                  # pattern literals would self-match; package code only here
     t = p.read_text(encoding="utf-8", errors="replace")
     if "WAFW00F is not installed" in t and '"ERROR"' in t:
         err_left.append(p.name)
