@@ -248,6 +248,39 @@ so the sweep can never delete anything servable.
   The dev batteries no longer string-replace the old default — each
   injects its test host with a regex over the SITE assignment itself, so
   a future default change can never silently turn the patch into a no-op.
+- **Fix 17** — root-relative URLs in externally-served documents (found by
+  the 2026-11-09 live Chromium+Firefox field check on the aya mirror): the
+  Discord.com widget iframe (fetched via /__s2l_ext__/discord.com/widget)
+  ships `<link href="/assets/…css">` / `<script src="/assets/…js">` and
+  its 626KB CSS ships `url(/assets/…woff2)` — all ROOT-relative. In the
+  mirror those resolve against the proxy origin and land on the MAIN site
+  route: aya answers its JSON 404 (`{"detail":"Not Found"}`, nosniff),
+  the browser logs a MIME mismatch and drops the resource → unstyled,
+  script-less widget. New `rewrite_doc_relative(body, doc_host, html_doc)`
+  (Rewriting/HTML/URLs.py) re-points root-relative resource URLs at the
+  DOCUMENT's own host via _proxy_target (dedicated MULTIPORT port when
+  registered, the catch-all __s2l_ext__ prefix otherwise); applied at all
+  six serve points — ext_asset fresh-HTML/fresh-CSS/cache-HIT and the
+  MULTIPORT mini-server's fresh-HTML/fresh-CSS/cache-HIT. The pass is
+  surgical: protocol-relative //host values stay with the absolute passes,
+  already-proxied values are skipped (_proxy_target's idempotency guard +
+  `(?!/)`), DONT_REWRITE hosts are exempt wholesale, and the disk cache
+  keeps storing RAW upstream bodies (rewriting is a view — never
+  persisted), so fresh and cached serves agree byte-for-byte.
+- **Fix 18** — plain-http absolute URLs routed through the proxy (found by
+  the same field check, round 2): with Fix 17 the Discord widget's JS
+  finally ran inside the mirror — and immediately XHRed
+  `http://discord.com/api/guilds/…/widget.json` (plain http, absolute,
+  hardcoded in the bundle). The main injector's rw() only routed https:
+  third-party URLs, so the http: request leaked DIRECT to the real host;
+  on the real site that call is same-origin (the widget iframe IS
+  discord.com), but in the mirror the iframe origin is the proxy → the
+  browser killed it on CORS (the Discord API sends no ACAO — it never
+  needed one). The branch now takes http: exactly like https: through the
+  EXT catch-all (which always fetches the upstream over https anyway).
+  One-line change in the shared __s2l_core, so fetch/XHR/WebSocket/Worker
+  patches and the Worker prelude all inherit it. Verified by running the
+  REAL core under Node.js (10-case rw() matrix + idempotence).
 - **9.0 cleanup (the "new generation" cut)** — migration machinery removed
   (`Legacy.py`, `Migration.py`, `_migration_checked` state, frozen 9.1a
   formula, 09/10 lossy sanitizer); unreachable legacy caches swept at
@@ -297,6 +330,19 @@ shipped inside the Site2Local tree):
   fake modules: fork shape / future rename / neither), WAFW00F WARN
   source contract (ast-based), zstd streamed end-to-end through
   _stream_resp.
+- `test_ext_doc_rewrite.py` — Fix 17 battery (10 checks): unit matrix for
+  rewrite_doc_relative (attrs/srcset/CSS, untouched families, idempotence,
+  DONT_REWRITE), the exact Discord-widget cache-HIT scenario (HTML + CSS
+  re-pointed to the doc's own host), cache-is-truth (disk stays RAW),
+  fresh-path parity through a fake upstream (save still enqueues RAW),
+  JSON absolute-rewrite regression, and a source contract over all six
+  call sites.
+- `test_http_xhr.py` — Fix 18 battery (5 checks): source contract on the
+  widened condition, the real __s2l_core extracted from the built injector
+  and executed under Node.js (10-case rw() matrix: http/https third-party,
+  MAIN_HOST, localhost, relative, protocol-relative, DONT_REWRITE,
+  dedicated port, ws:// — plus idempotence on every case), XHR/fetch patch
+  contract, and an EXT HTML cache-HIT serving the widened injector.
 - `test_race_fixes.py` — Fix 9 battery (9 checks): same-batch sidecar
   collision, atomic-write torn reads, CDN-registry churn, SSE reader
   leak, visited eviction order, crawl sentinel lifecycle, malformed-item
