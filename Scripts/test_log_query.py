@@ -20,6 +20,7 @@ live upstream, which an OFFLINE battery cannot drive).
 import contextlib
 import io
 import os
+import re
 import shutil
 import sys
 
@@ -40,7 +41,7 @@ def build_test_env():
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     cfg = os.path.join(WORK, "Site2Local", "Config.py")
     txt = open(cfg, encoding="utf-8").read()
-    txt = txt.replace('SITE = "jeskojets.com"', 'SITE = "aya.nodium.lol"')
+    txt = re.sub(r'SITE\s*=\s*"[^"]*"', 'SITE = "aya.nodium.lol"', txt)
     txt = txt.replace("OFFLINE = False", "OFFLINE = True")
     txt = txt.replace("CRAWL = True", "CRAWL = False")
     open(cfg, "w", encoding="utf-8").write(txt)
