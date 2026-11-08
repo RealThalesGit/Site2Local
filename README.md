@@ -5,7 +5,7 @@ A **Vibe-coded** python project which makes a existent website running on localh
 
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
 
-> **This the modularized version of site2local, currently in prototype/tests.**
+> **The current version is 9.0, which is the new generation of site2local, the single-file layout has been modularized.**
 
 ## 9.0 — the "new generation" line
 - **The legacy migration bridges are GONE**: caches written by older
