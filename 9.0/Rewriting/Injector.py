@@ -1,24 +1,35 @@
-"""The __s2l__ browser-side JS — one verbatim template string.
-
-Extracted from the old Rewriting/Injector.py (match: the `js = ( ... )`
-concatenation inside `_build_s2l_injector` in the s2l.py monolith, lines
-~1002-1555). Only the function header changed: the two locals the template
-reads (`hp`, `_dr_regex_js`) became parameters — every string literal,
-comment and json.dumps call below is byte-identical to the monolith.
-
-Deliberate post-match deltas (documented in MODULAR_MAP.md, "Correções
-pós-match"): 3b — CSSStyleDeclaration.setProperty patch (bloco CSS);
-4 — the live HP poll MIRRORS the server map (add + update + remove)
-instead of only adding missing hosts.
-"""
+"""Browser-side S2L runtime injector."""
 from __future__ import annotations
 
 import json
+import re
 
-from ... import Runtime as _s2l_state
+from .. import Runtime as _s2l_state
 
 
-def _injector_js(hp: dict, _dr_regex_js: str) -> str:
+def _build_s2l_injector() -> bytes:
+    with _s2l_state._cdn_port_lock:
+        hp = dict(_s2l_state._cdn_host_port)
+    # DONT_REWRITE — host patterns whose URLs must go DIRECT (never rewritten
+    # to localhost). Compiled into one regex for the JS side so rw() can
+    # short-circuit cheaply. Captcha backends (hcaptcha.com, recaptcha.net,
+    # ...) reject requests whose Origin is "localhost", so their assets and
+    # scripts must NOT be tunneled through S2L.
+    _dr_patterns = []
+    for _entry in _s2l_state.DONT_REWRITE:
+        _e = _entry.strip().lower()
+        if not _e:
+            continue
+        if "/" in _e:
+            _h, _p = _e.split("/", 1)
+            _dr_patterns.append(
+                r'^(?:[^/]*\.)?' + re.escape(_h) + r'/' + re.escape(_p)
+            )
+        else:
+            _dr_patterns.append(
+                r'^(?:[^/]*\.)?' + re.escape(_e) + r'(?:[:/]|$)'
+            )
+    _dr_regex_js = json.dumps("|".join(_dr_patterns) if _dr_patterns else "")
     js = (
         '<script id="__s2l__">'
         '(function(){'
@@ -469,18 +480,6 @@ def _injector_js(hp: dict, _dr_regex_js: str) -> str:
               'get:_ctD.get,set:function(v){return _ctD.set.call(this,_cssRw(v));}'
             '});'
           '}'
-          # setProperty() carries url() values inside CSS custom properties —
-          # React style props like {"--icon-src": "url(https://cdn/x.svg)"}
-          # (Poki's icon system does exactly this) go through setProperty,
-          # which the two setters above never see. Without this patch those
-          # URLs load directly from the real CDN, bypassing the proxy.
-          'var _spD=CSSStyleDeclaration.prototype.setProperty;'
-          'if(_spD){'
-            'CSSStyleDeclaration.prototype.setProperty=function(p,v,pri){'
-              'if(typeof v==="string"&&v.indexOf("url(")>-1)v=_cssRw(v);'
-              'return _spD.call(this,p,v,pri);'
-            '};'
-          '}'
         '}catch(e){}'
         # ── DOM attribute scanner + MutationObserver ──────────────────────────
         # try/catch: document.documentElement can be null in sandboxed/srcdoc
@@ -570,26 +569,20 @@ def _injector_js(hp: dict, _dr_regex_js: str) -> str:
           '}'
         '}catch(e){}'
         # ── Live HP refresh — picks up CDN hosts registered after page load ───
-        # Polls PX+/__s2l_hp every 2s (then 10s after 30 ticks) and MIRRORS
-        # the server map into HP: adds missing hosts, updates ports that
-        # changed (a CDN mini-server that died and re-registered gets a NEW
-        # port — the old add-only poll kept the dead port forever), and drops
-        # hosts whose entry vanished (server died → its URLs fall back to the
-        # /__s2l_ext__/ route on the main port, which is also what
-        # re-registers the host with a fresh port on the next poll).
+        # Polls PX+/__s2l_hp every 2s (then 10s after 30 ticks) so CDN hosts
+        # registered AFTER the initial page serve are picked up without a reload.
         '(function(){'
           'var _ht=0;'
           'function _hp_poll(){'
             '_ht++;'
             'fetch(PX+"/.__s2l_hp",{cache:"no-store"})'
               '.then(function(r){return r.json();})'
-              '.then(function(d){for(var h in HP)if(!(h in d))delete HP[h];for(var h in d)HP[h]=d[h];})'
+              '.then(function(d){for(var h in d)if(!HP[h]){HP[h]=d[h];}})'
               '.catch(function(){});'
             'setTimeout(_hp_poll,_ht<30?2000:10000);'
           '}'
           'setTimeout(_hp_poll,1500);'
         '})();'
         '})();</script>'
-    
     )
-    return js
+    return js.encode("utf-8")

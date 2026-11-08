@@ -22,24 +22,116 @@ def _safe_seg(name: str) -> str:
     return f"{base[:32]}_{h}{ext}"
 
 
-def _sanitize_query_for_filename(qs: str) -> str:
-    """LEGACY (09/10) query → filename mapping. LOSSY — do not use for new files.
+#: Characters a beautified query segment keeps. Everything else (spaces,
+#: ``:``/``;``/``/``/``?``/``#``, quotes, non-ASCII …) becomes ``_``.
+_BEAUTY_SAFE_RE = re.compile(r"[^A-Za-z0-9@+.,~=\-]")
+_BEAUTY_SEG_MAX = 64          # per-segment cap before hashing
+_BEAUTY_TOTAL_MAX = 160       # whole-name cap before hashing (base joins later)
 
-    Kept only so ``_legacy_cache_paths()`` can locate caches written by the
-    09/10 layout (``b_=<query>.js`` / ``v1/asset/id=N`` straight in the host
-    folder) and migrate them into ``__query__/``. Everything outside
-    ``[\\w.\\-=]`` collapses to ``_`` here, so different queries could share
-    one name (``a=1&b=2`` and ``a=1_b=2``). New files use
-    ``_encode_query_for_filename()`` instead.
+
+def _beauty_seg(s: str) -> str:
+    """Sanitize one key/value fragment for the beautified name."""
+    seg = _BEAUTY_SAFE_RE.sub("_", s).strip("_")
+    if not seg:
+        return ""
+    if len(seg) > _BEAUTY_SEG_MAX:
+        seg = seg[:_BEAUTY_SEG_MAX - 7] + "_" + hashlib.sha1(
+            s.encode("utf-8", "surrogatepass")).hexdigest()[:6]
+    return seg
+
+
+def _beautify_query_name(qs: str) -> str:
+    """Human-readable name for a query string (the "remove the junk" pass).
+
+    Sketch (user-approved, CORRECTED in 9.2):
+
+      1 param   → ``[K]_[V]``                  ``?v=26b3…``   → ``v_26b3…``
+      2+ params → ``[K1]_[V1]_N_[K2]_[V2]``    (``N`` stands for "&")
+
+    so the final file name reads ``Aya.App_v_26b389885145fb927a677cca.js``
+    instead of the pre-9.1 ``Aya.App_=v=26b389885145fb927a677cca.js``, and
+    ``css2?family=Montserrat:wght@400&display=swap`` becomes
+    ``css2_family_Montserrat_wght@400_N_display_swap``. (9.1 as shipped
+    beautified a 1-param query to the VALUE alone — ``Aya.App_26b38….js``;
+    the user's correction makes the parameter NAME always join the value,
+    uniform across the 1-param and 2+-param cases — and strictly fewer
+    collisions, since ``?v=1`` and ``?x=1`` no longer share ``base_1``.)
+
+    Values are percent-DECODED first (readability), which makes the mapping
+    lossy — ``?a=1&b=2`` vs ``?a=1_b=2`` share a name. That is fine because
+    ``local_path()`` guards collisions with the ``<file>.q`` sidecar (the
+    owner's raw query) and falls back to the collision-free legacy layout
+    for the losing URL. Flags (``?debug``) and empty values (``?k=``) use
+    the key itself so the name is never empty; a value without a key
+    (``?=x``) uses the value alone.
     """
-    safe = re.sub(r"[^\w.\-=]", "_", qs)
-    if len(safe) > _s2l_state.MAX_FNAME - 24:
-        safe = safe[:80] + "_" + hashlib.sha1(qs.encode()).hexdigest()[:12]
-    return safe
+    from urllib.parse import parse_qsl
+    try:
+        pairs = parse_qsl(qs, keep_blank_values=True, errors="replace")
+    except Exception:
+        pairs = []
+    if not pairs:
+        # Completely unparseable query (e.g. binary garbage) — keep the old
+        # reversible encoding so nothing is lost.
+        return _encode_query_for_filename(qs, bare=True).lstrip("=")
+
+    if len(pairs) == 1:
+        k, v = pairs[0]
+        sk, sv = _beauty_seg(k), _beauty_seg(v)
+        # Corrected sketch (9.2): the parameter NAME always joins the value.
+        if sk and sv:
+            return f"{sk}_{sv}"
+        # Flag (?debug) or empty value (?k=) → the key alone; a value with
+        # no key (?=x) → the value alone; never empty.
+        return sk or sv or "_"
+
+    parts: list[str] = []
+    for k, v in pairs:
+        sk = _beauty_seg(k)
+        sv = _beauty_seg(v)
+        parts.append(f"{sk}_{sv}".rstrip("_") if sv else (sk or "_"))
+    name = "_N_".join(parts)
+
+    if len(name) > _BEAUTY_TOTAL_MAX:
+        head = re.sub(r"_h?[0-9a-f]{0,6}$", "", name[:120]).rstrip("_")
+        name = head + "_h" + hashlib.sha1(
+            qs.encode("utf-8", "surrogatepass")).hexdigest()[:6]
+    return name or "_"
+
+
+def _cap_query_fname(name: str) -> str:
+    """Post-join filesystem cap for a ``__query__`` filename (9.2).
+
+    Each part is capped on its own (``_safe_seg``: 180; the beautified
+    query: 160; ``_encode_query_for_filename``: MAX_FNAME-24), but the
+    JOINED name can still cross ``_FS_NAME_MAX``: a no-extension pretty
+    name is ``last_seg(≤180) + '_' + beauty(≤160)`` = up to 341 chars,
+    and the extension collision fallback is ``capped_base + '_=' +
+    encoding(≤156)``. An overlong name fails the cache write with
+    ENAMETOOLONG — the asset then re-fetches on every request and never
+    caches offline.
+
+    When the join overflows, keep a 32-char head plus a sha1 tag of the
+    FULL intended name: deterministic for the same URL, distinct for
+    different URLs, and still guarded by the ``.q`` sidecar like any
+    other beautified name. Names within the limit pass through
+    unchanged (bit-identical to 9.1), so this cap never moves a file
+    that 9.1 managed to write.
+    """
+    if len(name) <= _s2l_state._FS_NAME_MAX:
+        return name
+    head, ext = os.path.splitext(name)
+    return (f"{head[:32]}_"
+            f"{hashlib.sha1(name.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}{ext}")
 
 
 def _encode_query_for_filename(qs: str, bare: bool) -> str:
     """Raw query string → filesystem-safe name, readable and collision-free.
+
+    This is the LEGACY (pre-9.1) __query__ layout, still used as the
+    COLLISION FALLBACK: when two different queries beautify to the same
+    pretty name, the sidecar ``<file>.q`` detects it and the losing URL
+    keeps this reversible encoding instead.
 
     The query is stored as the server saw it (no decoding, no re-ordering):
 

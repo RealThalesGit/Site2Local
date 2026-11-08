@@ -18,7 +18,7 @@ import zlib
 from ... import Runtime as _s2l_state
 
 
-def _disk_validators(lp: str, ct: str | None = None) -> tuple[str, str] | None:
+def _disk_validators(lp: str, ct: str = "") -> tuple[str, str] | None:
     """(ETag, Last-Modified) derived from the file's CURRENT on-disk state.
 
     mtime_ns + size — a hand edit (user "mods") or a re-save always moves at
@@ -27,24 +27,19 @@ def _disk_validators(lp: str, ct: str | None = None) -> tuple[str, str] | None:
     every reload, and stat() is ~free while hashing every WASM/video on each
     request is not.
 
-    When ``ct`` is given it is folded into the ETag (crc32 of the base MIME
-    type). Browsers keep the STORED response's Content-Type across matching
-    304s — so a server-side Content-Type derivation change (correção 5:
-    globe.gl served as video/gl → text/javascript) would never reach a client
-    that already cached the poisoned entry: the ETag still matched, the 304
-    confirmed it, and Chrome kept refusing to execute the script. Folding the
-    CT in makes any future MIME-derivation change invalidate the validator —
-    one fresh 200 per asset per client and the healed type sticks.
+    `ct` folds a crc32 of the Content-Type BASE into the ETag when the
+    caller knows the type it is about to serve. This is the MIME auto-heal:
+    when the content-based resolver learns to type a file it used to call
+    octet-stream (or a Fix changes its answer), the ETag changes with it, so
+    every browser holding the old validators gets a fresh 200 with the new
+    Content-Type instead of a 304 that would have pinned the old type for
+    the life of the entry.
     """
     try:
         st = os.stat(lp)
     except OSError:
         return None
-    etag = f'"s2l:{st.st_size}:{st.st_mtime_ns}'
-    if ct:
-        _ct_base = ct.split(";", 1)[0].strip().lower()
-        etag += f":{zlib.crc32(_ct_base.encode('utf-8', 'ignore')) & 0xFFFFFFFF:08x}"
-    etag += '"'
+    etag = f'"s2l:{zlib.crc32(_s2l_state._ct_base(ct or "").encode()) & 0xFFFFFFFF:x}:{st.st_size}:{st.st_mtime_ns}"'
     return etag, email.utils.formatdate(st.st_mtime, usegmt=True)
 
 

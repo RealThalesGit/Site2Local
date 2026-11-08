@@ -90,7 +90,7 @@ def _finalize_security_headers(response: Response) -> Response:
     # main and CDN Flask apps, so set CORP here as a final universal safeguard,
     # including errors and routes that don't pass through filter_resp().
     _s2l_state._apply_corp_header(response.headers)
-    _is_html = response.mimetype == "text/html"
+    _is_html = _s2l_state._is_document_ct(response.mimetype)
     _body = b""
     if _is_html and not response.is_streamed:
         _body = response.get_data()

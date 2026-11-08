@@ -80,19 +80,12 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     # For no-extension cache files (the 09/10 "asset/?id=N" layout), the
     # path itself gives no MIME hint — sniff the leading bytes so a Range
     # request on a cached PNG/MP3/WASM asset gets the right Content-Type
-    # and the browser can stream it correctly. We pass _slice only as a
-    # hint when start==0 (the sniff needs the file's leading bytes); for
-    # mid-file ranges we fall back to a fresh read of just the head, which
-    # is cheap relative to the range payload.
-    if start == 0:
-        ct = _s2l_state._resolve_mime_with_sniff(lp, _slice)
-    else:
-        ct = _s2l_state._resolve_mime_with_sniff(lp)
+    # and the browser can stream it correctly. ALWAYS sniff the file's real
+    # head (a fresh 2 KB read) instead of the requested slice: the 200 and
+    # the 206 of the same file must carry the SAME Content-Type, and a
+    # short mid-file slice would starve the sniffer of evidence.
+    ct = _s2l_state._resolve_mime_with_sniff(lp)
     ct = _s2l_state._ensure_wasm_content_type(ct, lp)
-    # Correção 5 — keep partial-content serves MIME-consistent with the full
-    # 200s: a JS file behind an exotic extension must be text/javascript on
-    # the 206 too, or nosniff browsers refuse the slice they just requested.
-    ct = _s2l_state._js_mime_rescue(ct, lp, _slice if start == 0 else None)
     resp = Response(_slice, status=206, content_type=ct)
     resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     resp.headers["Accept-Ranges"] = "bytes"
@@ -101,7 +94,7 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     _s2l_state._apply_isolation_headers(resp.headers,
                              is_worker_script=_s2l_state._is_worker_request())
     _s2l_state._apply_security_headers(resp.headers)
-    _s2l_state.log(f"{method} HIT {_s2l_state._fmt_host(urlparse(target).netloc)}{req_path} 206 [{_s2l_state._fmt_size(len(_slice))}]", "←")
+    _s2l_state.log(f"{method} HIT {_s2l_state._fmt_host(urlparse(target).netloc)}{_s2l_state._fmt_path_qs(req_path)} 206 [{_s2l_state._fmt_size(len(_slice))}]", "←")
     _s2l_state._gui_push_raw(method, req_path, 206, ct, _slice,
                   origin=_s2l_state.MAIN_HOST,
                   _skip_log=True)   # caller already logged

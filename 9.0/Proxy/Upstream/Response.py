@@ -42,7 +42,7 @@ def _make_flask_resp(ctx: _s2l_state.HookContext, method: str) -> Response:
                     headers=clean_headers, content_type=ctx.resp_ct)
     # Keep CORS and CORP headers consistent across all response paths.
     _s2l_state._apply_cors_headers(resp.headers)
-    _is_html_resp = "text/html" in (ctx.resp_ct or "").lower()
+    _is_html_resp = _s2l_state._is_document_ct(ctx.resp_ct)
     # Apply isolation headers to document and Worker responses.
     _s2l_state._apply_isolation_headers(resp.headers, body, is_top_level_html=_is_html_resp,
                              is_worker_script=_s2l_state._is_worker_request())

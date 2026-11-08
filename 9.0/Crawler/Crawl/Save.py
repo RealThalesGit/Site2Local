@@ -45,6 +45,7 @@ def _save_worker() -> None:
                     _s2l_state.log(f"Bot page detected — NOT caching {urlparse(u).netloc}{urlparse(u).path}", "WARN")
                     continue
                 _dev_tag = _s2l_state._device_variant(rest[0]) if rest and rest[0] else ""
+                _qs = urlparse(u).query or ""
                 p = _s2l_state.local_path(u, _dev_tag)
                 h = hashlib.sha1(data).hexdigest()
                 _link_src: str | None = None
@@ -95,14 +96,14 @@ def _save_worker() -> None:
                     if len(_s2l_state.saved_paths) > _s2l_state._SAVED_PATHS_MAX:
                         _s2l_state.saved_paths.clear()
                         _s2l_state.saved_paths.add(original_p)
-                batch.append((original_p, p, data, _link_src))
+                batch.append((original_p, p, data, _link_src, _qs))
             except Exception as e:
                 _s2l_state.log(f"Save-worker item error: {u} — {e}", "ERROR")
             finally:
                 _s2l_state.save_queue.task_done()
         now = time.time()
         if batch and (len(batch) >= _s2l_state.SAVE_BATCH or now - last_flush >= _s2l_state.SAVE_INTERVAL):
-            for original_p, p, data, link_src in batch:
+            for original_p, p, data, link_src, qs in batch:
                 try:
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     if os.path.isdir(p):
@@ -115,6 +116,8 @@ def _save_worker() -> None:
                         try:
                             if os.path.isfile(link_src):
                                 os.link(link_src, p)
+                                if qs:
+                                    _s2l_state._write_query_sidecar(p, qs)
                                 if p != original_p:
                                     with _s2l_state.save_lock:
                                         _s2l_state.saved_paths.discard(original_p)
@@ -125,6 +128,11 @@ def _save_worker() -> None:
                             pass   # fall through to a plain byte write
                     with open(p, "wb") as f:
                         f.write(data)
+                    # Query files record their owning RAW query in the .q
+                    # sidecar — this is what makes the beautified names
+                    # collision-safe (see local_path).
+                    if qs:
+                        _s2l_state._write_query_sidecar(p, qs)
                     # Write succeeded — record the FINAL write path in saved_paths
                     # (may differ from original_p due to directory-collision remap).
                     if p != original_p:

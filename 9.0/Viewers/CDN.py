@@ -1,11 +1,23 @@
-"""Site2Local: CDN viewer HTML page (self-contained, 50 ms live refresh).
+"""Self-contained live CDN viewer page."""
+from __future__ import annotations
 
-The template below is kept byte-identical to the monolith's inline string
-(s2l.py, inside _s2l_viewer_endpoint) so the served page matches exactly —
-match-based modularization: no byte of HTML/CSS/JS was touched.
-"""
+from flask import Response
+from flask import request as flask_request
 
-_CDN_VIEWER_PAGE = r"""<!DOCTYPE html>
+from .. import Runtime as _s2l_state
+
+
+def _s2l_viewer_endpoint() -> Response:
+    """Self-contained live CDN viewer page (refreshes every 50 ms)."""
+    if not _s2l_state.WEB_CDNVIEWER:
+        return _s2l_state._viewer_disabled_response()
+    if not _s2l_state._viewer_ip_allowed():
+        return _s2l_state._viewer_ip_denied_response()
+    if flask_request.method == "OPTIONS":
+        r = Response(status=204)
+        r.headers.update(_s2l_state._viewer_cors_headers(flask_request.headers.get("Origin", "")))
+        return r
+    page = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1064,3 +1076,7 @@ _CDN_VIEWER_PAGE = r"""<!DOCTYPE html>
 </script>
 </body>
 </html>"""
+    resp = Response(page, content_type="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.update(_s2l_state._viewer_cors_headers(flask_request.headers.get("Origin", "")))
+    return resp

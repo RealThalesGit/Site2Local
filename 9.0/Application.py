@@ -28,13 +28,9 @@ def create_app(app: Flask | None = None) -> Flask:
                      methods=['GET', 'OPTIONS'])
     app.add_url_rule(f'{state._EXT_PREFIX}/<path:extpath>', view_func=state.ext_asset,
                      methods=state._ALL_METHODS)
-    # Rule var names mirror the monolith verbatim (wspath/tcppath/udppath,
-    # while the views sign _wspath/_tcppath/_udppath — see MODULAR_MAP §6:
-    # replicated quirk; opening these URLs in a plain browser tab 500s in
-    # the monolith and must 500 here too during the match phase).
-    app.add_url_rule('/__s2l_ws_ext__/<path:wspath>', view_func=state.ws_ext, methods=['GET'])
-    app.add_url_rule('/__s2l_tcp__/<path:tcppath>', view_func=state.tcp_ext, methods=['GET'])
-    app.add_url_rule('/__s2l_udp__/<path:udppath>', view_func=state.udp_ext, methods=['GET'])
+    app.add_url_rule('/__s2l_ws_ext__/<path:_wspath>', view_func=state.ws_ext, methods=['GET'])
+    app.add_url_rule('/__s2l_tcp__/<path:_tcppath>', view_func=state.tcp_ext, methods=['GET'])
+    app.add_url_rule('/__s2l_udp__/<path:_udppath>', view_func=state.udp_ext, methods=['GET'])
     app.add_url_rule('/<path:path>', view_func=state.proxy, methods=state._ALL_METHODS)
     app.add_url_rule('/', defaults={'path': ''}, view_func=state.proxy,
                      methods=state._ALL_METHODS)

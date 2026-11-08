@@ -33,7 +33,8 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
     ct    = _s2l_state._ensure_wasm_content_type(ct, urlparse(target).path or "")
     sc    = upstream_r.status_code
     enc   = (upstream_r.headers.get("Content-Encoding", "") or "").lower().strip()
-    out_h = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(upstream_r))
+    out_h = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(upstream_r),
+                                    is_worker_script=_s2l_state._is_worker_request())
     # CORS + CORP are already set correctly by filter_resp() — do NOT re-set
     # them with a bare Access-Control-Expose-Headers: "*" here, that would
     # overwrite the concrete list filter_resp set for credentialed requests.
@@ -159,7 +160,8 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                 _not_cached_note = " — too large, not cached"
             elif not completed:
                 _not_cached_note = " — incomplete, not cached"
-            _s2l_state.log(f"[STREAM] {method} {sc} {_s2l_state._fmt_host(urlparse(target).netloc)}{urlparse(target).path}"
+            _tgt = urlparse(target)
+            _s2l_state.log(f"[STREAM] {method} {sc} {_s2l_state._fmt_host(_tgt.netloc)}{_s2l_state._fmt_path_qs(_tgt.path, _tgt.query)}"
                 f" [{_s2l_state._fmt_size(total)}]{_not_cached_note}", "→")
             # Push to the GUI traffic log. For 206/204 and other non-2xx the
             # preview may be empty — that's fine, _gui_push_raw handles it.

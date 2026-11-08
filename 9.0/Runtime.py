@@ -186,7 +186,6 @@ _lolcat_probe_lock            = threading.Lock()
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 from .Config import (
-    VERSION,
     SITE,
     HOST,
     PORT,
@@ -209,6 +208,7 @@ from .Config import (
     DUMP_ALL,
     PROXY_CDN,
     CACHE_CDN,
+    VERSION,
     MULTIPORT,
     HOOK_GUI,
     RAINBOW_LOGS,
@@ -663,18 +663,6 @@ _QS_PCT_RE  = re.compile(r"%[0-9A-Fa-f]{2}")
 # Hard ceiling for one on-disk name (bytes == chars: names are pure ASCII).
 # Most filesystems allow 255; 240 leaves room for the device suffix.
 _FS_NAME_MAX = 240
-
-# In-memory cache of paths that have ALREADY been checked for migration.
-# Without this, every local_path() call (16× per request × 150 concurrent
-# requests = 2400 calls) would do an os.path.isfile() stat on the new path
-# AND on each legacy path — a torrent of stat calls that alone can saturate
-# the FS and cause request timeouts (ERR_CONNECTION_*).
-#
-# The set is capped; when it exceeds _MIGRATION_CHECKED_MAX we clear it and
-# start over. A clear is safe — worst case, a few stat calls are repeated.
-_migration_checked: set[str] = set()
-_migration_checked_lock = threading.Lock()
-_MIGRATION_CHECKED_MAX = 50000
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Site init
@@ -1174,38 +1162,36 @@ _S2L_VIEWER_REFRESH_MS = 50
 
 # Assemble implementations after all shared state has been initialized.
 # These explicit re-exports also preserve the historical `import s2l` API.
-from .Core.Cache.Naming import (
+from .Core.Cache import (
     _safe_seg,
-    _sanitize_query_for_filename,
     _encode_query_for_filename,
+    _beautify_query_name,
+    _cap_query_fname,
+    _query_sidecar_path,
+    _query_sidecar_owner,
+    _write_query_sidecar,
+    _purge_cached_file,
+    _sweep_legacy_cache,
+    local_path,
 )
-from .Core.Cache.Legacy import _legacy_cache_paths
-from .Core.Cache.Migration import _migrate_legacy_cache
-from .Core.Cache.Paths import local_path
-from .Capture.HTTP.Record import (
+from .Capture.HTTP import (
     _CaptureRecord,
     _capture_path,
     _encode_body,
-)
-from .Capture.HTTP.Worker import (
     _capture_worker,
     _maybe_capture,
 )
-from .Capture.WebSocket.Record import (
+from .Capture.WebSocket import (
     _WSCaptureRecord,
     _ws_capture_dir,
-)
-from .Capture.WebSocket.Worker import (
     _ws_capture_worker,
     _maybe_capture_ws,
 )
-from .CDN.Registry.Origins import (
+from .CDN.Registry import (
     _real_origin_for,
-    _proxy_target,
-)
-from .CDN.Registry.Hosts import (
     _register_cdn_host,
     _preregister_cdn_hosts_from_disk,
+    _proxy_target,
 )
 from .CDN.Server import (
     _start_cdn_server,
@@ -1217,138 +1203,101 @@ from .Core.Compression import (
     decompress_body,
     _decompress_body_impl,
 )
-from .Crawler.Crawl.Hosts import (
+from .Crawler.Crawl import (
     _mark_host_dead,
     _is_host_dead,
-)
-from .Crawler.Crawl.Assets import (
     _clean_url_match,
     _fetch_external_asset,
-    _start_ext_asset_workers,
-    _ext_asset_worker,
-)
-from .Crawler.Crawl.Save import _save_worker
-from .Crawler.Crawl.Jobs import (
+    _save_worker,
     enqueue,
     _crawl,
     _crawl_worker,
-    crawl_parallel,
-)
-from .Crawler.Crawl.Links import (
+    _start_ext_asset_workers,
+    _ext_asset_worker,
     _discovery_worker,
     _start_discovery_workers,
     _extract_links_async,
+    crawl_parallel,
 )
-from .Hooks.GUI.App import (
+from .Hooks.GUI import (
     _launch_hook_gui,
 )
-from .HTTP.Headers.Forwarding import (
+from .HTTP.Headers import (
     filter_fwd,
-    inject_csrf_headers,
-    rewrite_origin,
-)
-from .HTTP.Headers.Cookies import (
     _all_set_cookies,
     _resp_headers_dict,
     _flatten_cookiejar,
-)
-from .HTTP.Headers.Isolation import (
     _needs_isolation,
-    _is_worker_request,
-    _is_document_request,
-    _coep_credentialless_supported,
-    _coep_value,
-    _apply_isolation_headers,
-)
-from .HTTP.Headers.CORS import (
     _cors_origin_pair,
     _pna_allow_header,
-    _apply_corp_header,
-    _apply_cors_headers,
-)
-from .HTTP.Headers.CI import (
     _ci_header_keys,
     _ci_get_header,
     _ci_remove_header,
-)
-from .HTTP.Headers.Security import _apply_security_headers
-from .HTTP.Headers.Response import (
+    _apply_corp_header,
+    _apply_cors_headers,
+    _apply_security_headers,
+    _is_worker_request,
+    _is_document_request,
+    _is_document_ct,
+    _coep_value,
+    _apply_isolation_headers,
     filter_resp,
     _finalize_security_headers,
+    inject_csrf_headers,
+    rewrite_origin,
 )
-from .Hooks.Hooks.Context import HookContext
-from .Hooks.Hooks.Registry import (
+from .Hooks.Hooks import (
+    HookContext,
     _norm_methods,
     on_request,
     on_response,
     _run_hooks,
-)
-from .Hooks.Hooks.GUIWS import (
     _gui_ws_push,
     _apply_gui_ws_hooks,
-)
-from .Hooks.Hooks.GUITraffic import (
     _gui_push,
     _gui_push_raw,
-)
-from .Hooks.Hooks.GUIHooks import (
     _origin_matches,
     _apply_gui_hooks,
-)
-from .Hooks.Hooks.Store import (
     _make_hook_store,
     _editor_preview,
 )
-from .Core.Logging.Lolcat import (
+from .Core.Logging import (
     _lolcat_internal,
     _probe_lolcat,
     _lolcat_real,
+    log,
 )
-from .Core.Logging.Logger import log
-from .Core.MIME.Guess import (
+from .Core.MIME import (
     guess_mime,
-    _resolve_mime_with_sniff,
-    _js_mime_rescue,
-    _sniff_nonhtml_type,
-    _SNIFF_HEAD,
-)
-from .Core.MIME.ContentType import (
     _ensure_wasm_content_type,
     _ct_base,
-)
-from .Core.MIME.Assets import (
+    _resolve_mime_with_sniff,
     is_static_asset,
     is_subresource,
 )
-from .Proxy.Upstream.Headers import (
+from .Proxy.Upstream import (
     _main_security_headers,
     _normalize_request_origin,
     _cors_allow_headers,
-)
-from .Proxy.Upstream.Request import (
     _upstream_url,
     _build_ctx,
     _is_sw_path,
     _do_upstream,
+    _make_flask_resp,
 )
-from .Proxy.Upstream.Response import _make_flask_resp
-from .Proxy.Cache.Range import (
+from .Proxy.Cache import (
     _parse_range_header,
-    _serve_range_from_disk,
-)
-from .Proxy.Cache.Validators import (
     _disk_validators,
     _conditional_304,
     _apply_freshness,
-)
-from .Proxy.Cache.Serve import (
+    _serve_range_from_disk,
     _serve_cached,
     _cached_response,
 )
 from .Proxy.Assets import (
     ext_asset,
 )
-from .Proxy.Routes.Main import (
+from .Proxy.Routes import (
     proxy,
 )
 from .Proxy.TunnelRoutes import (
@@ -1356,65 +1305,59 @@ from .Proxy.TunnelRoutes import (
     tcp_ext,
     udp_ext,
 )
-from .Rewriting.Injector.Build import (
+from .Rewriting.Injector import (
     _build_s2l_injector,
 )
-from .Rewriting.HTML.Reveal import _reveal_hidden
-from .Rewriting.HTML.ServiceWorker import _inject_sw_clear
-from .Rewriting.HTML.Policy import _is_dont_rewrite_host
-from .Rewriting.HTML.URLs import _rewrite_ext_urls
+from .Rewriting.HTML import (
+    _reveal_hidden,
+    _inject_sw_clear,
+    _is_dont_rewrite_host,
+    _rewrite_ext_urls,
+)
 from .Rewriting.JSON import (
     _rewrite_json_urls,
 )
-from .Crawler.Scanner.Wordlists import (
+from .Crawler.Scanner import (
     _load_wordlist,
     _resolve_wordlists,
-)
-from .Crawler.Scanner.Status import (
     _scan_paths_summary,
     _parse_status_csv,
     _prompt_scan_status_filter,
+    _run_path_scanner,
 )
-from .Crawler.Scanner.Runner import _run_path_scanner
-from .Network.Server.WSGI import _PooledWSGIServer
-from .Network.Server.Handler import _S2LWSGIRequestHandler
-from .HTTP.Sessions.Devices import (
+from .Network.Server import (
+    _PooledWSGIServer,
+    _S2LWSGIRequestHandler,
+)
+from .HTTP.Sessions import (
     _sanitize_ua,
     _detect_device_from_ua,
     _effective_device,
     _device_variant,
-)
-from .HTTP.Sessions.Cloudflare import (
     _next_cf_config,
-    _is_cf_block,
-    _is_raw_block_text,
-    _is_bot_page,
-)
-from .HTTP.Sessions.Factory import (
     _make_cffi_session,
     _make_session,
     _make_cloudscraper_session,
     _make_requests_session,
-)
-from .HTTP.Sessions.Clients import (
+    _is_cf_block,
+    _is_raw_block_text,
+    _is_bot_page,
     _get_proxy_session,
     _client_id,
     _get_client_session,
     _short_exc,
 )
-from .Core.Stats.Model import _Stats
-from .Core.Stats.CDNHealth import (
+from .Core.Stats import (
+    _Stats,
     record_cdn_health,
     snapshot_cdn_health,
     prune_cdn_health,
     _start_health_pruner,
 )
-from .HTTP.Streaming.Detect import (
+from .HTTP.Streaming import (
     _should_stream,
+    _stream_resp,
     _is_sse_response,
-)
-from .HTTP.Streaming.Response import _stream_resp
-from .HTTP.Streaming.SSE import (
     _sse_iter,
     _sse_stream_generator,
     _stream_sse_resp,
@@ -1422,38 +1365,29 @@ from .HTTP.Streaming.SSE import (
 from .Network.Tunnels import (
     _pump_tcp_over_ws,
 )
-from .Core.URL.Request import (
+from .Core.URL import (
     _raw_path_after,
-    _request_host_header,
-    _request_hostname,
-    _proxy_base,
-)
-from .Core.URL.Network import (
     _is_ip_literal,
     _is_ipv6_literal,
     _is_wire_payload,
     _is_valid_html,
-    resolve_ip,
-    url_depth,
-    is_html,
-)
-from .Core.URL.Platform import (
     set_last_platform,
     get_last_platform,
     detect_platform,
-)
-from .Core.URL.Rewrite import (
+    _request_host_header,
+    _request_hostname,
+    _proxy_base,
     rewrite_abs_urls,
     strip_fragment,
     normalize_url,
-    build_base_url,
-)
-from .Core.URL.Format import (
+    resolve_ip,
+    url_depth,
+    is_html,
     _fmt_size,
     _fmt_host,
+    _fmt_path_qs,
     log_req,
-)
-from .Core.URL.Policy import (
+    build_base_url,
     is_allowed_domain,
     is_external_domain,
 )
@@ -1472,37 +1406,33 @@ from .Viewers.Reset import (
 from .Viewers.Data import (
     _s2l_viewer_data_endpoint,
 )
-from .Viewers.CDN.Endpoint import (
+from .Viewers.CDN import (
     _s2l_viewer_endpoint,
 )
-from .WebSockets.Protocol.Frames import (
+from .WebSockets.Protocol import (
     _ws_unmask,
-    _ws_handshake_accept,
-    _recv_exact,
-    _ws_read_frame,
-    _ws_make_frame,
-)
-from .WebSockets.Protocol.Compression import (
     _ws_deflate_init,
     _ws_deflate_msg,
     _ws_inflate_msg,
     _ws_deflate_cleanup,
-)
-from .WebSockets.Protocol.Hooks import (
     on_ws_message,
     _run_ws_msg_hooks,
+    _ws_handshake_accept,
+    _recv_exact,
+    _ws_read_frame,
+    _ws_make_frame,
 )
 from .WebSockets.Tunnel import (
     _WSTunnel,
     _ws_keepalive_loop,
     _pump_ws_frames_v2,
 )
-from .WebSockets.Upstream.Raw import _RawSocketUpstreamWS
-from .WebSockets.Upstream.Connect import (
+from .WebSockets.Upstream import (
+    _RawSocketUpstreamWS,
     _get_session_for_ws,
+    _CffiUpstreamWS,
     _ws_connect_upstream,
 )
-from .WebSockets.Upstream.CFFI import _CffiUpstreamWS
 from .Application import create_app
 
 # ── Site init (same expression and order as the monolith) ────────────────────
@@ -1515,20 +1445,6 @@ MAIN_HOST = urlparse(SITE_URL).netloc
 SITE_NAME = MAIN_HOST.removeprefix("www.").replace(".", "_")
 SRC_FOLDER  = os.path.join("site_src",  SITE_NAME)
 DATA_FOLDER = os.path.join("site_data", SITE_NAME)
-
-# ── Device-profile change tracking ───────────────────────────────────────────
-# All desktop-class profiles (auto/desktop/macintosh/bot/ie11) map to the SAME
-# canonical cache file (see _device_variant). When that file was written under
-# a PREVIOUS profile — an older pre-variant build, a run with DEVICE=mobile
-# before variants existed, or simply a stale mirror — flipping DEVICE between
-# desktop-class profiles never revalidates it: the proxy keeps serving, say,
-# the mobile homepage to a desktop browser forever, which looks exactly like
-# "the DEVICE setting does nothing". main() records the active profile in
-# site_data and sets _DEVICE_CHANGED when it differs from the previous boot;
-# the proxy route then re-fetches each cached HTML document exactly once
-# (_DEVICE_REFRESHED tracks the files already refreshed this session).
-_DEVICE_CHANGED   = False
-_DEVICE_REFRESHED: set = set()
 
 stats = _Stats()
 
@@ -1544,28 +1460,6 @@ def main() -> None:
     global CACHE_CDN
     os.makedirs(SRC_FOLDER, exist_ok=True)
     os.makedirs(DATA_FOLDER, exist_ok=True)
-
-    def _note_device_change() -> None:
-        """Detect a DEVICE profile change between boots (site_data JSON)."""
-        global _DEVICE_CHANGED
-        state_fp = os.path.join(DATA_FOLDER, "device_profile.json")
-        prev = None
-        try:
-            with open(state_fp, "r", encoding="utf-8") as f:
-                prev = json.load(f).get("device")
-        except Exception:
-            prev = None   # first boot / unreadable — record and move on
-        try:
-            with open(state_fp, "w", encoding="utf-8") as f:
-                json.dump({"device": DEVICE}, f)
-        except Exception as e:
-            log(f"Could not persist device profile state: {e}", "WARN")
-        if prev is not None and prev != DEVICE:
-            _DEVICE_CHANGED = True
-            log(f"DEVICE profile changed ({prev} → {DEVICE}) — cached HTML documents "
-                f"will be re-fetched once on first visit", "WARN")
-
-    _note_device_change()
     threading.Thread(target=_save_worker, daemon=True, name="save-worker").start()
     import signal
 
@@ -1658,7 +1552,7 @@ def main() -> None:
                     with open(fp, "rb") as f:
                         data = f.read(8192)
                     if _is_bot_page(data):
-                        os.remove(fp)
+                        _purge_cached_file(fp)
                         purged += 1
                         log(f"Purged bot-page cache: {os.path.relpath(fp)}", "WARN")
                 except Exception:
@@ -1667,6 +1561,16 @@ def main() -> None:
             log(f"Startup bot-cache purge: removed {purged} poisoned file(s)", "INFO")
 
     threading.Thread(target=_purge_bot_cache, daemon=True, name="bot-cache-purge").start()
+
+    # One-shot sweep of legacy-layout cache files (pre-9.1 / 9.1a / 09/10
+    # naming). The migration bridges are gone — those files can never be
+    # served again, so they are deleted and the reclaimed space logged.
+    # Safe in OFFLINE too: the sweep only removes files NO URL can resolve
+    # to (liveness proven via local_path), unlike the bot purge above.
+    # Unconditional (9.0 contract) and backgrounded — a big mirror must not
+    # delay the first serve.
+    threading.Thread(target=_sweep_legacy_cache, daemon=True,
+                     name="legacy-cache-sweep").start()
 
     if SCAN_PATHS and not OFFLINE:
         # Run the interactive status-filter prompt in the MAIN thread BEFORE
@@ -1713,36 +1617,8 @@ def main() -> None:
                 f"{s['ws_captured']} ws-captured · "
                 f"{s['revealed']} revealed · {s['conn_errors']} unreachable · "
                 f"{s['http_errors']} HTTP errors")
-            # Print the LIVE port, not the snapshot above: the snapshot is
-            # taken the instant crawl_parallel() returns, and a CDN mini-server
-            # registered mid-crawl can still be binding then (sentinel -1 in
-            # the map) — printing the stale copy showed "http://localhost:-1"
-            # even though the bind had already completed by print time (the
-            # "host → :PORT" line logged by _start_cdn_server only appears
-            # AFTER the real port is written to the map). Bounded grace
-            # (≤2s, 50ms steps) so the summary virtually always shows the
-            # real port; entries that vanished meanwhile (bind failed —
-            # ERROR already logged by _start_cdn_server — or server crashed)
-            # are skipped instead of printing a dead address.
-            def _live_cdn_port(h: str):
-                with _cdn_port_lock:
-                    return _cdn_host_port.get(h)
-            for host in cdn_map:
-                live = _live_cdn_port(host)
-                if live == -1:
-                    for _ in range(40):
-                        time.sleep(0.05)
-                        live = _live_cdn_port(host)
-                        if live != -1:
-                            break
-                if live is None:
-                    continue
-                if live > 0:
-                    log(f"  CDN {host} → http://localhost:{live}", "CDN")
-                elif live == 0:
-                    log(f"  CDN {host} → {_EXT_PREFIX}/ route (no dedicated port)", "CDN")
-                else:
-                    log(f"  CDN {host} → port pending (mini-server still binding)", "CDN")
+            for host, port in cdn_map.items():
+                log(f"  CDN {host} → http://localhost:{port}", "CDN")
         threading.Thread(target=_bg_crawl, daemon=True, name="crawl-main").start()
         log("Crawler started in background.")
     elif CRAWL and OFFLINE:

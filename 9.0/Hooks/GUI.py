@@ -1,8 +1,4 @@
-"""Site2Local: PyQt6 hook-editor GUI application assembly.
-
-The Qt widget tree is one closure (mirrors the single _launch_hook_gui
-function of the s2l.py monolith). Pure helpers live in Codecs.py/Find.py.
-"""
+"""Site2Local: gui."""
 from __future__ import annotations
 
 from urllib.parse import urlparse
@@ -12,9 +8,7 @@ import queue
 import re
 import sys
 
-from ... import Runtime as _s2l_state
-from .Codecs import _bytes_to_hexdump, _hexdump_to_bytes, _ws_auto_encoding
-from .Find import _find_all
+from .. import Runtime as _s2l_state
 
 
 def _launch_hook_gui() -> None:
@@ -188,6 +182,34 @@ def _launch_hook_gui() -> None:
 
         # Cursor-based case-insensitive find for a QPlainTextEdit.
         # Returns the list of start positions and highlights every match.
+        def _find_all(edit: QPlainTextEdit, query: str):
+            edit.setExtraSelections([])
+            if not query:
+                return []
+            doc = edit.document()
+            positions = []
+            cur = QTextCursor(doc)
+            cur.movePosition(QTextCursor.MoveOperation.Start)
+            ql = len(query)
+            while True:
+                cur = doc.find(query, cur)
+                if cur.isNull():
+                    break
+                positions.append(cur.selectionStart())
+            if positions:
+                fmt = QTextCharFormat()
+                fmt.setBackground(QColor(_YLW_HI))
+                fmt.setForeground(QColor("#000000"))
+                sels = []
+                for p in positions:
+                    sel = QTextEdit.ExtraSelection()
+                    sel.cursor = QTextCursor(doc)
+                    sel.cursor.setPosition(p)
+                    sel.cursor.setPosition(p + ql, QTextCursor.MoveMode.KeepAnchor)
+                    sel.format = fmt
+                    sels.append(sel)
+                edit.setExtraSelections(sels)
+            return positions
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 1: Traffic + Hooks
@@ -345,7 +367,7 @@ def _launch_hook_gui() -> None:
         def _body_find_apply(*_):
             q = body_find_edit.text()
             _body_find_positions.clear()
-            _body_find_positions.extend(_find_all(body_box, q, _YLW_HI))
+            _body_find_positions.extend(_find_all(body_box, q))
             n = len(_body_find_positions)
             body_find_match_lbl.setText(f"{n} match{'es' if n != 1 else ''}")
             if _body_find_positions:
@@ -1122,11 +1144,59 @@ def _launch_hook_gui() -> None:
         wtf.addWidget(ws_then_tabs, 1)
 
         # ── Hex / text helpers + bidirectional live sync ─────────────────
+        def _bytes_to_hexdump(data: bytes) -> str:
+            """Format editable bytes without offsets or length fields."""
+            if not data:
+                return ""
+            return "\n".join(
+                " ".join(f"{b:02x}" for b in data[off:off + 16])
+                for off in range(0, len(data), 16)
+            )
 
+        def _hexdump_to_bytes(text: str):
+            """Parse raw hex bytes or legacy offset-prefixed dumps."""
+            out = bytearray()
+            for line in text.splitlines():
+                stripped = re.sub(
+                    r"^[0-9a-fA-F]{8}\s{2,}", "", line).strip()
+                if not stripped:
+                    continue
+                for tok in stripped.split():
+                    if not re.fullmatch(r"[0-9a-fA-F]+", tok):
+                        return None
+                    if len(tok) % 2 != 0:
+                        return None
+                    out.extend(bytes.fromhex(tok))
+            return bytes(out)
 
         _ws_syncing_editors = [False]
         _ws_text_sync_error = [False]
 
+        def _ws_auto_encoding(data: bytes) -> str:
+            """Detect common Unicode encodings; arbitrary legacy encodings are ambiguous."""
+            for marker, encoding in (
+                (codecs.BOM_UTF32_LE, "utf-32"),
+                (codecs.BOM_UTF32_BE, "utf-32"),
+                (codecs.BOM_UTF8, "utf-8-sig"),
+                (codecs.BOM_UTF16_LE, "utf-16"),
+                (codecs.BOM_UTF16_BE, "utf-16"),
+            ):
+                if data.startswith(marker):
+                    return encoding
+            sample = data[:256]
+            if len(sample) >= 4:
+                even_nuls = sum(sample[i] == 0 for i in range(0, len(sample), 2))
+                odd_nuls = sum(sample[i] == 0 for i in range(1, len(sample), 2))
+                pairs = len(sample) // 2
+                if even_nuls > pairs * 0.3 and odd_nuls == 0:
+                    return "utf-16-be"
+                if odd_nuls > pairs * 0.3 and even_nuls == 0:
+                    return "utf-16-le"
+            try:
+                data.decode("utf-8", errors="strict")
+                return "utf-8"
+            except UnicodeDecodeError:
+                return "cp1252"
 
         def _ws_selected_encoding(data: bytes) -> tuple[str, str]:
             requested = ws_encoding_combo.currentText().strip()

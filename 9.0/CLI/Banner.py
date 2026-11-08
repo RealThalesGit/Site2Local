@@ -56,9 +56,9 @@ def _banner() -> None:
     # closed with a right ║ so the box is always perfectly rectangular.
     # The box auto-expands if any line is wider than the default _BOX_W.
     _title = "S I T E  2  L O C A L"
-    # Version comes from Config.VERSION (single source of truth); the spaced
-    # style matches the title ("9.0" → "9 . 0").
-    _ver   = " ".join("V" + _s2l_state.VERSION)
+    # Letter-spaced version from Config.VERSION (was a stale hardcoded
+    # "V 8 . 1" two generations back).
+    _ver   = "V " + _s2l_state.VERSION.replace(".", " . ")
     _title_core = f"  {_title}    {_ver}  "
 
     # Build body lines first so we can measure their visible widths.

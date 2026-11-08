@@ -84,33 +84,14 @@ def _do_upstream(method: str, target: str, ctx: _s2l_state.HookContext,
     # during iteration inside requests' header merging). The per-request
     # `fwd` headers already override session-level headers via kwargs["headers"].
 
-    # Client hints must agree with the User-Agent we actually send. In
-    # explicit-DEVICE mode the browser's own Sec-CH-UA* headers describe a
-    # DIFFERENT device than the profile UA (classic case: testing in DevTools
-    # mobile emulation while DEVICE=macintosh — the request leaves with a
-    # desktop UA but Sec-CH-UA-Mobile: ?1). Hint-first backends (unlike
-    # UA-only ones) then serve the mobile variant no matter which UA we
-    # claimed, and the user concludes "the DEVICE setting does nothing".
-    # So: auto → mirror the browser (backfill any hints it did not send);
-    # explicit → strip the browser's hints and install the profile's own
-    # (_SEC_CH_UA covers the Chromium profiles; ie11/bot/symbian/safari
-    # profiles send none, which is exactly what those real clients do).
-    _ch_hint_names = ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-                      "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-model")
-    if _s2l_state.DEVICE == "auto":
-        for hint_hdr in (*_ch_hint_names,
-                         "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-                         "sec-fetch-user"):
-            if hint_hdr not in {k.lower() for k in fwd}:
-                val = flask_request.headers.get(hint_hdr, "")
-                if val:
-                    fwd[hint_hdr] = val
-    else:
-        for _k in [k for k in fwd if k.lower() in _ch_hint_names]:
-            fwd.pop(_k, None)
-        _ch = _s2l_state._SEC_CH_UA.get(_s2l_state.DEVICE)
-        if _ch:
-            fwd.update(_ch)
+    for hint_hdr in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                     "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-model",
+                     "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+                     "sec-fetch-user"):
+        if hint_hdr not in {k.lower() for k in fwd}:
+            val = flask_request.headers.get(hint_hdr, "")
+            if val:
+                fwd[hint_hdr] = val
 
     orig_accept  = fwd.get("Accept", "")
     orig_purpose = flask_request.headers.get("Purpose", "")

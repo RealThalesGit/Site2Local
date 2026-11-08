@@ -1,7 +1,6 @@
 """Site2Local: MIME type detection and asset classification."""
 from __future__ import annotations
 
-import json
 import mimetypes
 import os
 import re
@@ -13,7 +12,7 @@ def guess_mime(path: str) -> str:
     """Guess a MIME type from a path extension.
 
     Uses the stdlib mimetypes module (dynamic — reads /etc/mime.types at
-    import time). Falls back to application/octet-stream when the extension
+    import time). Falls-back to application/octet-stream when the extension
     is unknown or absent, which is the safest default for binary-safe
     proxying. No static type list is maintained on our side.
     """
@@ -26,293 +25,325 @@ def guess_mime(path: str) -> str:
     return mt or "application/octet-stream"
 
 
-# Head window used by every content sniffer below (and by the 304 probes in
-# the cache-serve paths). 2048 instead of the historical 512: license
-# banners on minified CSS/JS routinely exceed 512 bytes, and a head that
-# ends inside the banner can't confirm anything.
+# ── Content-based MIME rescue (Fix 6, restored + unified) ────────────────────
+#
+# The cache re-derives the Content-Type on every request (the CT that came
+# from upstream is not persisted), so a file whose NAME lies about its type
+# would be mis-served forever. This resolver sniffs the leading bytes and
+# only ever RESCUES — it never downgrades a type that the extension/caller
+# already established with confidence.
+#
+# Design rules (learned the hard way — see the [{"id":… regression):
+#   * false positives are THE enemy: a JSON array must never be sniffed as
+#     CSS, so the CSS discriminator only fires on strong evidence
+#     (magic > parse > at-rule > selector, in that order of strength);
+#   * only the types nosniff consumers actually reject are rescue targets:
+#     script / style / JSON / wasm / images / fonts — text/plain and friends
+#     stay out of scope;
+#   * one sniff window for every caller (2048 bytes) so the 200, the 304
+#     probe and the 206 of the SAME file can never disagree.
+
+#: Single sniff window used by every caller (magic + heuristics fit well
+#: under 2 KB; a license banner longer than the old 512-byte window used to
+#: defeat the JS rescue).
 _SNIFF_HEAD = 2048
 
-
-def _resolve_mime_with_sniff(lp: str, data: bytes | None = None) -> str:
-    """Resolve a MIME type for a cached file, sniffing HTML for no-ext files.
-
-    Per the 09/10 spec: for files WITHOUT an extension (the new
-    ``asset/?id=N`` layout), identify HTML by content and serve as
-    ``text/html``; everything else is ``application/octet-stream``.
-    Files WITH an extension use ``guess_mime(lp)`` as before.
-
-    Correção 6: the "everything else" arm is now content-sniffed for
-    CSS/JS/JSON too (see ``_sniff_nonhtml_type``). Only the first
-    ``_SNIFF_HEAD`` bytes are read when ``data`` is None — the HTML and
-    CSS/JS checks only look at the head, so reading more would waste
-    memory when many large binary assets are processed concurrently.
-    """
-    has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
-    looks_html = lp.endswith(".html") or lp.endswith("/index.html")
-    if has_ext or looks_html:
-        return _s2l_state.guess_mime(lp)
-    # Extensionless file — sniff content.
-    if data is None:
-        try:
-            with open(lp, "rb") as f:
-                data = f.read(_SNIFF_HEAD)   # head only — never read the full file here
-        except OSError:
-            return "application/octet-stream"
-    if _s2l_state._is_valid_html(data) and not _s2l_state._is_wire_payload(data):
-        return "text/html; charset=utf-8"
-    # Correção 6 — CSS/JS/JSON content rescue (css2?family=… class). When the
-    # caller only passed a head slice (the 304 probes), the JSON check
-    # effectively can't confirm a tail and yields None — harmless: JSON
-    # responses are served no-store and never carry validators to revalidate.
-    return _sniff_nonhtml_type(data) or "application/octet-stream"
-
-
-# ── JavaScript content rescue (correção 5) ───────────────────────────────────
-# Types that already ARE executable JavaScript — never re-sniffed.
-_JS_EXECUTABLE = ("text/javascript", "application/javascript",
-                  "application/x-javascript", "text/jscript")
-
-# Types the rescue must NEVER touch. The browser consumes them as-is and a
-# JS-looking head would be a false positive: CSS banners `/*! … */` are
-# byte-level near-identical to JS license banners (gsap ships both kinds),
-# HTML starts with `<`, JSON with `{`/`[`/`"`, SVG is text-but-image.
-# application/json also keeps _serve_cached's JSON-rewrite branch active.
-_NEVER_JS_RESCUE = ("text/html", "text/css", "text/xml", "application/xml",
-                    "application/json", "image/svg+xml", "application/wasm")
-
-# High-precision "this is JavaScript" token prefixes. Trailing spaces where a
-# bare word could prefix English prose ("various", "constant", "classical").
-_JS_SIGNATURES = (
-    "'use strict'", '"use strict"', "!function", "!(function", "(function",
-    "(()=>", "!(()=>", "(async", "async function", "function ", "function*",
-    "class ", "var ", "let ", "const ", "import ", "import(", "export ",
-    "export{", "define(", "require(", "module.exports", "Object.defineProperty",
-    "window.", "self.", "globalThis", "void ", "typeof ", ";(function",
-    ";!function", "(typeof", "new Function", "#!",
+#: Magic-byte signatures checked at offset 0. Highest evidence strength.
+_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\x00asm",              "application/wasm"),
+    (b"\x89PNG\r\n\x1a\n",    "image/png"),
+    (b"\xff\xd8\xff",         "image/jpeg"),
+    (b"GIF87a",               "image/gif"),
+    (b"GIF89a",               "image/gif"),
+    (b"RIFF",                 ""),   # resolved via sub-magic (WEBP)
+    (b"wOF2",                 "font/woff2"),
+    (b"wOFF",                 "font/woff"),
+    (b"OTTO",                 "font/otf"),
+    (b"\x00\x01\x00\x00",     "font/ttf"),
+    (b"BM",                   ""),   # too weak alone — skipped below
 )
 
-# Bounded dedupe for rescue log lines (one WARN per path, cap 256).
-_js_rescue_logged: set[str] = set()
+#: RIFF sub-magic (bytes 8..12) — only WEBP matters in practice.
+_RIFF_SUBMAGIC = {b"WEBP": "image/webp"}
 
+#: mp4/iso-bmff: bytes 4..8 == b"ftyp".
+_FTYP_OFF = (4, 8)
 
-def _looks_like_js(head: bytes) -> bool:
-    """High-precision check that a byte head is JavaScript source.
+#: Strong JavaScript evidence. Counted with word-ish boundaries; a banner
+#: comment, a license header or a single stray token never reaches the
+#: threshold. These are the tokens every bundler/minifier emits.
+_JS_EXECUTABLE = (
+    b"function", b"return", b"var ", b"let ", b"const ", b"=>",
+    b"import", b"export", b"typeof", b"new ", b"this.", b"class ",
+    b"async ", b"await ", b"try", b"catch", b"throw", b"window",
+    b"document", b"self.", b"Math.", b"Object", b"Array",
+)
+_JS_MIN_HITS = 4
 
-    Strips up to three leading comment blocks (`//` line / `/* … */` banner,
-    the universal minified-library prelude) and then matches a conservative
-    token-prefix list. Comment-only heads that never terminate within the
-    window return False (can't confirm). CSS/HTML/JSON never match: `.foo{`,
-    `@media`, `<!doctype`, `{`, `[` are not in the signature list — which is
-    exactly why CSS files (whose `/*!` banners look like JS banners) are safe.
-    """
-    try:
-        s = head.decode("utf-8", "ignore").lstrip("\ufeff ﻿ \t\r\n")
-    except Exception:
-        return False
-    for _ in range(3):
-        if not s:
-            return False
-        if s.startswith("#!"):
-            return True          # hashbang — valid at the start of JS modules
-        if s.startswith("/*"):
-            end = s.find("*/", 2)
-            if end == -1:
-                return False     # unterminated banner inside the head — give up
-            s = s[end + 2:].lstrip(" \t\r\n")
-        elif s.startswith("//"):
-            nl = s.find("\n")
-            if nl == -1:
-                return False
-            s = s[nl + 1:].lstrip(" \t\r\n")
-        else:
-            break
-    if not s:
-        return False
-    return any(s.startswith(sig) for sig in _JS_SIGNATURES)
+#: Extensions whose guess_mime() answer is trusted only when the content
+#: does not contradict it. Anything else keeps the extension's answer.
+_RESCUE_TARGET_EXTS = frozenset({
+    ".js", ".mjs", ".cjs", ".jsx",          # Fix 5 family: lying extension
+    ".css",
+    ".json", ".map", ".webmanifest",
+    "",                                      # extensionless (09/10 layout)
+})
 
+#: Content-Type bases whose extension-derived answer is ALWAYS trusted
+#: (text formats, executables and binary formats with unambiguous
+#: extensions). An extension that maps to anything OUTSIDE this set (e.g.
+#: ``.gl`` → ``video/gl``, an obscure IANA type that shadowed the
+#: globe.gl JS library and blacked out an entire 3D site) is treated as
+#: "obscure" and the CONTENT gets a chance to rescue the real type.
+_TRUSTED_CT_BASES = frozenset({
+    "application/javascript", "application/ecmascript",
+    "application/json", "application/manifest+json",
+    "application/xhtml+xml", "application/wasm",
+    "application/pdf", "application/zip", "application/gzip",
+    "application/x-tar", "application/x-bzip2", "application/rtf",
+    "application/font-woff", "application/vnd.ms-fontobject",
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon",
+    "image/avif", "image/bmp", "image/tiff",
+    "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav", "audio/webm",
+    "audio/aac", "audio/flac", "audio/opus",
+    "video/mp4", "video/webm", "video/ogg", "video/quicktime",
+    "video/x-matroska", "video/x-msvideo", "video/mpeg",
+    "font/woff", "font/woff2", "font/ttf", "font/otf",
+})
 
-def _js_mime_rescue(ct: str, lp: str, head: bytes | None = None) -> str:
-    """Serve executable JavaScript even when the path/extension lies about it.
-
-    Field bug (mirror jeskojets.com, globe section rendered as a plain black
-    circle): the page loads ``<script src="https://cdn.jsdelivr.net/npm/globe.gl">``
-    — the package NAME looks like a filename with extension ``.gl``, and the
-    stdlib maps ``.gl`` → ``video/gl`` (the 1993 Graphics Language animation
-    type, still in the IANA registry). The disk cache stores only the body
-    (the upstream's ``application/javascript`` is not persisted), so every
-    cache-hit serve re-derives the Content-Type from the extension and ships
-    ``video/gl``. jsdelivr — like the proxy itself — sends
-    ``X-Content-Type-Options: nosniff``, and Chromium REFUSES to execute a
-    classic script whose MIME is not a JavaScript type: window.Globe never
-    exists, the site's ``if (typeof Globe !== 'function') return;`` guard
-    bails, and the styled-but-empty container shows through. First visit
-    (live fetch, upstream CT) worked; every later visit (cache hit) broke —
-    the classic "worked once, then never again" pattern.
-
-    The rescue: when the derived type is NOT a type the browser can consume
-    as this content (and not one of the never-touch text types where a
-    JS-looking head would be a false positive), sniff the leading bytes —
-    content that is really JavaScript is served as ``text/javascript``.
-    Identical bytes, correct label. Real binaries (PNG/MP4/WASM/…) never
-    match the token signatures and keep their extension-derived type.
-
-    Companion: ``_disk_validators()`` folds this Content-Type into the ETag,
-    so a browser that already cached a poisoned entry (e.g. video/gl) gets a
-    fresh 200 instead of being pinned to it by matching 304s.
-    """
-    ct_base = (ct or "").split(";", 1)[0].strip().lower()
-    if not ct_base:
-        ct_base = "application/octet-stream"
-    if (ct_base in _JS_EXECUTABLE
-            or ct_base in _NEVER_JS_RESCUE
-            or ct_base.endswith("+json") or ct_base.endswith("+xml")):
-        return ct
-    if head is None:
-        try:
-            with open(lp, "rb") as f:
-                head = f.read(512)
-        except OSError:
-            return ct
-    if not head or not _looks_like_js(head):
-        return ct
-    if len(_js_rescue_logged) < 256 and lp not in _js_rescue_logged:
-        _js_rescue_logged.add(lp)
-        try:
-            _s2l_state.log(f"MIME rescue: {os.path.basename(lp)!r} is JavaScript "
-                           f"but its path suggested {ct_base!r} → text/javascript", "WARN")
-        except Exception:
-            pass
-    return "text/javascript; charset=utf-8"
-
-
-# ── Content sniffing for extensionless cache files (correção 6) ─────────────
-
-# CSS at-rules — bulletproof file-start markers (checked as plain prefixes;
-# none of them is valid as the start of a JavaScript file: JS decorators like
-# @component are NOT in this list, and @media/@font-face/etc. never open a JS
-# module).
+#: CSS @-rules — near-zero false-positive rate (JSON never starts a line
+#: with these, JS never has `foo:` followed by `;` in this shape).
 _CSS_AT_RULES = (
-    "@charset", "@import", "@font-face", "@media", "@supports", "@keyframes",
-    "@namespace", "@page", "@layer", "@property", "@counter-style",
-    "@container", "@document", "@scope", "@font-feature-values",
-    "@-webkit-", "@-moz-", "@-ms-", "@-o-",
+    b"@media", b"@import", b"@font-face", b"@keyframes", b"@supports",
+    b"@charset", b"@-webkit-", b"@-moz-", b"@layer", b"@container",
+    b"@property", b"@scope",
 )
 
-# Selector heuristic: an identifier-ish start (letter, class, id, universal
-# or :pseudo) followed only by selector punctuation and then an opening
-# brace. Deliberately excludes `(`, `=` and `;` so ordinary JavaScript lines
-# (document.addEventListener(…), x = {…}, foo(1);) can never match — those
-# characters are also rare at the very first rule of a real stylesheet
-# (files open with resets, element/class selectors or at-rules). `[` is
-# likewise excluded from the START class: a JSON array of objects opens with
-# `[{` — an attribute selector as the FIRST rule of a stylesheet is a
-# once-a-career event, a JSON array response is every list API on the web.
-_CSS_SELECTOR_RE = re.compile(r"[A-Za-z:*.][A-Za-z0-9_\-: .#>,*~\t\r\n]{0,300}\{")
+#: CSS property regex (ASCII, bytes): `foo:` at line start or after `;{`.
+#: Deliberately EXCLUDES `(`, `=`, `;`, `[` so a JSON/JS line like
+#: `"a":1,` or `x=(y)` can never match (the field regression precedent).
+_CSS_PROP_RE = re.compile(
+    rb"(?:^|[\n\r;{])[ \t]*[a-zA-Z-]{2,24}[ \t]*:[ \t]*[^ \t\n\r;{}]")
 
 
-def _looks_like_css(head: bytes) -> bool:
-    """High-precision check that a byte head is CSS source.
+def _sniff_magic(head: bytes) -> str:
+    """Strongest-evidence check: magic bytes at offset 0."""
+    for sig, mime in _MAGIC_PREFIXES:
+        if mime and head.startswith(sig):
+            return mime
+    if head.startswith(b"RIFF") and head[8:12] in _RIFF_SUBMAGIC:
+        return _RIFF_SUBMAGIC[head[8:12]]
+    if head[_FTYP_OFF[0]:_FTYP_OFF[1]] == b"ftyp":
+        # iso-bmff: brand at 8..12 — mp4 brands start with 'isom'/'mp4'/'avc'…
+        brand = head[8:12]
+        if brand[:2] in (b"is", b"mp", b"av", b"da", b"mo", b"MS", b"ma"):
+            return "video/mp4"
+    return ""
 
-    Mirrors ``_looks_like_js``: strips up to three leading comment blocks
-    (``/* … */`` banners are the universal minified-CSS prelude — Google
-    Fonts' css2 endpoint opens every block with ``/* latin */``), then
-    accepts either a known at-rule prefix or the tight selector-then-brace
-    shape. JavaScript, JSON and HTML never match:
-      • JS is checked FIRST by the caller (its signatures claim var/let/
-        function/window… heads before this runs);
-      • JS lines that survive that (``document.x = {``) contain ``=`` or
-        ``(`` before any ``{`` — excluded from the selector class;
-      • JSON opens with ``{``/``[`` — not in the selector start class;
-      • HTML opens with ``<``.
+
+def _sniff_svg(head: bytes) -> bool:
+    """SVG: `<svg` at start, or an `<?xml` prologue followed by `<svg`."""
+    h = head.lstrip()
+    if h.startswith(b"<svg") or h.startswith(b"<!DOCTYPE svg"):
+        return True
+    if h.startswith(b"<?xml"):
+        return b"<svg" in h[:512]
+    return False
+
+
+def _sniff_js(head: bytes) -> bool:
+    """Executable-JavaScript check with a hit-count threshold.
+
+    A >4-token consensus is required: minified JS hits double digits within
+    the first 2 KB, while JSON payloads, license banners and HTML text
+    stay far below. `crossOriginIsolated`-style API prose in HTML comments
+    never reaches the threshold either.
     """
-    try:
-        s = head.decode("utf-8", "ignore").lstrip("\ufeff ﻿ \t\r\n")
-    except Exception:
-        return False
-    for _ in range(3):
+    hits = 0
+    for tok in _JS_EXECUTABLE:
+        if tok in head:
+            hits += 1
+            if hits >= _JS_MIN_HITS:
+                return True
+    return False
+
+
+def _sniff_css(head: bytes) -> bool:
+    """Stylesheet check — @-rules first (strong), then property shapes."""
+    for rule in _CSS_AT_RULES:
+        if rule in head:
+            return True
+    # A run of property declarations is convincing; a single one is not.
+    return len(_CSS_PROP_RE.findall(head)) >= 3
+
+
+def _json_prefix_ok(t: str) -> bool:
+    """Is `t` valid JSON, or a CLEAN PREFIX of a JSON document?
+
+    A cached JSON payload larger than the 2048-byte sniff window gets
+    truncated mid-document; the honest test is then: cut at the last
+    structural character, strip a dangling comma, close every bracket that
+    is still open (string/escape aware), and see if json.loads accepts the
+    completed document. Only structural characters count — a truncation in
+    the middle of a string or an unbalanced bracket refuses (returns
+    False), keeping the false-positive rate at zero.
+    """
+    import json
+
+    def _complete(s: str) -> bool:
+        s = s.rstrip(",")
         if not s:
             return False
-        if s.startswith("/*"):
-            end = s.find("*/", 2)
-            if end == -1:
-                return False     # unterminated banner inside the head — give up
-            s = s[end + 2:].lstrip(" \t\r\n")
-        else:
-            break
-    if not s:
-        return False
-    for at in _CSS_AT_RULES:
-        if s.startswith(at):
+        stack: list[str] = []
+        in_str = False
+        esc = False
+        for ch in s:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                if in_str:
+                    esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "[{":
+                stack.append("]" if ch == "[" else "}")
+            elif ch in "]}":
+                if not stack or stack[-1] != ch:
+                    return False
+                stack.pop()
+        if in_str or esc:
+            return False
+        try:
+            json.loads(s + "".join(reversed(stack)))
             return True
-    return _CSS_SELECTOR_RE.match(s) is not None
+        except ValueError:
+            return False
+
+    # 1. Direct parse (with short trailing-garbage retries).
+    for cut in range(len(t), max(len(t) - 40, 0), -1):
+        try:
+            json.loads(t[:cut])
+            return True
+        except ValueError:
+            continue
+    # 2. Close the truncated document as-is (number/keyword cut).
+    if _complete(t):
+        return True
+    # 3. Cut at the last structural character, then close.
+    last = max(t.rfind(","), t.rfind("}"), t.rfind("]"))
+    if last >= 4:
+        return _complete(t[:last + 1])
+    return False
 
 
-# Full-data JSON parse is bounded: a body larger than this is not worth
-# confirming (no real JSON API response reaches this size, and the sniff
-# runs on every cache-hit serve).
-_JSON_SNIFF_MAX = 8 * 1024 * 1024
-
-
-def _looks_like_json(data: bytes) -> bool:
-    """Check that the WHOLE body is a JSON document.
-
-    Structural gate first (first non-space byte ``{``/``[``, last non-space
-    byte ``}``/``]``), then a full ``json.loads`` — the body is already in
-    memory at serve time, and the gate makes non-JSON binaries fail on the
-    first byte instead of paying the parse. Needs the full body (a head
-    slice can't confirm the tail), so the 304 probes — which only read the
-    head — never claim JSON; harmless, because JSON responses are served
-    no-store and carry no validators to revalidate.
-    """
-    if len(data) < 2 or len(data) > _JSON_SNIFF_MAX:
-        return False
-    lead = data[:64].lstrip(b"\xef\xbb\xbf \t\r\n")
-    if not lead or lead[0:1] not in (b"{", b"["):
-        return False
-    tail = data.rstrip(b" \t\r\n")
-    if not tail or tail[-1:] not in (b"}", b"]"):
-        return False
+def _sniff_json(head: bytes) -> bool:
+    """JSON check: valid prefix that json.loads accepts (or a clean slice)."""
     try:
-        json.loads(data)
-    except Exception:
+        text = head.decode("utf-8", "strict")
+    except (UnicodeDecodeError, ValueError):
         return False
-    return True
+    t = text.lstrip()
+    if not t or t[0] not in "[{":
+        return False
+    return _json_prefix_ok(t)
 
 
-def _sniff_nonhtml_type(data: bytes) -> str | None:
-    """Content-based MIME for cache bytes whose path says nothing.
+def _read_head(lp: str, size: int) -> bytes:
+    try:
+        with open(lp, "rb") as f:
+            return f.read(size)
+    except OSError:
+        return b""
 
-    Field bug (mirror of a Next.js storefront): the page loads its
-    stylesheet from ``fonts.googleapis.com/css2?family=Montserrat…`` — a
-    path with NO extension plus a query string, so the 10/10 layout stores
-    it as ``__query__/css2/family=Montserrat…`` (extensionless). The cache
-    stores only the body (the upstream's ``text/css`` is not persisted), so
-    the extensionless serve re-derived ``application/octet-stream`` — and
-    with the universal ``X-Content-Type-Options: nosniff`` hardening, a
-    stylesheet that is not ``text/css`` is REFUSED by the browser: Firefox
-    raises ``NS_ERROR_CORRUPTED_CONTENT`` (the 0-byte failure in the
-    network panel), Chrome logs a MIME refusal. First visit worked (live
-    fetch ships the upstream's real Content-Type); every reload failed —
-    the same "worked once, then never again" shape as correção 5, on the
-    extensionless side of the cache.
 
-    The rescue: sniff the leading bytes (JS via the correção-5 signatures,
-    CSS via at-rules/selector shape, JSON via a full parse) and label the
-    bytes what they actually are. Real binaries never match and keep the
-    octet-stream default. The companion ``_disk_validators`` ETag already
-    folds the Content-Type, so a browser that cached a poisoned
-    octet-stream entry gets a fresh 200 with the healed type instead of
-    being pinned by matching 304s.
+def _resolve_mime_with_sniff(lp: str, data: bytes | None = None,
+                             live_ct: str = "") -> str:
+    """Resolve the MIME type of a cached file from name + content + any CT
+    the live pipeline still knows about.
 
-    Order matters: JS first (its token signatures are the strictest), then
-    CSS, then JSON — a ``var x = {`` head is claimed as JavaScript before
-    the selector heuristic could see ``= {``.
+    Order of authority (strongest first):
+
+      1. magic bytes at offset 0 (wasm/PNG/JPEG/GIF/WEBP/woff2/woff/otf/
+         ttf/mp4) — content can never lie about its container;
+      2. SVG prologue;
+      3. HTML doctype/html tags in the first bytes;
+      4. extension's guess_mime() — trusted UNLESS the extension belongs to
+         the rescue-target family (``.js``/``.css``/``.json`` — the lying
+         extension case) and content checks contradict it with confidence;
+      5. JSON parse / JS token consensus / CSS @-rule+property checks
+         (only for extensionless files);
+      6. application/octet-stream.
+
+    `data` may be a prefix of the file (≥ _SNIFF_HEAD bytes when the caller
+    has them; a shorter slice still works, just with less evidence). When
+    None, the head is read from disk. `live_ct` is the upstream's own
+    Content-Type when available — used only as a tie-breaker between two
+    plausible content types, never to downgrade a magic-byte finding.
+
+    Never-downgrade guarantee: a caller-provided live_ct or extension type
+    is only ever REPLACED by a stronger content finding, and octet-stream
+    (the "unknown" answer) is always replaceable.
     """
-    head = data[:_SNIFF_HEAD]
-    if _looks_like_js(head):
-        return "text/javascript; charset=utf-8"
-    if _looks_like_css(head):
-        return "text/css; charset=utf-8"
-    if _looks_like_json(data):
-        return "application/json"
-    return None
+    ext = os.path.splitext(os.path.basename(lp))[1].lower()
+    looks_html_path = lp.endswith(".html") or lp.endswith("/index.html")
+
+    if data is None:
+        data = _read_head(lp, _SNIFF_HEAD)
+    head = data[:_SNIFF_HEAD] if data else b""
+
+    # 1. magic bytes — the strongest possible evidence.
+    magic = _sniff_magic(head) if head else ""
+    if magic:
+        return magic
+
+    # 2. SVG prologue.
+    if head and _sniff_svg(head):
+        return "image/svg+xml"
+
+    # 3. HTML by content.
+    if head and _s2l_state._is_valid_html(head) \
+            and not _s2l_state._is_wire_payload(head):
+        return "text/html; charset=utf-8"
+
+    # 4. Extension-derived type (the normal, trusted case).
+    ext_ct = ""
+    if ext or looks_html_path:
+        ext_ct = _s2l_state.guess_mime(lp)
+        if looks_html_path:
+            # .html / /index.html — the layout promises HTML unconditionally.
+            return ext_ct
+        base_ct = _s2l_state._ct_base(ext_ct)
+        _trusted = (base_ct.startswith("text/")
+                    or base_ct in _TRUSTED_CT_BASES)
+        if ext not in _RESCUE_TARGET_EXTS and _trusted:
+            # Trusted extension (text/executable/unambiguous binary) —
+            # its answer stands unless magic bytes already said otherwise.
+            return ext_ct
+        # else: rescue-target family (.js/.css/.json lying) OR an OBSCURE
+        # extension (.gl → video/gl, .dyn → application/octet-stream …) —
+        # fall through and let the content speak.
+
+    # From here on we are in rescue territory: extensionless files, or an
+    # extension from the lying family (.js/.css/.json) that content may
+    # contradict.
+    if head:
+        if _sniff_json(head):
+            return "application/json"
+        if _sniff_js(head):
+            return "application/javascript; charset=utf-8"
+        if _sniff_css(head):
+            return "text/css; charset=utf-8"
+
+    # Nothing contradicted the extension — keep its answer (or the live
+    # pipeline's own CT when the extension had nothing to say).
+    if ext_ct and ext_ct != "application/octet-stream":
+        return ext_ct
+    if live_ct:
+        return live_ct
+    return "application/octet-stream"

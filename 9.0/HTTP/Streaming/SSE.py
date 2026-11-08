@@ -167,7 +167,8 @@ def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
     headers["Cache-Control"] = "no-cache, no-transform"
     headers["X-Accel-Buffering"] = "no"   # disable nginx buffering if behind one
     ct = upstream_r.headers.get("Content-Type", "text/event-stream")
-    _s2l_state.log_req(method, 200, urlparse(target).netloc, urlparse(target).path, -1, tag="SSE")
+    _s2l_state.log_req(method, 200, urlparse(target).netloc, urlparse(target).path, -1,
+                       tag="SSE", query=urlparse(target).query)
     return Response(
         _keepalive_injected(),
         status=upstream_r.status_code,

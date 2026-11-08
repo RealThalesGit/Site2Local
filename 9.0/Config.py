@@ -1,11 +1,18 @@
 """User settings. Edit before starting Site2Local."""
 
-# Package version — single source of truth, shown in the boot banner.
-# The 9.x line is the MODULAR tree; the frozen monolith reference (s2l.py)
-# stays at its historical 8.1. Bump here and the banner follows.
-VERSION = "9.0"
+VERSION = "9.0"                 # 9.0 = the "new generation" line:
+                                #        beautified __query__ cache names
+                                #        ([ARQUIVO]_[NOMEQUERY]_[VALOR]) with
+                                #        .q sidecar collision guard, COOP/COEP
+                                #        isolation, unified content-MIME
+                                #        resolver, query strings in the access
+                                #        log — and the legacy migration bridges
+                                #        REMOVED: old-layout caches (pre-9.1 /
+                                #        9.1a / 09/10) are no longer renamed on
+                                #        request; the startup sweep deletes them
+                                #        as unreachable garbage instead.
 
-SITE = "examples.com"   # target domain or URL
+SITE = "jeskojets.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA

@@ -7,6 +7,18 @@ import re
 from ... import Runtime as _s2l_state
 
 
+#: Content-Types that identify a DOCUMENT (not a fragment/subresource).
+#: Callers use this instead of hand-rolling `"text/html" in ct` so XHTML
+#: documents get the same isolation treatment as HTML ones.
+_DOC_CT_MARKERS = ("text/html", "application/xhtml+xml")
+
+
+def _is_document_ct(ct: str) -> bool:
+    """True when this Content-Type marks a navigable HTML/XHTML document."""
+    lc = (ct or "").lower()
+    return any(m in lc for m in _DOC_CT_MARKERS)
+
+
 def _needs_isolation(body: bytes) -> bool:
     """Heuristic: does this HTML look like it needs Cross-Origin isolation?
 
@@ -15,11 +27,14 @@ def _needs_isolation(body: bytes) -> bool:
     or the browser silently refuses to hand them a working SharedArrayBuffer
     — the app initializes just far enough to paint its background/canvas and
     then hangs forever waiting on a threading primitive that was never
-    granted.
+    granted (or throws "The WebAssembly.Memory object cannot be serialized").
     A real, unproxied deployment of such a site sends these headers itself
     (from its own server config); scan for the tell-tale APIs so we can
     reproduce that even when the origin's own header choice didn't survive
-    being fetched through us.
+    being fetched through us, and even when the threading logic itself lives
+    in an external script (the HTML only carries a hint sentence — e.g.
+    aya.nodium.lol's "This page needs cross-origin isolation for
+    multithreaded WebAssembly").
     """
     if not body:
         return False
@@ -28,10 +43,15 @@ def _needs_isolation(body: bytes) -> bool:
     has_atomics = b"atomics.wait" in head
     has_worker = b"new worker(" in head and b"postmessage" in head
     # Some clients explicitly fail startup when cross-origin isolation is off.
+    # Covers both runtime checks (crossOriginIsolated) and the human-facing
+    # hint sentences apps embed ("needs cross-origin isolation…",
+    # "…isolation is required…").
     has_xorigin_check = (
         b"crossoriginisolated" in head
         or b"cross-origin isolation is required" in head
         or b"cross origin isolation is required" in head
+        or b"needs cross-origin isolation" in head
+        or b"multithreaded webassembly" in head
         or (b"coop" in head and b"coep" in head
             and b"cross-origin isolation" in head)
     )
@@ -45,11 +65,16 @@ def _is_worker_request() -> bool:
     """Detect if the current request is fetching a Worker script.
 
     Browsers tag Worker script fetches with `Sec-Fetch-Dest: worker` (classic
-    dedicated worker) or `Sec-Fetch-Dest: sharedworker` (SharedWorker).
-    Module workers also use `Sec-Fetch-Dest: worker`. This is the most
-    reliable "on-demand" signal: when this header is present, we know the
-    page is using Workers and the script response needs COEP for the
-    Worker to inherit `crossOriginIsolated === true` from the parent.
+    dedicated worker), `sharedworker` (SharedWorker) or `serviceworker`.
+    Module workers also use `Sec-Fetch-Dest: worker`. Worklet module loads
+    (`audio-worklet`, `paint-worklet`, `layout-worklet`) follow the same
+    contract — an AudioWorklet that receives a WebAssembly.Memory via
+    postMessage needs the SAME COEP treatment, so they are included here.
+
+    This is the most reliable "on-demand" signal: when this header is
+    present, we know the page is using Workers/Worklets and the script
+    response needs COEP for the context to inherit `crossOriginIsolated
+    === true` from its parent.
 
     Returns False if no Flask request context is active (background threads,
     tests) so callers can safely default to "don't apply".
@@ -58,18 +83,30 @@ def _is_worker_request() -> bool:
         if not flask_request:
             return False
         _dest = (flask_request.headers.get("Sec-Fetch-Dest", "") or "").lower()
-        return _dest in ("worker", "sharedworker", "serviceworker")
+        return _dest in ("worker", "sharedworker", "serviceworker",
+                         "audio-worklet", "audioworklet",
+                         "paint-worklet", "layout-worklet")
     except (RuntimeError, AttributeError):
         return False
 
 
 def _is_document_request() -> bool:
-    """Detect a top-level browser navigation that must establish isolation."""
+    """Detect a browser navigation that must establish (or join) isolation.
+
+    `document` covers top-level navigations. `iframe`/`frame`/`fencedframe`
+    cover embedded document loads: a Worker or an iframe created by an
+    isolated page needs COEP on ITS response to inherit crossOriginIsolated,
+    and an app running inside an iframe (common for embedded players) breaks
+    with the exact same WebAssembly.Memory DOMException when the iframe
+    response is missing the pair — so iframes are treated as documents here.
+    COOP on an iframe response is simply ignored by browsers, sending it is
+    harmless.
+    """
     try:
         if not flask_request:
             return False
         _dest = (flask_request.headers.get("Sec-Fetch-Dest", "") or "").lower()
-        if _dest == "document":
+        if _dest in ("document", "iframe", "frame", "fencedframe"):
             return True
         _mode = (flask_request.headers.get("Sec-Fetch-Mode", "") or "").lower()
         _accept = (flask_request.headers.get("Accept", "") or "").lower()
@@ -78,36 +115,31 @@ def _is_document_request() -> bool:
         return False
 
 
-def _coep_credentialless_supported() -> bool:
-    """True when the browser supports COEP: credentialless (Chromium).
+# Firefox shipped COEP `credentialless` in 119 (Nov 2023). Below that (and on
+# Safari, which never shipped it) we keep `require-corp` — the widely
+# supported value. credentialless preserves cross-origin isolation while
+# allowing anonymous no-CORS third-party assets that cannot be made to send
+# CORP, which cures the NS_ERROR_DOM_CORP_FAILED console flood on sites that
+# load some resources directly from their real CDNs.
+_FIREFOX_VER_RE = re.compile(r"Firefox/(\d+)")
+_CREDENTIALLESS_MIN_FIREFOX = 119
 
-    Firefox and Safari have NOT shipped `credentialless` (MDN, dez/2025) —
-    for them COEP only has the `require-corp` flavor, which hard-blocks
-    every cross-origin no-CORS subresource whose response lacks a CORP
-    header. The proxy rewrites and proxies the vast majority of URLs, but
-    a runtime-constructed URL can still slip past every patch (template
-    literals like `https://cdn/icons/${name}.svg`, CSS custom properties
-    with url(), imgs inserted via innerHTML before the MutationObserver
-    microtask fires). On Chromium those escapees still load under
-    `credentialless`; on Firefox/Safari they die with
-    NS_ERROR_DOM_CORP_FAILED. Callers use this to decide whether the
-    blanket document-navigation isolation is safe.
 
-    Detection mirrors _coep_value(): CriOS is excluded because iOS
-    Chrome is WebKit underneath — no credentialless there either.
-    """
+def _coep_value() -> str:
+    """Use credentialless on Chromium and modern Firefox; require-corp else."""
     try:
         ua = (flask_request.headers.get("User-Agent", "") or "")
     except (RuntimeError, AttributeError):
         ua = ""
-    return ("CriOS/" not in ua
-            and bool(re.search(r"(?:Chrome|Chromium|Edg|OPR)/", ua, re.I)))
-
-
-def _coep_value() -> str:
-    """Use credentialless on Chromium so anonymous third-party assets can load."""
-    if _coep_credentialless_supported():
+    if "CriOS/" not in ua and re.search(r"(?:Chrome|Chromium|Edg|OPR)/", ua, re.I):
         return "credentialless"
+    m = _FIREFOX_VER_RE.search(ua)
+    if m:
+        try:
+            if int(m.group(1)) >= _CREDENTIALLESS_MIN_FIREFOX:
+                return "credentialless"
+        except ValueError:
+            pass
     return "require-corp"
 
 
@@ -118,20 +150,22 @@ def _apply_isolation_headers(out, body: bytes = b"",
 
     Two paths trigger isolation:
 
-      1. Top-level HTML document navigations. Runtime isolation checks are
+      1. Top-level HTML document navigations (including iframe document
+         loads — see _is_document_request). Runtime isolation checks are
          often in a separately loaded script and absent from cached HTML.
 
-      2. Worker script responses — detected via the `is_worker_script`
-         parameter, set by callers that inspect Sec-Fetch-Dest: worker.
-         Whenever the browser fetches a Worker script, we know the page
-         is using Workers and the script needs COEP for the Worker to
-         inherit crossOriginIsolated from the parent. Sites that don't
-         use Workers pay zero overhead.
+      2. Worker/Worklet script responses — detected via the
+         `is_worker_script` parameter, set by callers that inspect
+         Sec-Fetch-Dest. Whenever the browser fetches a Worker script, we
+         know the page is using Workers and the script needs COEP for the
+         Worker to inherit crossOriginIsolated from its parent. Sites that
+         don't use Workers pay zero overhead.
 
-    Chromium uses COEP `credentialless`: it preserves cross-origin isolation
-    while allowing anonymous cross-origin no-CORS assets that cannot be made
-    to send CORP (for example, third-party SDK scripts). Other browsers retain
-    the broadly supported `require-corp` policy.
+    Chromium and Firefox ≥119 use COEP `credentialless`: it preserves
+    cross-origin isolation while allowing anonymous cross-origin no-CORS
+    assets that cannot be made to send CORP (for example, third-party SDK
+    scripts). Other browsers retain the broadly supported `require-corp`
+    policy.
 
     Idempotent — responses that need isolation receive the complete,
     compatible pair even if the origin supplied only one header or supplied
@@ -141,22 +175,11 @@ def _apply_isolation_headers(out, body: bytes = b"",
     (online filter_resp, cache-hit _cached_response, _make_flask_resp
     safety net, _stream_resp, CDN mini-server, ext_asset route).
     """
-    # Document navigations get the pair — but ONLY on Chromium: browsers
-    # without COEP credentialless (Firefox/Safari) hard-block every
-    # cross-origin no-CORS subresource that escapes the proxy while the
-    # document is require-corp (NS_ERROR_DOM_CORP_FAILED in Firefox), and
-    # no rewriter can guarantee 100% of runtime-constructed URLs pass
-    # through us (template literals, CSS custom properties with url(),
-    # imgs inserted via innerHTML before the observer microtask fires).
-    # There, isolation is granted only when the page's own body asks for
-    # it — the same posture as the real site (most send no COEP at all).
-    # Body inspection remains a fallback for HTML responses in clients
-    # without Fetch Metadata headers.
-    _blanket_ok = _coep_credentialless_supported()
+    # Document navigations always get the pair. Body inspection remains a
+    # fallback for HTML responses in clients without Fetch Metadata headers.
     _html_needs_isolation = bool(
         is_top_level_html
-        and ((_s2l_state._is_document_request() and _blanket_ok)
-             or (body and _s2l_state._needs_isolation(body))))
+        and (_s2l_state._is_document_request() or (body and _needs_isolation(body))))
     # Worker responses need COEP so the Worker can inherit
     # crossOriginIsolated from its parent.
     _should_apply = _html_needs_isolation or is_worker_script

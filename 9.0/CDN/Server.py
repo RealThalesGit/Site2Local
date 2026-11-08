@@ -81,16 +81,22 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
         # should still be served when offline.
         lp = _s2l_state.local_path(cdn_url)
         if method in _s2l_state._SAFE_METHODS and (_s2l_state.CACHE_CDN or _s2l_state.OFFLINE) and os.path.isfile(lp):
-            _c304 = _s2l_state._conditional_304(
-                lp, _s2l_state._js_mime_rescue(_s2l_state._resolve_mime_with_sniff(lp), lp))
+            # Range requests on a cache hit MUST get 206 Partial Content —
+            # a full 200 stalls/loops HTML5 <video>/<audio> (shared seam
+            # _serve_range_from_disk, same rule as the main proxy).
+            if flask_request.headers.get("Range", ""):
+                _rng_c = _s2l_state._serve_range_from_disk(lp, cdn_url, method, "/" + p.lstrip("/"))
+                if _rng_c is not None:
+                    return _rng_c
+            _c304 = _s2l_state._conditional_304(lp, _s2l_state._resolve_mime_with_sniff(lp))
             if _c304 is not None:
                 _s2l_state.stats.inc("cache_304")
-                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT 304 {_s2l_state._fmt_host(cdn_host)}/{p}", "CDN")
+                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT 304 {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)}", "CDN")
                 return _c304
             result = _s2l_state._serve_cached(lp)
             if result is not None:
                 data, ct = result
-                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT {_s2l_state._fmt_host(cdn_host)}/{p} {_s2l_state._fmt_size(len(data))}", "CDN")
+                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} {_s2l_state._fmt_size(len(data))}", "CDN")
                 resp = Response(data, content_type=ct)
                 if ct.startswith("text/html") or "json" in ct:
                     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -107,7 +113,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 return resp
 
         if _s2l_state.OFFLINE:
-            _s2l_state.log(f"CDN {method} 404 {_s2l_state._fmt_host(cdn_host)}/{p} (not cached)", "CDN")
+            _s2l_state.log(f"CDN {method} 404 {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} (not cached)", "CDN")
             return Response("Offline", status=404)
 
         # Forward request to real CDN (all methods, including POST/PUT for uploads)
@@ -181,10 +187,6 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             ct   = _s2l_state._ensure_wasm_content_type(
                 r.headers.get("Content-Type", "application/octet-stream"),
                 "/" + p.lstrip("/"))
-            # Correção 5 — upstream CT can be missing/lying on exotic-extension
-            # URLs; the decompressed head is already in hand, so the JS content
-            # rescue costs nothing and keeps first-visit serves executable too.
-            ct = _s2l_state._js_mime_rescue(ct, "/" + p.lstrip("/"), body[:512] if body else None)
             # Empty-body recovery: curl_cffi's HTTP/2 mode sometimes returns
             # empty content for small images/avatars on CDN hosts. Without
             # this, the browser gets a 200 with 0 bytes — a "phantom" image
@@ -222,13 +224,8 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if r.status_code == 200 and body and method in _s2l_state._SAFE_METHODS and _s2l_state.CACHE_CDN:
                 _s2l_state.save_queue.put((cdn_url, body, ct, _s2l_state._effective_device()))
                 _s2l_state.stats.inc("cdn_fetched")
-            out_headers = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(r))
-            # CORS + CORP are already set correctly by filter_resp() — including
-            # the concrete Access-Control-Expose-Headers list for credentialed
-            # requests. Do NOT re-set them here: a bare `Access-Control-Expose-
-            # Headers: "*"` would overwrite the concrete list and break
-            # credentialed cross-origin fetches that read Authorization /
-            # Content-Encoding / etc. (opaque "CORS error" in the console).
+            out_headers = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(r), body,
+                                        is_top_level_html=_s2l_state._is_document_ct(ct))
             if method in _s2l_state._SAFE_METHODS:
                 _s2l_state._apply_freshness(out_headers, ct)
             # Rewrite URLs inside CDN HTML/CSS pages so their sub-resources also load
@@ -258,7 +255,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             if _s2l_state.CAPTURE and _s2l_state.CAPTURE_CDN:
                 _s2l_state._maybe_capture(ctx)
 
-            _s2l_state.log(f"{method} {ctx.resp_status} {_s2l_state._fmt_host(cdn_host)}/{p} {_s2l_state._fmt_size(len(ctx.resp_body))} :{port}", "CDN")
+            _s2l_state.log(f"{method} {ctx.resp_status} {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} {_s2l_state._fmt_size(len(ctx.resp_body))} :{port}", "CDN")
             _s2l_state._gui_push_raw(method, f"/{p}", ctx.resp_status, ctx.resp_ct, ctx.resp_body,
                           display_tag=f"[CDN:{port}]", origin=_s2l_state._fmt_host(cdn_host),
                           _skip_log=True)
