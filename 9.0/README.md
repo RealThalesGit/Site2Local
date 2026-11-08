@@ -20,10 +20,13 @@ It's accessible in [here!](https://github.com/RealThalesGit/Site2Local/blob/main
 - **Content-based MIME rescue**: scripts behind exotic extensions (like `globe.gl`, which the stdlib types as `video/gl`) are sniffed and served as `text/javascript`, with self-healing ETags that un-poison browsers which already cached the wrong type.
 - **Extensionless cache MIME rescue**: files cached without a path extension (query-only URLs like Google Fonts' `css2?family=Montserrat`) are content-sniffed too — a cached stylesheet now serves as `text/css` instead of `application/octet-stream`, which browsers with `nosniff` used to reject with `NS_ERROR_CORRUPTED_CONTENT` on every reload (it worked on the first visit, then never again). JSON APIs cached at extensionless paths stopped the purge-and-refetch loop.
 
-## 9.0 Directory Structure
+## Repository layout — ONE folder
+
+The repo root **is** the package: everything lives inside a single
+`Site2Local/` folder — code, the monolith reference, launcher, docs.
 
 ```
-9.0/
+Site2Local/
 ├── Boot.py             ← run with python3 Site2Local/Boot.py (simple launcher)
 ├── s2l.py              ← the original monolith (13.7k lines) — still runs standalone
 ├── Config.py           ← user settings (edit before starting)
@@ -56,13 +59,13 @@ from inside the folder.
 ```bash
 pip install -r Site2Local/requirements.txt   # core only (flask, requests, bs4, colorama)
 
-python3 9.0/Boot.py          # ← the simple way (from the parent folder)
-cd 9.0 && python3 Boot.py    # same thing, from inside
+python3 Site2Local/Boot.py          # ← the simple way (from the parent folder)
+cd Site2Local && python3 Boot.py    # same thing, from inside
 python -m Site2Local                # equivalent (from the parent folder)
-python 9.0/s2l.py            # the monolith (reference / comparison)
+python Site2Local/s2l.py            # the monolith (reference / comparison)
 ```
 
-`Boot.py` (and `python -m Site2Local`) `cd`s into the `9.0` folder
+`Boot.py` (and `python -m Site2Local`) `cd`s into the `Site2Local` folder
 before starting, so the mirror (`site_src/`), metadata (`site_data/`) and
 wordlists always land **inside that same folder**, no matter where you
 invoke it from.
@@ -72,7 +75,7 @@ Optional packages (each unlocks a feature — see the comments inside
 (fallback bypass), `brotli`, `wafw00f`, `tqdm` (SCAN_PATHS progress bar) and
 `PyQt6` (HOOK_GUI traffic inspector).
 
-Before starting, edit `9.0/Config.py`: `SITE` is the target, plus
+Before starting, edit `Site2Local/Config.py`: `SITE` is the target, plus
 flags like `CRAWL`, `OFFLINE`, `PROXY_CDN`, `HOOK_GUI`, `RAINBOW_LOGS`.
 
 ## What i can change on it?
