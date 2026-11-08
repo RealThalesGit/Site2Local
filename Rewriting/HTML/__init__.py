@@ -10,6 +10,7 @@ from .Policy import (
 )
 from .URLs import (
     _rewrite_ext_urls,
+    rewrite_doc_relative,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "_inject_sw_clear",
     "_is_dont_rewrite_host",
     "_rewrite_ext_urls",
+    "rewrite_doc_relative",
 ]

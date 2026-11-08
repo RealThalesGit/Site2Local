@@ -69,6 +69,15 @@ def ext_asset(extpath: str) -> Response:
         result = _s2l_state._serve_cached(lp)
         if result is not None:
             data, ct = result
+            # Fix 17 — the root-relative pass on cache HITs: _serve_cached
+            # already applied the absolute-URL passes, but root-relative
+            # URLs need THIS route's host to resolve — without this they'd
+            # land on the main-site route (404 JSON + nosniff → the browser
+            # drops the resource with a MIME mismatch).
+            _ctb_e = ct.split(";")[0].strip().lower()
+            if _s2l_state.PROXY_CDN and ("text/html" in _ctb_e or "text/css" in _ctb_e):
+                data = _s2l_state.rewrite_doc_relative(
+                    data, ext_host, html_doc=("text/html" in _ctb_e))
             _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} [EXT] {method} HIT {_s2l_state._fmt_host(ext_host)}{_s2l_state._fmt_path_qs(ext_path, qs)} {_s2l_state._fmt_size(len(data))}", "CDN")
             _s2l_state._gui_push_raw("GET", ext_path, 200, ct, data,
                           display_tag="[CDN] [←] [EXT]", origin=ext_host, _skip_log=True)
@@ -173,10 +182,14 @@ def ext_asset(extpath: str) -> Response:
                 body = _s2l_state._rewrite_ext_urls(body, html_doc=True)
                 body = _s2l_state.rewrite_abs_urls(body)
                 body = _s2l_state._inject_sw_clear(body)
+                # Fix 17 — root-relative URLs resolve against THIS document's
+                # host, not the proxy origin (Discord widget /assets/* case).
+                body = _s2l_state.rewrite_doc_relative(body, ext_host, html_doc=True)
                 out_headers.pop("content-length", None)
                 out_headers.pop("Content-Length", None)
             elif "text/css" in _ct_base_e:
                 body = _s2l_state._rewrite_ext_urls(body, html_doc=False)
+                body = _s2l_state.rewrite_doc_relative(body, ext_host, html_doc=False)
                 out_headers.pop("content-length", None)
                 out_headers.pop("Content-Length", None)
             elif "json" in _ct_base_e:

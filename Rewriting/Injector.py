@@ -100,7 +100,15 @@ def _build_s2l_injector() -> bytes:
           '}'
           'if(p.host===M||p.host==="www."+M)return PX+p.pathname+(p.search||"")+(p.hash||"");'
           'if(HP[p.host]>0)return "http://"+proxyHost+":"+HP[p.host]+p.pathname+(p.search||"")+(p.hash||"");'
-          'if(p.protocol==="https:"&&p.hostname!==proxyHost)return PX+EXT+"/"+p.host+p.pathname+(p.search||"")+(p.hash||"");'
+          # Fix 18 — plain-HTTP absolute URLs of third-party hosts used to
+          # fall through untouched (https-only branch). The Discord widget
+          # XHRs "http://discord.com/api/guilds/…/widget.json" — same-origin
+          # on the real site, but in the mirror the iframe origin is the
+          # proxy, so the request went DIRECT to the real host and died on
+          # CORS (no ACAO header — it never needed one). Route http: exactly
+          # like https: through the EXT catch-all (which always fetches the
+          # upstream over https anyway).
+          'if((p.protocol==="https:"||p.protocol==="http:")&&p.hostname!==proxyHost)return PX+EXT+"/"+p.host+p.pathname+(p.search||"")+(p.hash||"");'
           '}catch(e){}return u;}'
           'try{var _f=self.fetch;if(_f)self.fetch=function(i,o){'
             'if(typeof i==="string")i=rw(i);'

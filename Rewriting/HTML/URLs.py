@@ -336,3 +336,86 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
         html = html.replace(f"\x00S2LSTYLE{_i}\x00", _body)
 
     return html.encode("utf-8")
+
+
+def rewrite_doc_relative(data: bytes, doc_host: str, html_doc: bool = True) -> bytes:
+    """Rewrite ROOT-RELATIVE URLs in a document served from an EXTERNAL origin.
+
+    A document fetched through /__s2l_ext__/<host>/… (or a MULTIPORT
+    mini-server) has its *origin* moved to the proxy, so a root-relative
+    reference like href="/assets/app.css" — which the real site resolves
+    against the DOCUMENT's own host — silently changes meaning in the
+    mirror: the browser resolves it against the proxy origin and it lands
+    on the MAIN site route (typically its 404 JSON body, served with
+    nosniff → the browser logs a MIME mismatch and drops the resource).
+    The Discord.com widget is the canonical case: its HTML ships
+    <link href="/assets/…css"> / <script src="/assets/…js"> and its CSS
+    ships url(/assets/…woff2) — all root-relative.
+
+    This pass re-points those URLs at the document's own host through
+    _proxy_target (dedicated MULTIPORT port when registered, the catch-all
+    __s2l_ext__ prefix otherwise). Only genuine root-relative values are
+    touched:
+
+      html_doc=True  → src/href/poster/data-src/data-href/action attribute
+                       values + srcset candidates
+      html_doc=False → standalone-CSS url() tokens
+
+    Protocol-relative (//host) values are left for the absolute passes;
+    already-proxied values are skipped (_proxy_target's idempotency guard
+    plus the (?!/) exclusion); a doc_host under DONT_REWRITE disables the
+    pass entirely — its resources go DIRECT from the browser by contract.
+    """
+    if (not _s2l_state.PROXY_CDN or not data or not doc_host
+            or _s2l_state._is_dont_rewrite_host(doc_host)):
+        return data
+    try:
+        text = data.decode("utf-8", "ignore")
+    except Exception:
+        return data
+
+    if html_doc:
+        def _attr_root(m: re.Match) -> str:
+            r = _s2l_state._proxy_target(doc_host, m.group(3))
+            if not r:
+                return m.group(0)
+            return f"{m.group(1)}{m.group(2)}{r}{m.group(4)}"
+        # (?!/) excludes protocol-relative //host values — those belong to
+        # the absolute passes. [^"'<>]* spans the value up to the closing
+        # quote, keeping any query string / fragment intact.
+        text = re.sub(
+            r'((?<![A-Za-z0-9_$.])(?:src|href|poster|data-src|data-href|action)\s*=\s*)(["\'])(/(?!/)[^"\'<>]*)(["\'])',
+            _attr_root, text, flags=re.IGNORECASE)
+
+        def _ss_root(m: re.Match) -> str:
+            parts = []
+            for e in re.split(r',\s+', m.group(2).strip()):
+                e = e.strip()
+                if not e:
+                    continue
+                bits = e.split(None, 1)
+                url, desc = bits[0], ((" " + bits[1]) if len(bits) > 1 else "")
+                if url.startswith("/") and not url.startswith("//"):
+                    r = _s2l_state._proxy_target(doc_host, url)
+                    if r:
+                        url = r
+                parts.append(url + desc)
+            return m.group(1) + ", ".join(parts) + m.group(3)
+        text = re.sub(r'(srcset\s*=\s*["\'])([^"\']+)(["\'])',
+                      _ss_root, text, flags=re.IGNORECASE)
+    else:
+        def _css_root_q(m: re.Match) -> str:
+            r = _s2l_state._proxy_target(doc_host, m.group(2))
+            return f'url("{r}")' if r else m.group(0)
+        text = re.sub(
+            r'url\(\s*(["\'])(/(?!/)[^"\']*)\1\s*\)',
+            _css_root_q, text, flags=re.IGNORECASE)
+
+        def _css_root_u(m: re.Match) -> str:
+            r = _s2l_state._proxy_target(doc_host, m.group(1))
+            return f'url("{r}")' if r else m.group(0)
+        text = re.sub(
+            r'url\(\s*(/(?!/)[^()\s]*)\s*\)',
+            _css_root_u, text, flags=re.IGNORECASE)
+
+    return text.encode("utf-8")

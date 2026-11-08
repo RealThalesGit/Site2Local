@@ -95,6 +95,13 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             result = _s2l_state._serve_cached(lp)
             if result is not None:
                 data, ct = result
+                # Fix 17 — the root-relative pass on cache HITs (same rule as
+                # ext_asset): root-relative URLs need THIS mini-server's host
+                # to resolve, or they land on the main-site route.
+                _ctb_c = ct.split(";")[0].strip().lower()
+                if _s2l_state.PROXY_CDN and ("text/html" in _ctb_c or "text/css" in _ctb_c):
+                    data = _s2l_state.rewrite_doc_relative(
+                        data, cdn_host, html_doc=("text/html" in _ctb_c))
                 _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} {_s2l_state._fmt_size(len(data))}", "CDN")
                 resp = Response(data, content_type=ct)
                 if ct.startswith("text/html") or "json" in ct:
@@ -235,10 +242,14 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                     body = _s2l_state._rewrite_ext_urls(body, html_doc=True)
                     body = _s2l_state.rewrite_abs_urls(body)
                     body = _s2l_state._inject_sw_clear(body)
+                    # Fix 17 — root-relative URLs resolve against THIS
+                    # document's host (Discord widget /assets/* case).
+                    body = _s2l_state.rewrite_doc_relative(body, cdn_host, html_doc=True)
                     out_headers.pop("content-length", None)
                     out_headers.pop("Content-Length", None)
                 elif "text/css" in _ct_base_c:
                     body = _s2l_state._rewrite_ext_urls(body, html_doc=False)
+                    body = _s2l_state.rewrite_doc_relative(body, cdn_host, html_doc=False)
                     out_headers.pop("content-length", None)
                     out_headers.pop("Content-Length", None)
                 elif "json" in _ct_base_c:

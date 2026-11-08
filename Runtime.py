@@ -1372,6 +1372,7 @@ from .Rewriting.HTML import (
     _inject_sw_clear,
     _is_dont_rewrite_host,
     _rewrite_ext_urls,
+    rewrite_doc_relative,
 )
 from .Rewriting.JSON import (
     _rewrite_json_urls,
