@@ -236,6 +236,18 @@ so the sweep can never delete anything servable.
   tree, all 41 dead-code-scan candidates verified alive (including the
   three newest: `_SIZE_RE`/`_SIZE_UNITS` from Fix 12 and `_pool_slots`),
   and the frozen monolith's own legacy code stays untouched by design.
+- **Fix 16** — universal-default pass (the "remove everything site-specific"
+  request): the whole-tree audit found exactly ONE functional site-specific
+  line — `Config.py`'s `SITE = "jeskojets.com"`. Now `SITE = "example.com"`
+  (RFC 2606 §3 reserved domain; identical to the frozen s2l.py monolith's
+  own default, so both flavors ship the same neutral target). Everything
+  else that mentions real domains is universal machinery, not site config:
+  WAF/bot-gate markers (`ddos-guard.net`, `challenges.cloudflare.com`,
+  hcaptcha/reCAPTCHA paths), DONT_REWRITE suffix-match examples in
+  comments, and aya.nodium.lol citations kept as fix-provenance docs.
+  The dev batteries no longer string-replace the old default — each
+  injects its test host with a regex over the SITE assignment itself, so
+  a future default change can never silently turn the patch into a no-op.
 - **9.0 cleanup (the "new generation" cut)** — migration machinery removed
   (`Legacy.py`, `Migration.py`, `_migration_checked` state, frozen 9.1a
   formula, 09/10 lossy sanitizer); unreachable legacy caches swept at

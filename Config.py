@@ -53,7 +53,7 @@ VERSION = "9.0"                 # 9.0 = the "new generation" line:
                                 #        request; the startup sweep deletes them
                                 #        as unreachable garbage instead.
 
-SITE = "jeskojets.com"   # target domain or URL
+SITE = "example.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
