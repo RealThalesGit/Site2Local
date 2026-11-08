@@ -6,7 +6,7 @@ concatenation inside `_build_s2l_injector` in the s2l.py monolith, lines
 reads (`hp`, `_dr_regex_js`) became parameters — every string literal,
 comment and json.dumps call below is byte-identical to the monolith.
 
-Deliberate post-match deltas (documented in MAPA_MODULAR.md, "Correções
+Deliberate post-match deltas (documented in MODULAR_MAP.md, "Correções
 pós-match"): 3b — CSSStyleDeclaration.setProperty patch (bloco CSS);
 4 — the live HP poll MIRRORS the server map (add + update + remove)
 instead of only adding missing hosts.

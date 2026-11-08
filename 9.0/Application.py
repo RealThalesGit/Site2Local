@@ -29,7 +29,7 @@ def create_app(app: Flask | None = None) -> Flask:
     app.add_url_rule(f'{state._EXT_PREFIX}/<path:extpath>', view_func=state.ext_asset,
                      methods=state._ALL_METHODS)
     # Rule var names mirror the monolith verbatim (wspath/tcppath/udppath,
-    # while the views sign _wspath/_tcppath/_udppath — see MAPA_MODULAR §6:
+    # while the views sign _wspath/_tcppath/_udppath — see MODULAR_MAP §6:
     # replicated quirk; opening these URLs in a plain browser tab 500s in
     # the monolith and must 500 here too during the match phase).
     app.add_url_rule('/__s2l_ws_ext__/<path:wspath>', view_func=state.ws_ext, methods=['GET'])

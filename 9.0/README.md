@@ -5,18 +5,25 @@ A **Vibe-coded** python project which makes a existent website running on localh
 
 > **WARNING: This tool is being constantly updated and it is still in "W.I.P", expect errors, missing things and garbage.**
 
-> **This is V9.0 — the modularized version of site2local.** The monolith `s2l.py` (frozen at 8.1) is kept at the repo root as the reference for the match-based modularization (see `MAPA_MODULAR.md`). The version lives in `Config.VERSION`.
+> **This is V9.0 — the modularized version of site2local.** The monolith `s2l.py` (frozen at 8.1) is kept at the repo root as the reference for the match-based modularization (see `MODULAR_MAP.md`). The version lives in `Config.VERSION`.
 
 # Documentary
 It's accessible in [here!](https://github.com/RealThalesGit/Site2Local/blob/main/DOCUMENTARY.md)
 
-## Repository layout — ONE folder
+## What's new in 9.0?
 
-The repo root **is** the package: everything lives inside a single
-`Site2Local/` folder — code, the monolith reference, launcher, docs.
+- **Modularized!** The 13.7k-line single file became ~100 small modules under one folder, migrated symbol-by-symbol with a zero-diff match. The monolith `s2l.py` stays frozen at 8.1 as the reference, and `MODULAR_MAP.md` documents every symbol → line mapping plus the full parity audit (config 27/27, routes 10/10, smoke 9/9, 0 symbols lost).
+- **Device-profile cache revalidation**: change `DEVICE` between boots and every cached HTML page is re-fetched once with the new profile — no more phone layout stuck on your desktop mirror.
+- **Coherent client hints**: explicit device profiles now send the matching `Sec-CH-UA*` headers, so hint-first backends can't override the profile you picked.
+- **Firefox/Safari fix**: cross-origin isolation (COOP/COEP) is now browser-aware — no more `NS_ERROR_DOM_CORP_FAILED` on images when you open a game in Firefox.
+- **CSS custom properties with `url(...)` are rewritten too** (`setProperty` patch in the injector), so icons defined like `--icon-src: url(https://cdn/x.svg)` load from your local CDN port instead of the real one.
+- **Content-based MIME rescue**: scripts behind exotic extensions (like `globe.gl`, which the stdlib types as `video/gl`) are sniffed and served as `text/javascript`, with self-healing ETags that un-poison browsers which already cached the wrong type.
+- **Extensionless cache MIME rescue**: files cached without a path extension (query-only URLs like Google Fonts' `css2?family=Montserrat`) are content-sniffed too — a cached stylesheet now serves as `text/css` instead of `application/octet-stream`, which browsers with `nosniff` used to reject with `NS_ERROR_CORRUPTED_CONTENT` on every reload (it worked on the first visit, then never again). JSON APIs cached at extensionless paths stopped the purge-and-refetch loop.
+
+## 9.0 Directory Structure
 
 ```
-Site2Local/
+9.0/
 ├── Boot.py             ← run with python3 Site2Local/Boot.py (simple launcher)
 ├── s2l.py              ← the original monolith (13.7k lines) — still runs standalone
 ├── Config.py           ← user settings (edit before starting)
@@ -34,7 +41,7 @@ Site2Local/
 ├── Viewers/            ← web viewers (CDN dashboard, stats, health)
 ├── Network/            ← WSGI server + TCP/UDP tunnels
 ├── CLI/                ← the startup banner
-├── MAPA_MODULAR.md     ← symbol-level map: modular tree ↔ s2l.py line numbers
+├── MODULAR_MAP.md      ← symbol-level map: modular tree ↔ s2l.py line numbers
 ├── requirements.txt
 └── .gitignore
 ```
@@ -49,13 +56,13 @@ from inside the folder.
 ```bash
 pip install -r Site2Local/requirements.txt   # core only (flask, requests, bs4, colorama)
 
-python3 Site2Local/Boot.py          # ← the simple way (from the parent folder)
-cd Site2Local && python3 Boot.py    # same thing, from inside
+python3 9.0/Boot.py          # ← the simple way (from the parent folder)
+cd 9.0 && python3 Boot.py    # same thing, from inside
 python -m Site2Local                # equivalent (from the parent folder)
-python Site2Local/s2l.py            # the monolith (reference / comparison)
+python 9.0/s2l.py            # the monolith (reference / comparison)
 ```
 
-`Boot.py` (and `python -m Site2Local`) `cd`s into the `Site2Local` folder
+`Boot.py` (and `python -m Site2Local`) `cd`s into the `9.0` folder
 before starting, so the mirror (`site_src/`), metadata (`site_data/`) and
 wordlists always land **inside that same folder**, no matter where you
 invoke it from.
@@ -65,16 +72,16 @@ Optional packages (each unlocks a feature — see the comments inside
 (fallback bypass), `brotli`, `wafw00f`, `tqdm` (SCAN_PATHS progress bar) and
 `PyQt6` (HOOK_GUI traffic inspector).
 
-Before starting, edit `Site2Local/Config.py`: `SITE` is the target, plus
+Before starting, edit `9.0/Config.py`: `SITE` is the target, plus
 flags like `CRAWL`, `OFFLINE`, `PROXY_CDN`, `HOOK_GUI`, `RAINBOW_LOGS`.
 
 ## What i can change on it?
-You can change if you want or don't want to use the "dump all" (only avaliable in 7.0-8.0), you can enable or disable crawling (if you have already crawled the site, or you want crawling in demand only) 
+You can change if you want or don't want to use the "dump all" (`DUMP_ALL` — it extracts and crawls every URL found in any response body), you can enable or disable crawling (if you have already crawled the site, or you want crawling in demand only), and you can go full `OFFLINE` (serve the disk mirror only, zero upstream requests).
 
-Change headers to mobile, tablet, desktop, macintosh, ie11, iphone, ipad, symbian, and bot. 
+Change headers to mobile, tablet, desktop, macintosh, ie11, iphone, ipad, symbian, and bot (or leave `auto` to mirror the UA of whoever is visiting your mirror). 
 When you change DEVICE and restart, cached pages are re-fetched from the site once automatically, so you never get stuck serving the layout of the previous profile (site assets stay cached — only HTML documents refresh).
 
-Optional thing is that also you can enable rainbow logs (It will use lolcat if your system has it, but make sure to install lolcat before!), and there is so much others you can do.
+Optional thing is that also you can enable rainbow logs (It will use lolcat if your system has it, but make sure to install lolcat before!), and there is so much others you can do — the hidden-path scanner (`SCAN_PATHS`), traffic capture (`CAPTURE` / `CAPTURE_WS`), the PyQt6 hook GUI (`HOOK_GUI`), `SHOW_HIDDEN` to un-hide display:none elements...
 
 ## What i shouldn't do with it?
 This tool is not and was never made to create malicious and phishing websites, so don't make me the villain of the history, use it only for yourself, but if you want to host a website that use this tool, please, just try to not make the website literally identical to the original one if you are going to host something that use this tool, and here's the warning again, dont use it for malicious purposes, the traffic hook system/gui only affects your side (client-side), it does not affect the "server-side" part of the website, if it doesn't have an security failure;

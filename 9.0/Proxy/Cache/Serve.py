@@ -26,13 +26,15 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
       and for HTML stored before the 09/10 rename) — treated as HTML.
     * No-extension paths (the 09/10 layout for "binary endpoint + query"
       URLs such as ``/v1/asset?id=N`` → ``host/v1/asset/id=N``) — the
-      on-disk path gives no MIME hint, so we sniff the bytes:
-      real HTML is served as ``text/html`` (and gets the full HTML
-      rewrite + runtime injection pipeline); everything else is served
-      verbatim as ``application/octet-stream``. This is the safest
-      fallback for binary endpoints — the JS consumer reads the raw
-      bytes and parses them according to its own logic, not the
-      Content-Type.
+      on-disk path gives no MIME hint, so we sniff the bytes: real HTML is
+      served as ``text/html``; CSS/JS/JSON bodies are rescued by content
+      too (correção 6 — an extensionless stylesheet must never ship as
+      ``application/octet-stream``: with the universal nosniff hardening
+      that is a refused stylesheet, ``NS_ERROR_CORRUPTED_CONTENT`` on
+      Firefox); everything else is served verbatim as
+      ``application/octet-stream``. This is the safest fallback for binary
+      endpoints — the JS consumer reads the raw bytes and parses them
+      according to its own logic, not the Content-Type.
     * Any other extension (``.js``, ``.css``, ``.json``, ``.wasm`` …) —
       MIME resolved by ``guess_mime()`` from the extension, with
       URL-rewrite passes applied for CSS and JSON.
@@ -47,15 +49,42 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
     has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
 
     if not has_ext and not looks_html:
-        # No-extension file (the new "asset/?id=N" layout).
-        # Spec: identify HTML by content; rest → octet-stream.
+        # No-extension file (the "asset/?id=N" and "css2?family=…" layouts).
+        # HTML: identified by content (spec). Correção 6: CSS/JS/JSON are
+        # content-sniffed too — the extensionless css2 stylesheet used to
+        # ship as application/octet-stream, and with nosniff that is a
+        # browser-refused stylesheet: NS_ERROR_CORRUPTED_CONTENT on Firefox,
+        # MIME refusal on Chrome — the classic "works on first visit (live,
+        # upstream CT), breaks on every reload (cache hit)" pattern.
         if _s2l_state._is_valid_html(data) and not _s2l_state._is_wire_payload(data):
             looks_html = True
         else:
-            return data, "application/octet-stream"
+            ct = _s2l_state._sniff_nonhtml_type(data) or "application/octet-stream"
+            # Same rewrite passes as the extensioned branches below, so a
+            # sniffed stylesheet keeps its url(...) sub-resources on the
+            # local CDN ports and a sniffed JSON keeps its URLs proxied.
+            if _s2l_state.PROXY_CDN and "css" in ct:
+                data = _s2l_state._rewrite_ext_urls(data, html_doc=False)
+            elif _s2l_state.PROXY_CDN and "json" in ct:
+                data = _s2l_state._rewrite_json_urls(data)
+            return data, ct
 
     if looks_html:
         if _s2l_state._is_wire_payload(data) or not _s2l_state._is_valid_html(data):
+            # Correção 6b — plain CSS/JS/JSON bodies cached at an index.html
+            # path (no-query, no-extension endpoints such as /api/v1/listings):
+            # serve them with their real content type instead of the
+            # purge-and-refetch loop that re-downloaded the body from the
+            # upstream on every request ("Stale RSC cache — purging" on each
+            # reload). Wire payloads and true junk keep the old behavior.
+            if not _s2l_state._is_wire_payload(data):
+                _sniff_ct = _s2l_state._sniff_nonhtml_type(data)
+                if _sniff_ct is not None:
+                    if _s2l_state.PROXY_CDN and "css" in _sniff_ct:
+                        data = _s2l_state._rewrite_ext_urls(data, html_doc=False)
+                    elif _s2l_state.PROXY_CDN and "json" in _sniff_ct:
+                        data = _s2l_state._rewrite_json_urls(data)
+                    return data, _sniff_ct
             # OFFLINE: never destroy irreplaceable cache — serve what we have
             # rather than permanently 404'ing the resource for the rest of the
             # session. In online mode, purging lets us re-fetch a clean copy.
@@ -129,7 +158,7 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
     else:
         try:
             with open(lp, "rb") as _hf:
-                _head = _hf.read(512)
+                _head = _hf.read(_s2l_state._SNIFF_HEAD)
         except OSError:
             return None
         _probe_ct = _s2l_state._js_mime_rescue(

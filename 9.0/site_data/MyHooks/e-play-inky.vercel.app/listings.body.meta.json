@@ -1,0 +1,8 @@
+{
+  "name": "listings",
+  "method": "GET",
+  "status": 200,
+  "pattern": "/api/v1/listings",
+  "origin_url": "e-play-inky.vercel.app",
+  "enabled": true
+}

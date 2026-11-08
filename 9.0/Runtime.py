@@ -1309,6 +1309,8 @@ from .Core.MIME.Guess import (
     guess_mime,
     _resolve_mime_with_sniff,
     _js_mime_rescue,
+    _sniff_nonhtml_type,
+    _SNIFF_HEAD,
 )
 from .Core.MIME.ContentType import (
     _ensure_wasm_content_type,
