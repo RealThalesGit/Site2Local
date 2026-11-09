@@ -53,7 +53,7 @@ VERSION = "9.0"                 # 9.0 = the "new generation" line:
                                 #        request; the startup sweep deletes them
                                 #        as unreachable garbage instead.
 
-SITE = "example.com"   # target domain or URL
+SITE = "youtube.com"   # target domain or URL
 HOST = "0.0.0.0"               # listen address
 PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
@@ -68,7 +68,7 @@ CRAWL_DEPTH = 7                # max URL path depth to follow
 SCAN_LIMIT = "256KB"         # body bytes scanned in DUMP_ALL mode
 RETRIES = 2                    # retry count on 5xx / timeout
 BACKOFF = 0.4                  # exponential backoff base (s)
-CRAWL = True                   # crawl at startup; False = proxy-on-demand only
+CRAWL = False                   # crawl at startup; False = proxy-on-demand only
 OFFLINE = False                # never hit upstream — serve disk only
 PREMAP_CDN = False             # pre-start ports for CDN hosts already cached on disk
 SAVE_ERRORS = False            # cache 4xx/5xx responses
