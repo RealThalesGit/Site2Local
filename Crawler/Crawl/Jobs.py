@@ -1,26 +1,21 @@
 """Site2Local: crawler queues, workers and link discovery."""
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
 from colorama import Fore
 from colorama import Style
-from urllib.parse import urljoin
 from urllib.parse import urlparse
 import os
-import queue
 import threading
 
 from ... import Runtime as _s2l_state
 
 
 def enqueue(u: str) -> None:
-    # Only feed the crawler while a consumer exists: during the initial
-    # crawl phase (workers running), and never after crawl finishes (the
-    # proxy serves fresh from upstream — no need to re-crawl). In
-    # procedural mode (CRAWL=False) / OFFLINE, main() marks _crawl_done
-    # up front, so this is a no-op there too — url_queue can never grow
-    # without a consumer.
-    if not _s2l_state._crawl_done.is_set():
+    # Feed initial workers or persistent discovery workers, never a queue
+    # without consumers (procedural/offline mode).
+    if (not _s2l_state.OFFLINE and (
+            not _s2l_state._crawl_done.is_set()
+            or (_s2l_state.CRAWL and _s2l_state._discovery_started.is_set()))):
         _s2l_state.url_queue.put(_s2l_state.normalize_url(u))
 
 
@@ -63,6 +58,7 @@ def _crawl(u: str) -> None:
     device = _s2l_state._device_variant(_s2l_state._effective_device())
     cache_path = _s2l_state.local_path(u, device)
     cached = os.path.isfile(cache_path)
+    discovery_base = u
 
     if cached:
         try:
@@ -71,7 +67,7 @@ def _crawl(u: str) -> None:
         except OSError as e:
             _s2l_state.log(f"Crawl cache read error: {cache_path} — {_s2l_state._short_exc(e)}", "ERROR")
             return
-        ct = _s2l_state.guess_mime(u)
+        ct = _s2l_state._resolve_mime_with_sniff(cache_path, data)
         _s2l_state.log(f"Cached  {host_disp}{path_short} — skipping download", "CRAWL")
     else:
         if _s2l_state._is_host_dead(netloc):
@@ -92,6 +88,7 @@ def _crawl(u: str) -> None:
         # Always decompress before processing
         data = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
         ct   = r.headers.get("Content-Type", "")
+        discovery_base = getattr(r, "url", None) or u
 
         sc_c = (Fore.GREEN if r.status_code < 300
                 else Fore.YELLOW if r.status_code < 400
@@ -125,39 +122,8 @@ def _crawl(u: str) -> None:
     if not cached:
         _s2l_state.save_queue.put((u, data, ct, device))
 
-    if _s2l_state.is_html(data, ct):
-        soup = BeautifulSoup(data.decode("utf-8", "ignore"), "lxml")
-        for tag in soup.find_all(["a", "script", "img", "link", "iframe", "source"]):
-            v = tag.get("href") or tag.get("src")
-            if not v:
-                continue
-            abs_url = _s2l_state.normalize_url(urljoin(u, v))
-            parsed  = urlparse(abs_url)
-            if parsed.hostname in _s2l_state._LOCAL_HOSTS:
-                continue
-            if _s2l_state.is_allowed_domain(parsed.netloc):
-                _s2l_state.enqueue(abs_url)
-            elif _s2l_state.PROXY_CDN and _s2l_state.is_external_domain(parsed.netloc) and tag.name in _s2l_state._ASSET_TAGS:
-                try:
-                    _s2l_state._ext_asset_queue.put_nowait(abs_url)
-                except queue.Full:
-                    pass
-
-    if _s2l_state.DUMP_ALL:
-        for m in _s2l_state.URL_REGEX.findall(data[:_s2l_state.SCAN_LIMIT]):
-            try:
-                cleaned = _s2l_state._clean_url_match(m)
-                if not cleaned:
-                    continue
-                found = cleaned.decode("utf-8", "ignore")
-                if found.startswith(("data:", "javascript:", "blob:", "mailto:", "tel:")):
-                    continue
-                p = urlparse(found)
-                if p.hostname in _s2l_state._LOCAL_HOSTS:
-                    continue
-                _s2l_state.enqueue(urljoin(u, found))
-            except Exception:
-                pass
+    discovery_ct = "text/html" if _s2l_state.is_html(data, ct) else ct
+    _s2l_state._discover_links(data, discovery_base, discovery_ct)
 
 
 def _crawl_worker() -> None:

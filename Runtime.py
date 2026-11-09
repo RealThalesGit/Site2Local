@@ -1280,6 +1280,7 @@ from .Crawler.Crawl import (
     _discovery_worker,
     _start_discovery_workers,
     _extract_links_async,
+    _discover_links,
     crawl_parallel,
 )
 from .Hooks.GUI import (

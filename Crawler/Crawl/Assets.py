@@ -36,7 +36,7 @@ def _clean_url_match(m: bytes) -> bytes:
 
 
 def _fetch_external_asset(u: str) -> None:
-    """PROXY_CDN: fetch a single CDN asset and cache it. No recursion."""
+    """Fetch a CDN asset; discover CSS dependencies through the bounded queue."""
     netloc = urlparse(u).netloc
     # Skip domains that require user auth / real browser cookies.
     # Background sessions lack these cookies so the response is always a bot page.
@@ -69,6 +69,11 @@ def _fetch_external_asset(u: str) -> None:
                     _s2l_state.save_queue.put((u, body, r.headers.get("Content-Type", ""), _s2l_state._effective_device()))
                 _s2l_state._register_cdn_host(netloc)
                 _s2l_state.stats.inc("cdn_fetched")
+                # Stylesheets have their own relative base and can reference
+                # further imports/fonts/images. The bounded asset queue and
+                # visited set handle cycles without spawning more threads.
+                if "text/css" in r.headers.get("Content-Type", "").lower():
+                    _s2l_state._discover_links(body, getattr(r, "url", None) or u, "text/css")
                 if _s2l_state.CAPTURE and _s2l_state.CAPTURE_CDN:
                     parsed_u = urlparse(u)
                     ctx_cdn  = _s2l_state.HookContext(

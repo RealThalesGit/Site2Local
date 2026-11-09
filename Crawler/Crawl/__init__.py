@@ -19,6 +19,7 @@ from .Links import (
     _discovery_worker,
     _start_discovery_workers,
     _extract_links_async,
+    _discover_links,
 )
 from .Save import (
     _save_worker,
@@ -38,5 +39,6 @@ __all__ = [
     "_discovery_worker",
     "_start_discovery_workers",
     "_extract_links_async",
+    "_discover_links",
     "crawl_parallel",
 ]

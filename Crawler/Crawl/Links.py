@@ -1,13 +1,12 @@
 """Site2Local: crawler queues, workers and link discovery."""
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from urllib.parse import urlparse
 import queue
 import threading
 
 from ... import Runtime as _s2l_state
+from .Extract import extract_links
 
 
 def _discovery_worker() -> None:
@@ -50,24 +49,26 @@ def _extract_links_async(html_body: bytes, base_url: str) -> None:
     JS may fail if a dependency isn't ready). With it, the discovery workers
     pre-cache linked pages and assets in the background.
     """
+    _discover_links(html_body, base_url, "text/html")
+
+
+def _discover_links(data: bytes, base_url: str, content_type: str) -> None:
+    """Shared discovery policy for initial crawling and proxy-served HTML."""
     try:
-        soup = BeautifulSoup(html_body.decode("utf-8", "ignore"), "lxml")
-        for tag in soup.find_all(["a", "script", "img", "link", "iframe", "source"]):
-            v = tag.get("href") or tag.get("src")
-            if not v:
-                continue
-            abs_url = _s2l_state.normalize_url(urljoin(base_url, v))
+        for abs_url, is_asset in extract_links(
+                data, base_url, content_type,
+                scan_text=_s2l_state.DUMP_ALL, scan_limit=_s2l_state.SCAN_LIMIT):
             parsed  = urlparse(abs_url)
             if parsed.hostname in _s2l_state._LOCAL_HOSTS:
                 continue
             if _s2l_state.is_allowed_domain(parsed.netloc):
                 _s2l_state.enqueue(abs_url)
-            elif _s2l_state.PROXY_CDN and _s2l_state.is_external_domain(parsed.netloc) and tag.name in _s2l_state._ASSET_TAGS:
+            elif _s2l_state.PROXY_CDN and is_asset and _s2l_state.is_external_domain(parsed.netloc):
                 # Use bounded pool instead of spawning a thread per asset —
                 # prevents "can't start new thread" on pages with many links.
                 try:
                     _s2l_state._ext_asset_queue.put_nowait(abs_url)
                 except queue.Full:
                     pass  # queue full — skip this asset, not critical
-    except Exception:
-        pass
+    except Exception as exc:
+        _s2l_state.log(f"Link discovery failed: {base_url} — {_s2l_state._short_exc(exc)}", "WARN")

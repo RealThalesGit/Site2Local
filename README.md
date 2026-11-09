@@ -1,5 +1,13 @@
 # Site2Local
 
+Link discovery shares one HTML/CSS extractor between the initial crawl and
+proxy navigation. It respects `<base href>`, media/poster/lazy-image attributes,
+`srcset`, inline styles, CSS `url()` and `@import`. HTTP(S) links are deduplicated
+without dropping query parameters; fragments and non-downloadable schemes are
+ignored. External CSS dependencies use the bounded CDN queue. `DUMP_ALL` also
+scans complete quoted URLs in JavaScript/JSON within `SCAN_LIMIT`; this is
+conservative discovery, not JavaScript execution or resolution of dynamic URLs.
+
 `CROSS_ORIGIN_ISOLATION = "auto"` (default) enables COOP/COEP when document
 headers or HTML indicate isolation requirements (SharedArrayBuffer/threaded
 WASM). Ordinary pages and workers do not enable isolation by themselves.
