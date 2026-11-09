@@ -55,6 +55,7 @@ def _save_worker() -> None:
             # kill the single save-worker thread — without task_done() the
             # save_queue.join() in crawl_parallel() hangs forever, blocking
             # startup entirely.
+            deferred = False
             try:
                 # Safety gate: never cache bot-detection / CAPTCHA pages.
                 # These can arrive from background CDN fetches or upstream retries.
@@ -93,11 +94,13 @@ def _save_worker() -> None:
                         _s2l_state.saved_keys.clear()
                         _s2l_state.saved_keys.add(key)
                 batch.append((u, _dev_tag, data, h, _qs))
+                deferred = True
                 batch_keys.add(key)
             except Exception as e:
                 _s2l_state.log(f"Save-worker item error: {u} — {e}", "ERROR")
             finally:
-                _s2l_state.save_queue.task_done()
+                if not deferred:
+                    _s2l_state.save_queue.task_done()
         now = time.time()
         if batch and (len(batch) >= _s2l_state.SAVE_BATCH or now - last_flush >= _s2l_state.SAVE_INTERVAL):
             for u, dev_tag, data, h, qs in batch:
@@ -111,26 +114,8 @@ def _save_worker() -> None:
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     if os.path.isdir(p):
                         p = os.path.join(p, "index.html")
-                    # Duplicate-content materialization: prefer a hardlink to
-                    # the first copy (zero extra disk). The mapping is
-                    # registered at flush (paths are only real then) and
-                    # re-validated with isfile so a purged source falls back
-                    # to a plain write; os.link also fails loudly on
-                    # cross-device / exotic filesystems → plain write.
-                    _link_src = None
-                    with _s2l_state.content_lock:
-                        _first = _s2l_state.content_hashes.get(h)
-                        if _first is not None and os.path.isfile(_first):
-                            _link_src = _first
-                    if _link_src and not os.path.isfile(p):
-                        try:
-                            os.link(_link_src, p)
-                            if qs:
-                                _s2l_state._write_query_sidecar(p, qs)
-                            _s2l_state.stats.inc("saved")
-                            continue
-                        except OSError:
-                            pass   # fall through to a plain byte write
+                    # Every editable URL owns an independent file. A hardlink
+                    # would propagate hand edits to unrelated cached URLs.
                     _atomic_write(p, data)
                     # Query files record their owning RAW query in the .q
                     # sidecar — this is what makes the beautified names
@@ -155,6 +140,9 @@ def _save_worker() -> None:
                     # skipped (which would make it uncacheable for the run).
                     with _s2l_state.save_lock:
                         _s2l_state.saved_keys.discard((u, dev_tag))
+                finally:
+                    # join() must wait for disk persistence, not just dequeue.
+                    _s2l_state.save_queue.task_done()
             batch.clear()
             batch_keys.clear()
             last_flush = now

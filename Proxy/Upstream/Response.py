@@ -8,8 +8,8 @@ from ... import Runtime as _s2l_state
 
 def _make_flask_resp(ctx: _s2l_state.HookContext, method: str) -> Response:
     """Build Flask Response from HookContext with body validation."""
-    # For HEAD, body is always empty (HTTP spec)
-    body = b"" if method == "HEAD" else ctx.resp_body
+    # Keep the representation for HEAD metadata; omit only the wire body.
+    body = ctx.resp_body
     if body is None:
         body = b""
         _s2l_state.log(f"Body was None in _make_flask_resp: {method} {ctx.path}", "ERROR")
@@ -27,8 +27,12 @@ def _make_flask_resp(ctx: _s2l_state.HookContext, method: str) -> Response:
     clean_headers = {k: v for k, v in ctx.resp_headers.items()
                      if k.lower() != "content-type"}
 
-    resp = Response(body, status=ctx.resp_status,
+    resp = Response(b"" if method == "HEAD" else body, status=ctx.resp_status,
                     headers=clean_headers, content_type=ctx.resp_ct)
+    if method == "HEAD":
+        upstream_length = next((v for k, v in clean_headers.items()
+                                if k.lower() == "content-length"), None)
+        resp.headers["Content-Length"] = str(upstream_length if upstream_length is not None else len(body))
     # Keep CORS and CORP headers consistent across all response paths.
     _s2l_state._apply_cors_headers(resp.headers)
     _is_html_resp = _s2l_state._is_document_ct(ctx.resp_ct)
