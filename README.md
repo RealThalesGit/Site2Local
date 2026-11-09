@@ -92,7 +92,7 @@ All settings live in [Config.py](Config.py). The tables below describe their pur
 
 | Flag | Purpose |
 | --- | --- |
-| `SITE`, `HOST`, `PORT` | Target website and local listening address. `127.0.0.1` is local-only; `0.0.0.0` listens on available interfaces. |
+| `SITE`, `HOST`, `PORT` | Target website and local listening address. Set `SITE = "http://example.com"` or `"https://example.com"`; a bare hostname means HTTPS. Failed probes and HTTPS-to-HTTP startup redirects stop startup. Same-protocol redirects and HTTP-to-HTTPS upgrades are supported. `127.0.0.1` is local-only; `0.0.0.0` listens on available interfaces. |
 | `DEVICE` | `"auto"` follows the requesting browser's user agent; other supported profiles are listed in the configuration. |
 | `CRAWL`, `CRAWL_DEPTH`, `WORKERS` | Enable discovery and control its depth and worker count. |
 | `DUMP_ALL`, `SCAN_LIMIT` | Also look for complete quoted URLs in JavaScript/JSON, within the scan budget. This does not execute JavaScript. |
@@ -102,7 +102,7 @@ All settings live in [Config.py](Config.py). The tables below describe their pur
 | `DONT_REWRITE` | Hosts that the browser should access directly. These resources still need an internet connection. |
 | `BLOCK_PATHS`, `CDN_BLOCK`, `DUMP_TARGETS` | Configure request blocking and discovery scope. |
 | `TIMEOUT_CONN`, `TIMEOUT_READ`, `TIMEOUT_STREAM_READ` | Connection and response timeouts. Streaming has a separate read timeout. |
-| `TLS_VERIFY` | Verify upstream HTTPS and WSS certificates (default `True`). Set `False` only for a trusted test server with an invalid certificate; this disables certificate and hostname checks. Restart after changing it. |
+| `TLS_VERIFY` | Verify upstream HTTPS and WSS certificates (default `True`). Set `False` only for a trusted test server with an invalid certificate. This does not select HTTP: choose `http://` explicitly in `SITE` for a plain HTTP origin. Restart after changing it. |
 | `OUTBOUND_PRIVATE_ALLOWLIST` | Private or non-global outbound destinations are blocked, including redirects, WebSockets and TCP/UDP tunnels. For a trusted local service, add its exact `"host:port"`, e.g. `["localhost:8443"]`. Restart after changing it. |
 
 HTML discovery understands `<base href>`, `srcset`, media and poster attributes, lazy-image attributes, and inline styles. CSS discovery handles `url()` and `@import`, including dependencies of external stylesheets. URLs are deduplicated without discarding query strings; fragments and non-HTTP(S) schemes are excluded from downloads.
@@ -218,6 +218,8 @@ See [requirements.txt](requirements.txt) for the package list. Optional dependen
 
 ## Troubleshooting and limitations
 
+The shared mirror bypasses authenticated requests (Authorization, upstream cookies or a nonempty server-side session jar). Responses marked `private` or `no-store`, responses setting cookies, and responses varying on Cookie/Authorization are not saved. This applies to the proxy, CDN, streams and crawler. Consequently, authenticated/private pages are not available from this shared offline mirror. Older mirrors can contain private data saved before this policy; review them before sharing a mirror with others.
+
 Upstream sessions are separated by a signed `HttpOnly` browser cookie rather than by IP address. The cookie is shared across the proxy's CDN ports and is never sent upstream. Browsers must accept cookies to retain a session. Restarting the process invalidates these identities and clears the in-memory upstream sessions. This isolates cookie jars; it does not authenticate access to the proxy. Keep the proxy private or put authentication and network restrictions in front of it.
 
 HTTP backends use an authenticated loopback outbound guard; WebSockets and raw tunnels use the same destination policy. The guard connects to the numeric address that it validated, including on redirected HTTP connections. Environment proxy settings are ignored by upstream sessions. `OUTBOUND_PRIVATE_ALLOWLIST` grants an explicit exception for a trusted `host:port` (`[::1]:8443` for IPv6). An allowed local service must itself be trusted; the exception permits access to that service.
@@ -281,7 +283,7 @@ python -X utf8 -B -m unittest discover -s Scripts -p test_live_proxy.py
 
 This starts an HTTP fixture and the real `Boot.py` in a temporary renamed checkout with `OFFLINE=False`. It checks live HTML/assets, POST bodies, browser-session isolation, redirects, blocked private destinations, disk caching, ranges and HEAD. It preserves your configuration and mirrors, stops the test processes, and deletes its temporary files. Optional WAF fingerprinting is disabled in this test; upstream requests are real. This suite does not replace browser or TLS/WebSocket tests.
 
-For manual testing, start the fixture with `python Scripts/local_test_server.py --port 9090`. To proxy it, use `SITE = "127.0.0.1:9090"`, `OFFLINE = False`, `TLS_VERIFY = False` (the fixture is plain HTTP), `CRAWL = False`, and `OUTBOUND_PRIVATE_ALLOWLIST = ["127.0.0.1:9090"]`. Its routes include `/`, `/app.js`, `/style.css`, `/redirect`, `POST /login` (`user=alice`), and `POST /echo`. Keep this fixture bound to loopback.
+For manual testing, start the fixture with `python Scripts/local_test_server.py --port 9090`. To proxy it, use `SITE = "http://127.0.0.1:9090"`, `OFFLINE = False`, `TLS_VERIFY = True` (the fixture uses plain HTTP, so no certificate is involved), `CRAWL = False`, and `OUTBOUND_PRIVATE_ALLOWLIST = ["127.0.0.1:9090"]`. Its routes include `/`, `/app.js`, `/style.css`, `/redirect`, `POST /login` (`user=alice`), and `POST /echo`. Keep this fixture bound to loopback.
 
 For a bug report, include the target URL, relevant settings, whether the failure happens on the first load or a reload, server logs, and browser Console/Network errors. Remove credentials and session tokens from shared logs. Contributions and reproducible reports are welcome; this is an independently maintained work in progress.
 

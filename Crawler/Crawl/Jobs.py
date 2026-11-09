@@ -73,7 +73,9 @@ def _crawl(u: str) -> None:
         if _s2l_state._is_host_dead(netloc):
             return
         try:
-            r = _s2l_state._get_proxy_session().get(u, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY)
+            session = _s2l_state._get_proxy_session()
+            authenticated_request = bool(session.cookies)
+            r = session.get(u, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY)
         except _s2l_state._CONN_ERRORS as e:
             _s2l_state.log(f"Skipping {netloc} — {_s2l_state._short_exc(e)}", "WARN")
             _s2l_state._mark_host_dead(netloc)
@@ -104,7 +106,12 @@ def _crawl(u: str) -> None:
         if r.status_code >= 400:
             _s2l_state.stats.inc("http_errors")
             if _s2l_state.SAVE_ERRORS:
-                _s2l_state.save_queue.put((u, data, ct, device))
+                _s2l_state._queue_cache_response(
+                    u, data, ct, device,
+                    response_headers=r.headers,
+                    request_headers=getattr(getattr(r, 'request', None), 'headers', {}),
+                    authenticated=authenticated_request or bool(session.cookies),
+                )
             return
 
     if _s2l_state.SHOW_HIDDEN and _s2l_state.is_html(data, ct):
@@ -120,7 +127,12 @@ def _crawl(u: str) -> None:
     # cache entries are read above only for link discovery and must not be
     # queued for writing back to disk.
     if not cached:
-        _s2l_state.save_queue.put((u, data, ct, device))
+        _s2l_state._queue_cache_response(
+            u, data, ct, device,
+            response_headers=r.headers,
+            request_headers=getattr(getattr(r, 'request', None), 'headers', {}),
+            authenticated=authenticated_request or bool(session.cookies),
+        )
 
     discovery_ct = "text/html" if _s2l_state.is_html(data, ct) else ct
     _s2l_state._discover_links(data, discovery_base, discovery_ct)

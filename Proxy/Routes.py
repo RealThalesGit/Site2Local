@@ -604,7 +604,7 @@ def proxy(path: str) -> Response:
             if req_qs:
                 cdn_url += f"?{req_qs}"
             cdn_lp = _s2l_state.local_path(cdn_url)
-            if os.path.isfile(cdn_lp):
+            if os.path.isfile(cdn_lp) and _s2l_state._shared_cache_request_allowed():
                 try:
                     # Read directly instead of send_file: send_file's mimetype
                     # guessing can disagree with our sidecar-resolved type, and it
@@ -654,7 +654,11 @@ def proxy(path: str) -> Response:
                     cdn_r.headers.get("Content-Type", "application/octet-stream"),
                     req_path_cdn)
                 if cdn_r.status_code < 400:
-                    _s2l_state.save_queue.put((cdn_url, cdn_body, ct, _s2l_state._effective_device()))
+                    _s2l_state._queue_cache_response(
+                        cdn_url, cdn_body, ct, _s2l_state._effective_device(),
+                        response_headers=cdn_r.headers,
+                        request_headers=getattr(getattr(cdn_r, 'request', None), 'headers', {}),
+                    )
                     _s2l_state.stats.inc("cdn_fetched")
                     _s2l_state.log(f"CDN fallback {_s2l_state._fmt_host(cdn_host)}{_s2l_state._fmt_path_qs(req_path_cdn, req_qs)} {cdn_r.status_code}", "CDN")
                     out = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(cdn_r))
@@ -770,7 +774,11 @@ def proxy(path: str) -> Response:
         # it to the HTML variant tag, so a phone's first visit caches
         # index__s2l_mobile.html and leaves the canonical desktop file
         # (and any user mods in it) untouched.
-        _s2l_state.save_queue.put((target, ctx.resp_body, ctx.resp_ct, _s2l_state._effective_device()))
+        _s2l_state._queue_cache_response(
+            target, ctx.resp_body, ctx.resp_ct, _s2l_state._effective_device(),
+            response_headers=ctx.resp_headers,
+            request_headers=ctx.req_headers,
+        )
         # Mark this URL as visited so the crawler doesn't fetch it again.
         # The proxy already fetched it — re-fetching is wasteful and creates
         # duplicate log entries. enqueue() still runs for link extraction

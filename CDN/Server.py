@@ -203,7 +203,11 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
             # Only save on real 200 responses with content — 304 has an empty body and
             # saving it would corrupt/truncate a previously-good cached file.
             if r.status_code == 200 and body and method in _s2l_state._SAFE_METHODS and _s2l_state.CACHE_CDN:
-                _s2l_state.save_queue.put((cdn_url, body, ct, _s2l_state._effective_device()))
+                _s2l_state._queue_cache_response(
+                    cdn_url, body, ct, _s2l_state._effective_device(),
+                    response_headers=r.headers,
+                    request_headers=ctx.req_headers,
+                )
                 _s2l_state.stats.inc("cdn_fetched")
             out_headers = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(r), body,
                                         is_top_level_html=_s2l_state._is_document_ct(ct))

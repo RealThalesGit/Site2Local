@@ -107,6 +107,14 @@ def _get_client_session(browser_token=None):
             _s2l_state._CLIENT_SESSIONS[cid] = _s2l_state._make_session()
         _s2l_state._CLIENT_LAST[cid] = now
         session = _s2l_state._CLIENT_SESSIONS[cid]
+        authenticated = bool(session.cookies)
+    # Capture authentication before another request can evict this session
+    # or an upstream response can clear its cookies. Never reset within a request.
+    if authenticated:
+        try:
+            g._s2l_private_request = True
+        except RuntimeError:
+            pass
     for old_session in retired:
         if old_session is not None:
             try: old_session.close()

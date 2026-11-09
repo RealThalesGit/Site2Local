@@ -14,7 +14,7 @@ import time
 import unittest
 
 import requests
-from local_test_server import create_server
+from local_test_server import create_server, create_test_tls_context
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,7 +33,8 @@ class LiveProxyTests(unittest.TestCase):
             elif path.is_dir() and (path / "__init__.py").exists():
                 shutil.copytree(path, checkout / path.name,
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        cls.upstream = create_server()
+        tls_context = create_test_tls_context() if getattr(cls, "HTTPS_UPSTREAM", False) else None
+        cls.upstream = create_server(tls_context=tls_context)
         threading.Thread(target=cls.upstream.serve_forever, daemon=True).start()
         cls.addClassCleanup(cls.upstream.server_close)
         cls.addClassCleanup(cls.upstream.shutdown)
@@ -41,9 +42,10 @@ class LiveProxyTests(unittest.TestCase):
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         cls.base = f"http://127.0.0.1:{port}"
-        overrides = dict(SITE=f"127.0.0.1:{cls.upstream.server_port}", HOST="127.0.0.1", PORT=port,
+        scheme = "https" if tls_context is not None else "http"
+        overrides = dict(SITE=f"{scheme}://127.0.0.1:{cls.upstream.server_port}", HOST="127.0.0.1", PORT=port,
                          OFFLINE=False, CRAWL=False, HOOK_GUI=False, PROXY_CDN=False,
-                         MULTIPORT=False, TLS_VERIFY=False, CAPTURE=False, CAPTURE_WS=False,
+                         MULTIPORT=False, TLS_VERIFY=True, CAPTURE=False, CAPTURE_WS=False,
                          SCAN_PATHS=False, TIMEOUT_CONN=1, TIMEOUT_READ=3,
                          OUTBOUND_PRIVATE_ALLOWLIST=[f"127.0.0.1:{cls.upstream.server_port}"])
         overrides.update(getattr(cls, "CONFIG_OVERRIDES", {}))
@@ -112,6 +114,19 @@ class LiveProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertGreater(self.upstream.hits["/blocked-redirect"], 0)
         self.assertEqual(self.upstream.hits["/private"], 0)
+
+    def test_private_html_never_crosses_browser_sessions_or_hits_disk(self):
+        with requests.Session() as alice, requests.Session() as bob:
+            for client, user in ((alice, "alice"), (bob, "bob")):
+                client.trust_env = False
+                client.headers["Sec-Fetch-Dest"] = "empty"
+                client.post(self.base + "/login", data={"user": user}, timeout=8).raise_for_status()
+            for client, user in ((alice, "alice"), (bob, "bob")):
+                response = client.get(self.base + "/private-profile.html", timeout=8)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("PRIVATE PROFILE: " + user, response.text)
+            time.sleep(0.4)  # Allow the save worker's batch interval to pass.
+            self.assertFalse(list(self.cache_root.rglob("private-profile.html")))
 
     def test_live_cache_range_and_head(self):
         body = self.client.get(self.base + "/app.js", timeout=8).content

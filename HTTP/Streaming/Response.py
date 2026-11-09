@@ -179,7 +179,11 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                     # hit disk — counting here too inflated the stat by 2 for
                     # every cached stream (and counted items the worker then
                     # dropped as bot pages / dedup misses).
-                    _s2l_state.save_queue.put((target, plain, ct, _s2l_state._effective_device()))
+                    _s2l_state._queue_cache_response(
+                        target, plain, ct, _s2l_state._effective_device(),
+                        response_headers=upstream_r.headers,
+                        request_headers=getattr(getattr(upstream_r, 'request', None), 'headers', {}),
+                    )
             # Single consolidated stream log line. Include "not cached" note
             # when the stream was too large or didn't complete — previously
             # this was a second separate log line, creating duplicate entries.

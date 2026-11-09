@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from urllib.parse import urldefrag
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 import re
 
 from ... import Runtime as _s2l_state
@@ -69,30 +70,40 @@ def normalize_url(u: str) -> str:
 
 
 def build_base_url(raw: str) -> str | None:
-    """Probe https:// then http:// to find which scheme `raw` actually serves.
+    """Resolve an explicit HTTP/HTTPS target; bare hostnames default to HTTPS.
 
-    "Probe" here is the verb form — testing each scheme in turn. The log
-    message "Probing {url}..." reflects this.
-
-    In OFFLINE mode, skip the probe entirely — there's no upstream to test.
-    Default to https:// (the common case) and return immediately without any
-    network call.
-
-    TLS_VERIFY also applies to startup probes. With verification enabled,
-    do not silently downgrade an unsuccessful HTTPS probe to plain HTTP.
+    TLS_VERIFY controls certificates, not protocol selection. A failed probe
+    never changes protocols. Offline mode preserves the configured URL.
     """
+    raw = raw.strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("SITE must be a hostname or an explicit http:// or https:// URL")
     if _s2l_state.OFFLINE:
         # No upstream — don't probe. Default to https:// (the common case),
         # which is what the probe would have picked anyway.
-        _offline_url = f"https://{raw}"
+        _offline_url = raw
         _s2l_state.log(f"OFFLINE: skipping upstream probe for {raw} → {_offline_url}", "INFO")
         return _offline_url
 
     s = _s2l_state._make_session()
     try:
-        for scheme in (("https://",) if _s2l_state.TLS_VERIFY else ("https://", "http://")):
+        target = raw
+        for _hop in range(11):
             try:
-                r = s.get(scheme + raw, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY)
+                r = s.get(target, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY, allow_redirects=False)
+                if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                    location = urljoin(target, r.headers["Location"])
+                    redirected = urlparse(location)
+                    r.close()
+                    if (redirected.scheme not in ("http", "https") or not redirected.hostname
+                            or redirected.username or redirected.password
+                            or (urlparse(target).scheme == "https" and redirected.scheme != "https")):
+                        raise ValueError("Startup redirect to an unsafe or downgraded protocol was blocked")
+                    target = location
+                    continue
                 if r.status_code < 500:
                     try:
                         platform = _s2l_state.detect_platform(r.url)
@@ -108,9 +119,13 @@ def build_base_url(raw: str) -> str | None:
                         _s2l_state.log("WAFW00F not installed (optional — pip install wafw00f); "
                             "platform detection disabled.", "WARN")
                     _s2l_state.log(f"Resolved {raw} → {r.url}  [{platform}]  IP: {_s2l_state.resolve_ip(urlparse(r.url).netloc)}", "INFO")
+                    r.close()
                     return r.url
+                r.close()
+                break
             except Exception as e:
-                _s2l_state.log(f"Probing {scheme+raw}: {_s2l_state._short_exc(e)}", "WARN")
+                _s2l_state.log(f"Probing {target}: {_s2l_state._short_exc(e)}", "WARN")
+                break
     finally:
         try: s.close()
         except Exception: pass

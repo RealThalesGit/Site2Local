@@ -13,6 +13,13 @@ from urllib.parse import parse_qs, urlsplit
 
 
 class TestHandler(BaseHTTPRequestHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Certificate-rejection tests intentionally disconnect early.
+            pass
+
     def log_message(self, *args):
         pass
 
@@ -45,6 +52,9 @@ class TestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/blocked-redirect":
             status, payload = 302, b""
             headers["Location"] = f"http://localhost:{self.server.server_port}/private"
+        elif parsed.path == "/startup-redirect":
+            status, payload = 302, b""
+            headers["Location"] = self.server.startup_redirect_url
         elif parsed.path == "/login" and self.command == "POST":
             user = parse_qs(body.decode()).get("user", ["guest"])[0]
             cookie = SimpleCookie()
@@ -56,6 +66,14 @@ class TestHandler(BaseHTTPRequestHandler):
             cookie.load(self.headers.get("Cookie", ""))
             payload = json.dumps({"method": self.command, "body": body.decode(errors="replace"),
                                   "cookies": {key: value.value for key, value in cookie.items()}}).encode()
+        elif parsed.path == "/private-profile.html":
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            user = cookie.get("fixture_user")
+            content_type = "text/html"
+            headers["Cache-Control"] = "private, no-store"
+            payload = ("<!doctype html><html><body>PRIVATE PROFILE: " +
+                       (user.value if user else "guest") + "</body></html>").encode()
         elif parsed.path == "/private":
             payload = b'{"private":"must not be reached through redirect"}'
         else:
@@ -84,11 +102,44 @@ class TestHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
 
-def create_server(port=0):
+def create_server(port=0, tls_context=None):
     server = ThreadingHTTPServer(("127.0.0.1", port), TestHandler)
+    if tls_context is not None:
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     server.daemon_threads = True
     server.hits, server.hits_lock = Counter(), threading.Lock()
     return server
+
+
+def create_test_tls_context():
+    """Generate a short-lived self-signed certificate for local TLS tests."""
+    import datetime
+    import ipaddress
+    from pathlib import Path
+    import ssl
+    from tempfile import TemporaryDirectory
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .sign(key, hashes.SHA256()))
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        (root / "key.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(root / "cert.pem", root / "key.pem")
+        return context
 
 
 if __name__ == "__main__":

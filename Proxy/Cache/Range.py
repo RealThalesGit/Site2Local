@@ -50,6 +50,8 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     for missing/unsupported ranges, failed reads, or a stale If-Range
     validator so callers can serve the complete current representation.
     """
+    if not _s2l_state._shared_cache_request_allowed():
+        return None
     rng = flask_request.headers.get("Range", "")
     if not rng:
         return None

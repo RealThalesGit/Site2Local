@@ -126,7 +126,11 @@ def ext_asset(extpath: str) -> Response:
         # Only save real 200 responses with content — 304 has empty body and saving
         # it would corrupt any existing cached file.
         if r.status_code == 200 and body and method in _s2l_state._SAFE_METHODS and _s2l_state.CACHE_CDN:
-            _s2l_state.save_queue.put((real_url, body, ct, _s2l_state._effective_device()))
+            _s2l_state._queue_cache_response(
+                real_url, body, ct, _s2l_state._effective_device(),
+                response_headers=r.headers,
+                request_headers=ctx.req_headers,
+            )
             _s2l_state._register_cdn_host(ext_host)
             _s2l_state.stats.inc("cdn_fetched")
         elif r.status_code < 400 and method in _s2l_state._SAFE_METHODS:

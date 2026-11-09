@@ -26,6 +26,10 @@ exec(compile(memory_tree, "Core/Cache/Memory.py", "exec"), MEMORY)
 
 
 def helpers(path, state):
+    if path != "Core/Cache/Policy.py" and not hasattr(state, "_shared_cache_request_allowed"):
+        policy = helpers("Core/Cache/Policy.py", state)
+        state._shared_cache_request_allowed = policy["_shared_cache_request_allowed"]
+        state._queue_cache_response = policy["_queue_cache_response"]
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     tree.body = [n for n in tree.body
                  if not (isinstance(n, ast.ImportFrom) and n.level)]

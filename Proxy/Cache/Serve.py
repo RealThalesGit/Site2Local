@@ -99,6 +99,8 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
 
 def _cached_response(lp: str, target: str, method: str, req_path: str) -> Response | None:
     """Build a Flask Response from a cached file on disk."""
+    if not _s2l_state._shared_cache_request_allowed():
+        return None
     # Conditional requests FIRST — a 304 skips the file read entirely, and the
     # validators come from the CURRENT disk state: a hand edit immediately
     # stops matching the old ETag (fresh 200 next request) and a deleted file

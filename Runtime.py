@@ -1335,6 +1335,7 @@ from .Network.Server import (
     _S2LWSGIRequestHandler,
 )
 from .Network.Outbound import _secure_session, _connect_outbound
+from .Core.Cache.Policy import _shared_cache_request_allowed, _queue_cache_response
 from .HTTP.Sessions.Clients import (
     _ensure_browser_session, _set_browser_cookie, _browser_cookies, _strip_browser_cookie,
 )
@@ -1449,7 +1450,9 @@ from .Application import create_app
 # the monolith does at import time. It is safe here because every helper it
 # needs (_make_session, detect_platform, resolve_ip, log, ...) is imported
 # above. Nothing earlier in this module reads these values at import time.
-SITE_URL  = build_base_url(SITE) or f"http://{SITE}"
+SITE_URL = build_base_url(SITE)
+if not SITE_URL:
+    raise RuntimeError("Could not reach SITE using its configured protocol; specify http:// or https:// explicitly")
 MAIN_HOST = urlparse(SITE_URL).netloc
 SITE_NAME = _safe_seg(MAIN_HOST.removeprefix("www.").replace(".", "_"))
 SRC_FOLDER  = os.path.join("site_src",  SITE_NAME)

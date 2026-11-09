@@ -65,7 +65,7 @@ class SecuritySettingsTests(unittest.TestCase):
         state._make_session = lambda: session
         probe = helpers("Core/URL/Rewrite.py", state)["build_base_url"]
         self.assertIsNone(probe("example.com"))
-        session.get.assert_called_once_with("https://example.com", timeout=(1, 1), verify=True)
+        session.get.assert_called_once_with("https://example.com", timeout=(1, 1), verify=True, allow_redirects=False)
         session.close.assert_called_once()
 
     def test_forwarded_for_cannot_select_another_peer_session(self):
