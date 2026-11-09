@@ -6,6 +6,13 @@ import re
 from ... import Runtime as _s2l_state
 
 
+def _strip_s2l_injector(html_bytes: bytes) -> bytes:
+    """Remove only S2L-owned script tags, keeping the site's own scripts."""
+    return re.sub(
+        rb'<script\b[^>]*\s+id\s*=\s*["\']__s2l__["\'][^>]*>.*?</script\s*>',
+        b'', html_bytes, flags=re.DOTALL | re.IGNORECASE)
+
+
 def _inject_sw_clear(html_bytes: bytes) -> bytes:
     if not html_bytes:
         return html_bytes
@@ -18,11 +25,7 @@ def _inject_sw_clear(html_bytes: bytes) -> bytes:
     # LAST and overwrites window.__s2l_rw / fetch / setAttribute / src-setters.
     # The regex matches id="__s2l__" anywhere in the <script> open tag (not just
     # as the first attribute), so <script type="..." id="__s2l__"> is also caught.
-    html_bytes = re.sub(
-        rb'<script\b[^>]*\bid=["\']__s2l__["\'][^>]*>.*?</script\s*>',
-        b'', html_bytes,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    html_bytes = _strip_s2l_injector(html_bytes)
 
     # Insert the injector AFTER <meta charset> / <meta http-equiv content-type>
     # if present in the first 2KB of <head>. Per HTML spec, the charset

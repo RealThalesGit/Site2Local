@@ -6,6 +6,7 @@ import json
 import re
 
 from ... import Runtime as _s2l_state
+from ...Rewriting.HTML.ServiceWorker import _strip_s2l_injector
 
 
 def _origin_matches(hook_origin: str, ctx: _s2l_state.HookContext) -> bool:
@@ -76,15 +77,30 @@ def _apply_gui_hooks(ctx: _s2l_state.HookContext) -> None:
         _hs = h.get("status", 0)
         if isinstance(_hs, int) and _hs > 0:
             ctx.resp_status = _hs
-        ctx.resp_headers["content-length"] = str(len(new_body))
         ctx.resp_headers["_hooked"] = "1"
         try:
             json.loads(new_body)
             ctx.resp_ct = "application/json; charset=utf-8"
         except Exception:
             head = new_body[:64].lstrip()
-            ctx.resp_ct = ("text/html; charset=utf-8" if head.startswith(b"<")
-                           else "text/plain; charset=utf-8")
+            if head.startswith(b"<"):
+                ctx.resp_ct = "text/html; charset=utf-8"
+        if _s2l_state._is_document_ct(ctx.resp_ct):
+            # Hooks store editable site HTML, not the proxy's implementation.
+            # Re-run the HTML pipeline because GUI hooks run after rewriting.
+            new_body = _strip_s2l_injector(new_body)
+            if _s2l_state.PROXY_CDN:
+                new_body = _s2l_state._rewrite_ext_urls(new_body, html_doc=True)
+            new_body = _s2l_state.rewrite_abs_urls(new_body)
+            new_body = _s2l_state._inject_sw_clear(new_body)
+            host = urlparse(ctx.url).netloc
+            if host != _s2l_state.MAIN_HOST:
+                new_body = _s2l_state.rewrite_doc_relative(new_body, host, html_doc=True)
+            ctx.resp_body = new_body
+        for key in list(ctx.resp_headers):
+            if key.lower() == "content-length":
+                del ctx.resp_headers[key]
+        ctx.resp_headers["Content-Length"] = str(len(ctx.resp_body))
         _s2l_state.log(f"Hook '{h['name']}' matched {ctx.method} {ctx.path} "
             f"[{ctx.resp_status}] {_s2l_state._fmt_size(len(new_body))}", "HOOK")
         break

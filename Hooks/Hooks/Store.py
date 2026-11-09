@@ -8,6 +8,7 @@ import re
 import tempfile
 
 from ... import Runtime as _s2l_state
+from ...Rewriting.HTML.ServiceWorker import _strip_s2l_injector
 
 
 def _make_hook_store(subdir: str, extra_binary_fields: tuple = ()):
@@ -118,6 +119,8 @@ def _editor_preview(body: bytes, ct: str = "") -> tuple[str, bool]:
     """
     if not body:
         return "", False
+    if "html" in ct.lower() or body.lstrip().startswith(b"<"):
+        body = _strip_s2l_injector(body)
     truncated = len(body) > _s2l_state._EDITOR_MAX_BYTES
     if truncated:
         slice_b = body[:_s2l_state._EDITOR_MAX_BYTES]

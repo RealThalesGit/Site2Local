@@ -9,6 +9,7 @@ import re
 import sys
 
 from .. import Runtime as _s2l_state
+from ..Rewriting.HTML.ServiceWorker import _strip_s2l_injector
 
 
 def _launch_hook_gui() -> None:
@@ -485,7 +486,7 @@ def _launch_hook_gui() -> None:
             method_combo.setCurrentText(data["method"] if data["method"] in _METHOD_OPTS else "*")
             sc = str(data["status"])
             status_combo.setCurrentText(sc if sc in _STATUS_OPTS else "*")
-            pat_edit.setText(data["path"])
+            pat_edit.setText("^" + re.escape(data["path"]) + "$")
             _data_origin = data.get("origin", "")
             origin_edit.setText(_data_origin if _data_origin else "*")
             if not name_edit.text().strip():
@@ -693,7 +694,7 @@ def _launch_hook_gui() -> None:
                         pat_edit.setText(hook_ref["pattern"])
                         origin_edit.setText(hook_ref.get("origin_url", "*") or "*")
                         try:
-                            txt = hook_ref["body_bytes"].decode("utf-8", errors="replace")
+                            txt = _strip_s2l_injector(hook_ref["body_bytes"]).decode("utf-8", errors="replace")
                             if hook_ref["body_bytes"].startswith(b"{") or hook_ref["body_bytes"].startswith(b"["):
                                 try:
                                     txt = json.dumps(json.loads(txt), indent=2, ensure_ascii=False)
@@ -788,7 +789,7 @@ def _launch_hook_gui() -> None:
                 "status":     status,
                 "pattern":    pat_str,
                 "origin_url": origin_str,
-                "body_bytes": body_txt.encode("utf-8"),
+                "body_bytes": _strip_s2l_injector(body_txt.encode("utf-8")),
                 "enabled":    True,
             }
             with _s2l_state._gui_hooks_lock:
