@@ -15,6 +15,10 @@ def _safe_seg(name: str) -> str:
     # would produce cache paths like "vue_app_<!DOCTYPE html>..." which breaks
     # on Windows and creates unusable cache entries on Linux.
     name = re.sub(r"[^\w.\-]", "_", name)
+    # Dot-only components have filesystem semantics rather than file names.
+    # Windows also normalizes longer runs of dots; never pass them to join().
+    if name and not name.strip("."):
+        name = "_s2l_dots_" + str(len(name))
     if len(name) <= _s2l_state.MAX_FNAME:
         return name
     base, ext = os.path.splitext(name)
@@ -51,19 +55,14 @@ def _beauty_seg(s: str) -> str:
 def _beautify_query_name(qs: str) -> str:
     """Human-readable name for a query string (the "remove the junk" pass).
 
-    Sketch (user-approved, CORRECTED in 9.2):
+    Query naming:
 
       1 param   → ``[K]_[V]``                  ``?v=26b3…``   → ``v_26b3…``
       2+ params → ``[K1]_[V1]_N_[K2]_[V2]``    (``N`` stands for "&")
 
-    so the final file name reads ``Aya.App_v_26b389885145fb927a677cca.js``
-    instead of the pre-9.1 ``Aya.App_=v=26b389885145fb927a677cca.js``, and
+    so the final file name reads ``Aya.App_v_26b389885145fb927a677cca.js``, and
     ``css2?family=Montserrat:wght@400&display=swap`` becomes
-    ``css2_family_Montserrat_wght@400_N_display_swap``. (9.1 as shipped
-    beautified a 1-param query to the VALUE alone — ``Aya.App_26b38….js``;
-    the user's correction makes the parameter NAME always join the value,
-    uniform across the 1-param and 2+-param cases — and strictly fewer
-    collisions, since ``?v=1`` and ``?x=1`` no longer share ``base_1``.)
+    ``css2_family_Montserrat_wght@400_N_display_swap``.
 
     Values are percent-DECODED first (readability), which makes the mapping
     lossy — ``?a=1&b=2`` vs ``?a=1_b=2`` share a name. That is fine because
@@ -86,7 +85,7 @@ def _beautify_query_name(qs: str) -> str:
     if len(pairs) == 1:
         k, v = pairs[0]
         sk, sv = _beauty_seg(k), _beauty_seg(v)
-        # Corrected sketch (9.2): the parameter NAME always joins the value.
+        # Include both the parameter name and value to reduce collisions.
         if sk and sv:
             return f"{sk}_{sv}"
         # Flag (?debug) or empty value (?k=) → the key alone; a value with

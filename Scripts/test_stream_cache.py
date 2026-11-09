@@ -40,6 +40,7 @@ class StreamCacheTests(unittest.TestCase):
             log=lambda *args: None, _short_exc=str, _fmt_host=lambda host: host,
             _fmt_path_qs=lambda path, query: path, _fmt_size=str,
             HOOK_GUI=False, CACHE_CDN=True, MAIN_HOST="example.com")
+        s.TLS_VERIFY = True
         self.stream_helpers = fixtures.helpers("HTTP/Streaming/Response.py", s)
         self.stream = self.stream_helpers["_stream_resp"]
         self.app = Flask(__name__)

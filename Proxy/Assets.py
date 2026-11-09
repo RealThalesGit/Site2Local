@@ -108,7 +108,7 @@ def ext_asset(extpath: str) -> Response:
             "headers":         ctx.req_headers,
             "timeout":         (_s2l_state.TIMEOUT_CONN, _read_timeout_e),
             "allow_redirects": True,
-            "verify":          False,
+            "verify":          _s2l_state.TLS_VERIFY,
         }
         if method in _s2l_state._BODY_METHODS:
             kw["data"] = ctx.req_body

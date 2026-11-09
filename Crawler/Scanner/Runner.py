@@ -187,10 +187,10 @@ def _run_path_scanner() -> None:
                     url = f"{origin}/{p}"
                     try:
                         r = sess.head(url, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ),
-                                      allow_redirects=False, verify=False)
+                                      allow_redirects=False, verify=_s2l_state.TLS_VERIFY)
                         if r.status_code == 405:
                             r = sess.get(url, timeout=(_s2l_state.TIMEOUT_CONN, min(_s2l_state.TIMEOUT_READ, 6)),
-                                         allow_redirects=False, verify=False)
+                                         allow_redirects=False, verify=_s2l_state.TLS_VERIFY)
                         sc = r.status_code
                         ct = r.headers.get("Content-Type", "")
                         with _counters_lock:
@@ -274,10 +274,10 @@ def _run_path_scanner() -> None:
                 url = f"{origin}/{p}"
                 try:
                     r = sess.head(url, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ),
-                                  allow_redirects=False, verify=False)
+                                  allow_redirects=False, verify=_s2l_state.TLS_VERIFY)
                     if r.status_code == 405:
                         r = sess.get(url, timeout=(_s2l_state.TIMEOUT_CONN, min(_s2l_state.TIMEOUT_READ, 6)),
-                                     allow_redirects=False, verify=False)
+                                     allow_redirects=False, verify=_s2l_state.TLS_VERIFY)
                     sc = r.status_code
                     ct = r.headers.get("Content-Type", "")
                     if sc not in (404, 410):

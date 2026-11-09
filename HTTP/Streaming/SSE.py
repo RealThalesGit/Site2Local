@@ -170,11 +170,13 @@ def _stream_sse_resp(upstream_r, method: str, target: str) -> Response:
 
     headers = _s2l_state.filter_resp(_s2l_state._resp_headers_dict(upstream_r))
     # Force chunked: Werkzeug doesn't auto-chunk generators with no Content-Length
-    headers.pop("content-length", None)
+    for key in list(headers):
+        if key.lower() in ("content-length", "cache-control", "x-accel-buffering"):
+            del headers[key]
     headers["Cache-Control"] = "no-cache, no-transform"
     headers["X-Accel-Buffering"] = "no"   # disable nginx buffering if behind one
     ct = upstream_r.headers.get("Content-Type", "text/event-stream")
-    _s2l_state.log_req(method, 200, urlparse(target).netloc, urlparse(target).path, -1,
+    _s2l_state.log_req(method, upstream_r.status_code, urlparse(target).netloc, urlparse(target).path, -1,
                        tag="SSE", query=urlparse(target).query)
     return Response(
         _keepalive_injected(),

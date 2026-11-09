@@ -1,11 +1,12 @@
 """Site2Local: upstream WebSocket transports."""
 from __future__ import annotations
+from http.cookies import SimpleCookie
 
 
 from ... import Runtime as _s2l_state
 
 
-def _get_session_for_ws():
+def _get_session_for_ws(extra_headers=None):
     """Get a session for the WS connection.
 
     Reuses the client session (which has cf_clearance cookies and
@@ -18,14 +19,14 @@ def _get_session_for_ws():
     """
     # First try the client session (per-browser, has cookies)
     try:
-        sess = _s2l_state._get_client_session()
-        if sess is not None and hasattr(sess, "ws_connect"):
-            return sess, False
-    except Exception:
-        pass
-    # Fall back to the proxy session
-    try:
-        sess = _s2l_state._get_proxy_session()
+        cookies = SimpleCookie()
+        for key, value in (extra_headers or {}).items():
+            if key.lower() == "cookie":
+                cookies.load(value)
+        token = cookies.get("__s2l_browser")
+        if token is None:
+            return _s2l_state._make_session(), True
+        sess = _s2l_state._get_client_session(token.value)
         if sess is not None and hasattr(sess, "ws_connect"):
             return sess, False
     except Exception:

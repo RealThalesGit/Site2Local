@@ -57,6 +57,13 @@ def _viewer_ip_allowed() -> bool:
     Forwarded headers are intentionally ignored: unless a trusted proxy is
     explicitly configured, clients can spoof them.
     """
+    # Check before producing data or mutating counters, not just in CORS
+    # response headers: cross-origin simple POSTs do not need preflight.
+    origin = flask_request.headers.get("Origin", "")
+    if origin and (origin == "null" or (
+            origin != flask_request.host_url.rstrip("/")
+            and origin not in _s2l_state.WEB_CDNVIEWER_ALLOWED_ORIGINS)):
+        return False
     if not _s2l_state.WEB_CDNVIEWER_IP_WHITELIST:
         return True
     try:

@@ -67,6 +67,8 @@ class CdnCachedHookTests(unittest.TestCase):
             return app
         namespace["Flask"] = create_app
         namespace["threading"] = SimpleNamespace(Thread=lambda **kwargs: SimpleNamespace(start=lambda: None))
+        self.state._ensure_browser_session = lambda: None
+        self.state._set_browser_cookie = lambda response: response
         namespace["_start_cdn_server"]("cdn.test", 8081)
         response = apps[0].test_client().get("/style.css?v=1")
         self.check_response(response)

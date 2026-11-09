@@ -45,9 +45,11 @@ class _RawSocketUpstreamWS:
         # SNI: don't send an IP literal as server_hostname — many servers/WAFs
         # reject SNI that looks like an IP (RFC 6066 says SNI is for DNS names).
         # Pass None for IP literals so OpenSSL sends an empty SNI extension.
-        sni_hostname = host if host and not _s2l_state._is_ip_literal(host) else None
+        # OpenSSL verifies IP subjectAltNames when server_hostname is an IP;
+        # it omits the SNI extension for literals automatically.
+        sni_hostname = host if _s2l_state.TLS_VERIFY or not _s2l_state._is_ip_literal(host) else None
 
-        raw = socket.create_connection((host, port), timeout=15)
+        raw = _s2l_state._connect_outbound(host, port, timeout=15)
         # After the TCP connect succeeds, clear the timeout so the WS
         # handshake AND all subsequent frame reads block until either side
         # closes the socket. The 15s connect timeout above is intentional
@@ -62,9 +64,10 @@ class _RawSocketUpstreamWS:
                     # cipher order) — meaningfully less fingerprintable than the
                     # bare interpreter default, but not a real JA3 match. See
                     # _CffiUpstreamWS below for the actual fix.
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False
-                    ctx.verify_mode    = ssl.CERT_NONE
+                    ctx = ssl.create_default_context()
+                    if not _s2l_state.TLS_VERIFY:
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
                     ctx.set_alpn_protocols(["http/1.1"])
                     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                     try:
@@ -77,8 +80,9 @@ class _RawSocketUpstreamWS:
                         pass
                 except Exception:
                     ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode    = ssl.CERT_NONE
+                    if not _s2l_state.TLS_VERIFY:
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
                 # Set a longer timeout for the TLS handshake — IPv6 connections
                 # to remote servers can take longer than the default, and a timeout
                 # here produces "The handshake operation timed out" which the
@@ -89,7 +93,7 @@ class _RawSocketUpstreamWS:
                 # frame reads — the tunnel should outlive idle periods (chat,
                 # push, dashboards). The handshake itself is fast; once it's
                 # done, recv blocks until either side closes the socket.
-                raw.settimeout(None)
+                srv.settimeout(None)
 
             # RFC 6455 §4.1: Sec-WebSocket-Key is 16 random bytes, base64-encoded
             # DIRECTLY — no hashing. SHA1 only enters the picture on the SERVER
@@ -109,7 +113,7 @@ class _RawSocketUpstreamWS:
                 f"Sec-WebSocket-Key: {key}",
                 "Sec-WebSocket-Version: 13",
             ]
-            for k, v in extra_headers.items():
+            for k, v in _s2l_state._strip_browser_cookie(extra_headers).items():
                 kl = k.lower()
                 if kl not in ("host", "upgrade", "connection",
                               "sec-websocket-key", "sec-websocket-version",

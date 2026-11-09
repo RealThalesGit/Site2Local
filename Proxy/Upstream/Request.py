@@ -49,7 +49,7 @@ def _is_sw_path(path: str) -> bool:
 def _do_upstream(method: str, target: str, ctx: _s2l_state.HookContext,
                   stream: bool = False) -> requests.Response:
     """Execute upstream request and return response object with content consumed."""
-    sess = _s2l_state._get_client_session()   # per-browser session (cookies isolated per IP)
+    sess = _s2l_state._get_client_session()   # cookies isolated by signed browser identity
 
     fwd = dict(ctx.req_headers)
     fwd["Host"] = _s2l_state.MAIN_HOST
@@ -72,7 +72,7 @@ def _do_upstream(method: str, target: str, ctx: _s2l_state.HookContext,
         ua = _s2l_state._sanitize_ua(_s2l_state.UA_PROFILES.get(_s2l_state.DEVICE, _s2l_state.UA_PROFILES["macintosh"]))
         fwd["User-Agent"] = ua
     # NOTE: do NOT mutate sess.headers here — the session is shared across
-    # concurrent requests from the same client IP. Mutating it races with
+    # concurrent requests from the same browser. Mutating it races with
     # other threads using the same session (RuntimeError: dict changed size
     # during iteration inside requests' header merging). The per-request
     # `fwd` headers already override session-level headers via kwargs["headers"].
@@ -135,14 +135,15 @@ def _do_upstream(method: str, target: str, ctx: _s2l_state.HookContext,
         "headers":         fwd,
         "timeout":         (_s2l_state.TIMEOUT_CONN, _read_timeout),
         "allow_redirects": True,
-        "verify":          False,
+        "verify":          _s2l_state.TLS_VERIFY,
         "stream":          stream,
     }
 
     fwd.pop("Cookie",  None)
     fwd.pop("cookie",  None)
     merged_cookies = _s2l_state._flatten_cookiejar(sess.cookies, prefer_host=urlparse(target).hostname or "")
-    merged_cookies.update(flask_request.cookies)
+    merged_cookies.update(_s2l_state._browser_cookies())
+    merged_cookies.pop("__s2l_browser", None)
     if merged_cookies:
         kwargs["cookies"] = merged_cookies
 

@@ -368,12 +368,10 @@ class _S2LWSGIRequestHandler(WSGIRequestHandler):
                 if use_udp:
                     # Detect IPv6 literal to pick the right socket family.
                     # Hardcoding AF_INET breaks /__s2l_udp__/[::1]:53 etc.
-                    _fam = socket.AF_INET6 if ":" in host else socket.AF_INET
-                    upstream_sock = socket.socket(_fam, socket.SOCK_DGRAM)
-                    upstream_sock.settimeout(_s2l_state.TUNNEL_TIMEOUT)
-                    upstream_sock.connect((host, port))
+                    upstream_sock = _s2l_state._connect_outbound(
+                        host, port, timeout=_s2l_state.TUNNEL_TIMEOUT, use_udp=True)
                 else:
-                    upstream_sock = socket.create_connection((host, port), timeout=_s2l_state.TIMEOUT_CONN)
+                    upstream_sock = _s2l_state._connect_outbound(host, port, timeout=_s2l_state.TIMEOUT_CONN)
                     upstream_sock.settimeout(_s2l_state.TUNNEL_TIMEOUT)
             except Exception as exc:
                 err_msg = str(exc)[:200].encode("utf-8", "replace")

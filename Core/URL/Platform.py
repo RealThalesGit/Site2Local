@@ -23,7 +23,30 @@ def detect_platform(target_url: str) -> str:
     if _s2l_state._WAFW00F is None:
         return "Unavailable"
 
-    scanner = _s2l_state._WAFW00F(target_url, timeout=min(_s2l_state.TIMEOUT_READ, 10))
+    class GuardedScanner(_s2l_state._WAFW00F):
+        def Request(self, headers=None, path=None, params=None, delay=0):
+            # WAFW00F's own transport bypasses our sessions and forces
+            # verify=False. Keep its detection logic, replace only I/O.
+            time.sleep(delay)
+            with _s2l_state._make_requests_session() as session:
+                response = session.get(
+                    self.target, headers=headers or self.headers, params=params or {},
+                    timeout=self.timeout, allow_redirects=self.allowredir,
+                    verify=_s2l_state.TLS_VERIFY, stream=True)
+                chunks, total, started = [], 0, time.monotonic()
+                try:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= 2 * 1024 * 1024 or time.monotonic() - started >= self.timeout:
+                            break
+                    response._content = b"".join(chunks)
+                finally:
+                    response.close()
+                self.requestnumber += 1
+                return response
+
+    scanner = GuardedScanner(target_url, timeout=min(_s2l_state.TIMEOUT_READ, 10))
     if scanner.rq is None:
         raise RuntimeError(f"WAFW00F could not reach {target_url}")
 

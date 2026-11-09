@@ -17,10 +17,10 @@ def _make_cffi_session(device: str, base_headers: dict):
     last_exc: Exception | None = None
     for target in candidates:
         try:
-            s = _s2l_state._cffi_requests.Session(impersonate=target, verify=False)
+            s = _s2l_state._cffi_requests.Session(impersonate=target, verify=_s2l_state.TLS_VERIFY)
             s.headers.update(base_headers)
             _s2l_state._cffi_impersonate_cache[device] = target
-            return s
+            return _s2l_state._secure_session(s)
         except Exception as e:
             last_exc = e
             continue
@@ -58,7 +58,7 @@ def _make_session(device: str | None = None):
             # (often Chrome 80-83) that fail browser version checks on modern sites.
             s.headers.update(base_headers)
             s.keep_alive = True
-            s.verify     = False
+            s.verify     = _s2l_state.TLS_VERIFY
             adapter = requests.adapters.HTTPAdapter(
                 max_retries      = _s2l_state._RETRY_POLICY,
                 pool_connections = _s2l_state.POOL_CONNECTIONS,
@@ -67,7 +67,7 @@ def _make_session(device: str | None = None):
             )
             s.mount("https://", adapter)
             s.mount("http://",  adapter)
-            return s
+            return _s2l_state._secure_session(s)
         except Exception as e:
             _s2l_state.log(f"cloudscraper init failed — falling back to requests: {e}", "WARN")
     else:
@@ -76,7 +76,7 @@ def _make_session(device: str | None = None):
 
     s = requests.Session()
     s.headers.update(base_headers)
-    s.verify = False
+    s.verify = _s2l_state.TLS_VERIFY
     adapter = requests.adapters.HTTPAdapter(
         max_retries      = _s2l_state._RETRY_POLICY,
         pool_connections = _s2l_state.POOL_CONNECTIONS,
@@ -85,7 +85,7 @@ def _make_session(device: str | None = None):
     )
     s.mount("https://", adapter)
     s.mount("http://",  adapter)
-    return s
+    return _s2l_state._secure_session(s)
 
 
 def _make_cloudscraper_session(device: str | None = None) -> object:
@@ -111,7 +111,7 @@ def _make_cloudscraper_session(device: str | None = None) -> object:
     s = _s2l_state.cloudscraper.create_scraper(browser=cfg, delay=0)
     s.headers.update(base_headers)
     s.keep_alive = True
-    s.verify     = False
+    s.verify     = _s2l_state.TLS_VERIFY
     adapter = requests.adapters.HTTPAdapter(
         max_retries=_s2l_state._RETRY_POLICY,
         pool_connections=_s2l_state.POOL_CONNECTIONS,
@@ -120,7 +120,7 @@ def _make_cloudscraper_session(device: str | None = None) -> object:
     )
     s.mount("https://", adapter)
     s.mount("http://",  adapter)
-    return s
+    return _s2l_state._secure_session(s)
 
 
 def _make_requests_session(device: str | None = None) -> object:
@@ -138,7 +138,7 @@ def _make_requests_session(device: str | None = None) -> object:
     }
     s = requests.Session()
     s.headers.update(base_headers)
-    s.verify = False
+    s.verify = _s2l_state.TLS_VERIFY
     adapter = requests.adapters.HTTPAdapter(
         max_retries=_s2l_state._RETRY_POLICY,
         pool_connections=_s2l_state.POOL_CONNECTIONS,
@@ -147,4 +147,4 @@ def _make_requests_session(device: str | None = None) -> object:
     )
     s.mount("https://", adapter)
     s.mount("http://",  adapter)
-    return s
+    return _s2l_state._secure_session(s)

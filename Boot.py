@@ -15,11 +15,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # directory the user invokes Boot.py from.
 if os.getcwd() != _HERE:
     os.chdir(_HERE)
-# Importing the package assembles the shared state (Runtime), the Flask app
-# and preserves the historical `import s2l` API (the monolith sits next to
-# this file, so it is importable when running from inside the folder). The
-# PYTHONWARNINGS resource-tracker suppression inside Runtime runs during
-# this import, exactly like it does for `python -m Site2Local`.
+# Importing the package assembles Runtime and the Flask application.
 # Keep a stable package identity while locating its code by this file's path.
 # This also supports directory names containing spaces, dots or hyphens.
 if "Site2Local" not in sys.modules:

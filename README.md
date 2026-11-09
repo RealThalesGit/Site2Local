@@ -102,6 +102,8 @@ All settings live in [Config.py](Config.py). The tables below describe their pur
 | `DONT_REWRITE` | Hosts that the browser should access directly. These resources still need an internet connection. |
 | `BLOCK_PATHS`, `CDN_BLOCK`, `DUMP_TARGETS` | Configure request blocking and discovery scope. |
 | `TIMEOUT_CONN`, `TIMEOUT_READ`, `TIMEOUT_STREAM_READ` | Connection and response timeouts. Streaming has a separate read timeout. |
+| `TLS_VERIFY` | Verify upstream HTTPS and WSS certificates (default `True`). Set `False` only for a trusted test server with an invalid certificate; this disables certificate and hostname checks. Restart after changing it. |
+| `OUTBOUND_PRIVATE_ALLOWLIST` | Private or non-global outbound destinations are blocked, including redirects, WebSockets and TCP/UDP tunnels. For a trusted local service, add its exact `"host:port"`, e.g. `["localhost:8443"]`. Restart after changing it. |
 
 HTML discovery understands `<base href>`, `srcset`, media and poster attributes, lazy-image attributes, and inline styles. CSS discovery handles `url()` and `@import`, including dependencies of external stylesheets. URLs are deduplicated without discarding query strings; fragments and non-HTTP(S) schemes are excluded from downloads.
 
@@ -147,6 +149,7 @@ Isolation enables certain browser features but can block external iframes that d
 | `CAPTURE_BODIES`, `CAPTURE_SKIP_STATIC` | Control what HTTP captures include. |
 | `WEB_CDNVIEWER` | Enable the CDN viewer at `http://localhost:8080/__s2l_viewer__`. |
 | `WEB_CDNVIEWER_IP_WHITELIST` | Restrict access to that viewer when configured. |
+| `WEB_CDNVIEWER_ALLOWED_ORIGINS` | Additional trusted browser origins allowed to read the viewer or reset counters. Empty permits same-origin requests and direct navigation only. This complements the IP allowlist; it is not authentication. |
 | `SCAN_PATHS`, `WORDLISTS_DIR`, `SCANS_PER_SECOND` | Configure optional path discovery from wordlists. |
 | `SSE_PROXY`, `SSE_HEARTBEAT` | Configure Server-Sent Events forwarding and keepalives. |
 | `SHOW_HIDDEN`, `RAINBOW_LOGS` | Optional visibility changes and terminal coloring. |
@@ -215,6 +218,10 @@ See [requirements.txt](requirements.txt) for the package list. Optional dependen
 
 ## Troubleshooting and limitations
 
+Upstream sessions are separated by a signed `HttpOnly` browser cookie rather than by IP address. The cookie is shared across the proxy's CDN ports and is never sent upstream. Browsers must accept cookies to retain a session. Restarting the process invalidates these identities and clears the in-memory upstream sessions. This isolates cookie jars; it does not authenticate access to the proxy. Keep the proxy private or put authentication and network restrictions in front of it.
+
+HTTP backends use an authenticated loopback outbound guard; WebSockets and raw tunnels use the same destination policy. The guard connects to the numeric address that it validated, including on redirected HTTP connections. Environment proxy settings are ignored by upstream sessions. `OUTBOUND_PRIVATE_ALLOWLIST` grants an explicit exception for a trusted `host:port` (`[::1]:8443` for IPv6). An allowed local service must itself be trusted; the exception permits access to that service.
+
 | Symptom | What to check |
 | --- | --- |
 | Missing resources offline | Confirm they were downloaded online, including CDN resources. Offline mode cannot reproduce live APIs, authentication servers, or WebSocket backends. |
@@ -256,7 +263,25 @@ python -B -m unittest discover -s Scripts -p test_hook_editor.py
 python -B -m unittest discover -s Scripts -p test_cdn_cached_hooks.py
 ```
 
-The iframe-origin JavaScript regression in `Scripts/test_injector_origin.py` requires Node.js on `PATH` and skips when unavailable. Other scripts in `Scripts/` include live-browser or environment-specific diagnostics; they are not all standalone offline tests. `-B` avoids creating Python bytecode cache files.
+Run every local regression script, including the adapted historical batteries and the live suites, with:
+
+```sh
+python -X utf8 -B Scripts/run_local_tests.py
+```
+
+Each script runs in its own process. Historical batteries use temporary copies of the current checkout and bundled fixtures; they do not depend on `download/Site2Local`, fixed `/tmp` paths, your personal configuration, or external websites. Use `--legacy-only` for just these batteries, and `--jobs 1` to run sequentially. Failures produce a nonzero exit code; skipped tests are reported separately.
+
+The JavaScript checks need Node.js on `PATH`. Browser isolation uses Playwright Chromium against a fresh local live proxy; it skips explicitly when the browser dependency is unavailable. The optional-dependency battery requires Brotli and Zstandard; the WSS certificate test requires `cryptography`. Missing optional prerequisites are reported as skips. `-B` avoids creating Python bytecode cache files. Unit and cache-fixture tests intentionally remain offline; the HTTP/browser/WSS integration tests make real loopback connections.
+
+Run the real-network integration suite locally (no external website needed):
+
+```sh
+python -X utf8 -B -m unittest discover -s Scripts -p test_live_proxy.py
+```
+
+This starts an HTTP fixture and the real `Boot.py` in a temporary renamed checkout with `OFFLINE=False`. It checks live HTML/assets, POST bodies, browser-session isolation, redirects, blocked private destinations, disk caching, ranges and HEAD. It preserves your configuration and mirrors, stops the test processes, and deletes its temporary files. Optional WAF fingerprinting is disabled in this test; upstream requests are real. This suite does not replace browser or TLS/WebSocket tests.
+
+For manual testing, start the fixture with `python Scripts/local_test_server.py --port 9090`. To proxy it, use `SITE = "127.0.0.1:9090"`, `OFFLINE = False`, `TLS_VERIFY = False` (the fixture is plain HTTP), `CRAWL = False`, and `OUTBOUND_PRIVATE_ALLOWLIST = ["127.0.0.1:9090"]`. Its routes include `/`, `/app.js`, `/style.css`, `/redirect`, `POST /login` (`user=alice`), and `POST /echo`. Keep this fixture bound to loopback.
 
 For a bug report, include the target URL, relevant settings, whether the failure happens on the first load or a reload, server logs, and browser Console/Network errors. Remove credentials and session tokens from shared logs. Contributions and reproducible reports are welcome; this is an independently maintained work in progress.
 

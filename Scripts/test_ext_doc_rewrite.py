@@ -39,9 +39,11 @@ import re
 import shutil
 import sys
 
+from legacy_test_support import legacy_workspace, prepare_legacy
+
 _here    = os.path.dirname(os.path.abspath(__file__))
-SRC_TREE = os.path.join(os.path.dirname(_here), "download", "Site2Local")
-WORK     = "/tmp/s2l_extdoc"
+SRC_TREE = os.path.dirname(_here)
+WORK = legacy_workspace("test_ext_doc_rewrite")
 
 WIDGET_HTML = (b"<!DOCTYPE html><html><head>"
                b'<link rel="stylesheet" href="/assets/fdf2a99770058b1f.css">'
@@ -52,11 +54,7 @@ WIDGET_CSS = (b"@font-face{font-family:Whitney;src:url(/assets/03dcf979852e8b8e.
 
 
 def build_test_env():
-    if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
-    os.makedirs(WORK)
-    shutil.copytree(SRC_TREE, os.path.join(WORK, "Site2Local"),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    prepare_legacy(WORK)
     cfg = os.path.join(WORK, "Site2Local", "Config.py")
     txt = open(cfg, encoding="utf-8").read()
     txt = re.sub(r'SITE\s*=\s*"[^"]*"', 'SITE = "aya.nodium.lol"', txt)
@@ -212,22 +210,24 @@ def main() -> int:
           f"status={r.status_code}")
 
     # ── ER10: source contract — every EXT/CDN serve path calls the pass ──
-    n_calls = 0
-    offenders = []
-    for rel in ("Proxy/Assets.py", "CDN/Server.py"):
-        src = open(os.path.join(WORK, "Site2Local", rel), encoding="utf-8").read()
-        n_calls += len(re.findall(r"rewrite_doc_relative\(", src))
-        for m in re.finditer(r'"text/html"\s+in\s+\w+', src):
-            # window spans BEFORE and AFTER the match: the hit-path calls
-            # pass "text/html" in _ctb as the html_doc= argument, i.e. the
-            # rewrite_doc_relative call sits just BEFORE that match.
-            blk = src[max(0, m.start() - 400):m.start() + 900]
-            if "rewrite_doc_relative" not in blk:
-                offenders.append(f"{rel}@{src[:m.start()].count(chr(10))+1}")
-    check("ER10 source contract: 6 call sites (Assets×3, Server×3), every "
-          "text/html branch covered",
-          n_calls == 6 and not offenders,
-          f"found={n_calls} offenders={offenders}")
+    # Cached responses share one implementation; fresh paths remain per route.
+    import ast
+    contracts = {}
+    for rel in ("Proxy/Assets.py", "CDN/Server.py", "Proxy/Cache/Serve.py"):
+        tree = ast.parse(open(os.path.join(WORK, "Site2Local", rel), encoding="utf-8").read())
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "rewrite_doc_relative"]
+        if rel == "Proxy/Cache/Serve.py":
+            contracts[rel] = any(any(kw.arg == "html_doc" for kw in node.keywords) for node in calls)
+        else:
+            flags = {kw.value.value for node in calls for kw in node.keywords
+                     if kw.arg == "html_doc" and isinstance(kw.value, ast.Constant)}
+            shared_cache = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                               and node.func.attr == "_cached_response" for node in ast.walk(tree))
+            contracts[rel] = flags == {True, False} and shared_cache
+    check("ER10 fresh HTML/CSS and shared cache all use document rewriting",
+          all(contracts.values()), str(contracts))
 
     print("\n=== SUMMARY ===")
     n_ok = sum(1 for _, ok in results if ok)

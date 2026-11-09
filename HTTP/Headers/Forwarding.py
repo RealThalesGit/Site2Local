@@ -14,7 +14,8 @@ def filter_fwd(headers: dict) -> dict:
     # instead of hoping every name is in the static list.
     skip |= _s2l_state._connection_tokens(
         _s2l_state._ci_get_header(headers, "Connection", ""))
-    return {k: v for k, v in headers.items() if k.lower() not in skip}
+    return _s2l_state._strip_browser_cookie(
+        {k: v for k, v in headers.items() if k.lower() not in skip})
 
 
 def inject_csrf_headers(fwd: dict) -> None:

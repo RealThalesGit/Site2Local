@@ -29,7 +29,7 @@ def _fetch_external_asset(u: str) -> None:
             # download large WASM/asset bundles that timeout at 12s.
             r    = _s2l_state._get_proxy_session().get(u,
                                              timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_STREAM_READ),
-                                             verify=False)
+                                             verify=_s2l_state.TLS_VERIFY)
             body = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
             # Never cache bot/CAPTCHA pages — they would poison the asset cache
             if _s2l_state._is_bot_page(body, r.status_code, urlparse(u).path):

@@ -198,6 +198,8 @@ from .Config import (
     DEVICE,
     TIMEOUT_READ,
     TIMEOUT_CONN,
+    TLS_VERIFY,
+    OUTBOUND_PRIVATE_ALLOWLIST,
     TIMEOUT_STREAM_READ,
     WORKERS,
     MAX_FNAME,
@@ -232,6 +234,7 @@ from .Config import (
     CAPTURE_WS,
     WEB_CDNVIEWER,
     WEB_CDNVIEWER_IP_WHITELIST,
+    WEB_CDNVIEWER_ALLOWED_ORIGINS,
     WS_PING_INTERVAL,
     WS_PONG_TIMEOUT,
     WS_AUTO_RECONNECT,
@@ -999,24 +1002,11 @@ _ws_ctx_lock = threading.Lock()
 # direction is "in" (browser→server) or "out" (server→browser)
 _WS_MSG_HOOKS: list[Callable] = []
 
-# NOTE: the old v1 `_pump_ws_frames` has been removed. The WS pipeline now
-# exclusively uses `_pump_ws_frames_v2` (above) which is a strict superset —
-# same frame relay, plus optional keepalive, permessage-deflate, frame
-# logging, GUI hooks, and capture. When all those features are disabled
-# (the defaults), v2 behaves identically to what v1 did, so there is no
-# functional regression — only one code path to maintain.
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Server-Sent Events proxy (text/event-stream)
 #
-# SSE is unidirectional (server→browser) over a long-lived HTTP connection.
-# The standard _stream_resp path works but has two problems for SSE:
-#   1. Werkzeug's iter_content chunks arbitrarily across event boundaries,
-#      so a browser's EventSource may receive half an event per chunk and
-#      block waiting for the rest. We re-buffer to whole-event boundaries.
-#   2. Many SSE endpoints go quiet for minutes between events; intermediate
-#      proxies/CDNs may close idle connections. (Keepalive injection is
-#      currently a pass-through — the stream is forwarded unchanged.)
+# HTTP/Streaming/SSE.py reassembles event boundaries and injects heartbeat
+# comments when SSE_HEARTBEAT is enabled to keep idle connections alive.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1344,6 +1334,10 @@ from .Network.Server import (
     _PooledWSGIServer,
     _S2LWSGIRequestHandler,
 )
+from .Network.Outbound import _secure_session, _connect_outbound
+from .HTTP.Sessions.Clients import (
+    _ensure_browser_session, _set_browser_cookie, _browser_cookies, _strip_browser_cookie,
+)
 from .HTTP.Sessions import (
     _sanitize_ua,
     _detect_device_from_ua,
@@ -1457,7 +1451,7 @@ from .Application import create_app
 # above. Nothing earlier in this module reads these values at import time.
 SITE_URL  = build_base_url(SITE) or f"http://{SITE}"
 MAIN_HOST = urlparse(SITE_URL).netloc
-SITE_NAME = MAIN_HOST.removeprefix("www.").replace(".", "_")
+SITE_NAME = _safe_seg(MAIN_HOST.removeprefix("www.").replace(".", "_"))
 SRC_FOLDER  = os.path.join("site_src",  SITE_NAME)
 DATA_FOLDER = os.path.join("site_data", SITE_NAME)
 

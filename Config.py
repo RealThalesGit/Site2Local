@@ -59,7 +59,9 @@ PORT = 8080                    # listen port
 DEVICE = "auto"                # UA profile: auto|mobile|macintosh|ie11|iphone|ipad|bot — auto mirrors the requesting browser's own UA
 TIMEOUT_READ = 12              # upstream read timeout (s)
 TIMEOUT_CONN = 6               # upstream connect timeout (s)
+TLS_VERIFY = True              # verify upstream HTTPS/WSS certificates; False permits invalid certificates
 TIMEOUT_STREAM_READ = 120      # streaming read timeout (s) — longer for video/audio
+OUTBOUND_PRIVATE_ALLOWLIST = [] # trusted private destinations as "host:port"; empty blocks non-global IPs
 WORKERS = 60                   # crawler thread-pool size
 MAX_FNAME = 180                # max on-disk path-segment length
 SAVE_BATCH = 32                # files per save-flush
@@ -113,6 +115,7 @@ CAPTURE_WS = False                # record every WebSocket message (text+binary)
 # surface. Flip either on to expose the corresponding self-contained viewer.
 WEB_CDNVIEWER    = True            # /__s2l_viewer__ + /__s2l_viewer_data__ + /__s2l_reset_stats__
 WEB_CDNVIEWER_IP_WHITELIST = []      # empty = allow anyone; otherwise e.g. ["192.168.1.20", "2001:db8::10"]
+WEB_CDNVIEWER_ALLOWED_ORIGINS = []  # same-origin by default; extra trusted origins, e.g. ["https://dashboard.example"]
 # ──────────────────────────────────────────────────────────────────────────────
 # LAYER 2 CONFIG
 # ──────────────────────────────────────────────────────────────────────────────

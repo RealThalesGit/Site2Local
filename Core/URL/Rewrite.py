@@ -78,11 +78,8 @@ def build_base_url(raw: str) -> str | None:
     Default to https:// (the common case) and return immediately without any
     network call.
 
-    verify=False is mandatory here: curl_cffi's Session defaults to real
-    certificate verification, and targets with a self-signed cert, a hostname
-    mismatch, or a CA bundle libcurl can't find (common on Termux) would fail
-    silently. The session itself is built with verify=False too — this is
-    belt-and-suspenders.
+    TLS_VERIFY also applies to startup probes. With verification enabled,
+    do not silently downgrade an unsuccessful HTTPS probe to plain HTTP.
     """
     if _s2l_state.OFFLINE:
         # No upstream — don't probe. Default to https:// (the common case),
@@ -93,9 +90,9 @@ def build_base_url(raw: str) -> str | None:
 
     s = _s2l_state._make_session()
     try:
-        for scheme in ("https://", "http://"):
+        for scheme in (("https://",) if _s2l_state.TLS_VERIFY else ("https://", "http://")):
             try:
-                r = s.get(scheme + raw, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=False)
+                r = s.get(scheme + raw, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY)
                 if r.status_code < 500:
                     try:
                         platform = _s2l_state.detect_platform(r.url)

@@ -202,6 +202,6 @@ def _host_dir_of(p) -> str:
 
     Stripping the port avoids ":" in directory names (invalid on Windows).
     """
-    host_dir = p.netloc.split("@")[-1].split(":")[0]
+    host_dir = p.hostname or "_invalid_host"
     host_dir = host_dir.removeprefix("www.") if host_dir.startswith("www.") else host_dir
-    return host_dir
+    return _s2l_state._safe_seg(host_dir)

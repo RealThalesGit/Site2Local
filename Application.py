@@ -17,6 +17,8 @@ def create_app(app: Flask | None = None) -> Flask:
         app = Flask(__name__, static_folder=None)
         app.config['MAX_CONTENT_LENGTH'] = state.MAX_BODY_BYTES
     app.before_request(state._normalize_request_origin)
+    app.before_request(state._ensure_browser_session)
+    app.after_request(state._set_browser_cookie)
     app.after_request(state._main_security_headers)
 
     app.add_url_rule('/.__s2l_hp', view_func=state._s2l_hp_endpoint, methods=['GET'])

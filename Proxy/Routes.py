@@ -479,10 +479,10 @@ def proxy(path: str) -> Response:
             forced_r = _s2l_state._get_proxy_session().get(
                 target,
                 headers={"Host": _s2l_state.MAIN_HOST, "Cache-Control": "no-cache", "Pragma": "no-cache"},
-                cookies=flask_request.cookies,
+                    cookies=_s2l_state._browser_cookies(),
                 timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ),
                 allow_redirects=True,
-                verify=False,
+                verify=_s2l_state.TLS_VERIFY,
             )
             body       = _s2l_state.decompress_body(forced_r.content, forced_r.headers.get("Content-Encoding", ""))
             upstream_r = forced_r
@@ -648,7 +648,7 @@ def proxy(path: str) -> Response:
                 # WASM/asset bundles that would timeout at TIMEOUT_READ=12s.
                 cdn_r    = _s2l_state._get_proxy_session().get(cdn_url,
                                                      timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_STREAM_READ),
-                                                     verify=False)
+                                                     verify=_s2l_state.TLS_VERIFY)
                 cdn_body = _s2l_state.decompress_body(cdn_r.content, cdn_r.headers.get("Content-Encoding", ""))
                 ct       = _s2l_state._ensure_wasm_content_type(
                     cdn_r.headers.get("Content-Type", "application/octet-stream"),
@@ -694,10 +694,10 @@ def proxy(path: str) -> Response:
             refetch_r = refetch_sess.get(
                 target,
                 headers=refetch_hdrs,
-                cookies=flask_request.cookies,
+                    cookies=_s2l_state._browser_cookies(),
                 timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ),
                 allow_redirects=True,
-                verify=False,
+                verify=_s2l_state.TLS_VERIFY,
             )
             refetch_body = _s2l_state.decompress_body(refetch_r.content, refetch_r.headers.get("Content-Encoding", ""))
             if not _s2l_state._is_wire_payload(refetch_body) and _s2l_state._is_valid_html(refetch_body):

@@ -28,11 +28,11 @@ import sys
 import zlib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent / "download" / "Site2Local"
-sys.path.insert(0, str(ROOT.parent))
+from legacy_test_support import load_legacy_runtime
+
+ROOT, S = load_legacy_runtime("test_stream_worker")
 
 from flask import Flask  # noqa: E402
-from Site2Local import Runtime as S  # noqa: E402
 
 app = Flask(__name__)  # only for test_request_context
 

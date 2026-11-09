@@ -28,6 +28,7 @@ class UpstreamRetryTests(unittest.TestCase):
             MAIN_HOST='example.com', SITE_URL='https://example.com',
             rewrite_origin=lambda *a: None, inject_csrf_headers=lambda *a: None,
             DEVICE='macintosh', _sanitize_ua=lambda ua: ua,
+            TLS_VERIFY=True, _browser_cookies=lambda: {},
             UA_PROFILES={'macintosh': 'UA'}, TIMEOUT_READ=12, TIMEOUT_CONN=5,
             _flatten_cookiejar=lambda *a, **kw: {},
             _BODY_METHODS={'POST', 'PUT', 'PATCH', 'DELETE'},

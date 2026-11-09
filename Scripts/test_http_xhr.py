@@ -35,20 +35,18 @@ import subprocess
 import sys
 import tempfile
 
+from legacy_test_support import legacy_workspace, prepare_legacy
+
 _here    = os.path.dirname(os.path.abspath(__file__))
-SRC_TREE = os.path.join(os.path.dirname(_here), "download", "Site2Local")
-WORK     = "/tmp/s2l_httpxhr"
+SRC_TREE = os.path.dirname(_here)
+WORK = legacy_workspace("test_http_xhr")
 
 CORE_START = "function __s2l_core("
 CORE_END = "return rw;}"
 
 
 def build_test_env():
-    if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
-    os.makedirs(WORK)
-    shutil.copytree(SRC_TREE, os.path.join(WORK, "Site2Local"),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    prepare_legacy(WORK)
     cfg = os.path.join(WORK, "Site2Local", "Config.py")
     txt = open(cfg, encoding="utf-8").read()
     txt = re.sub(r'SITE\s*=\s*"[^"]*"', 'SITE = "aya.nodium.lol"', txt)

@@ -17,6 +17,8 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
     cdn_app = Flask(f"cdn_{cdn_host}", static_folder=None)
     # OOM FIX: bound request bodies on the CDN mini-servers too.
     cdn_app.config["MAX_CONTENT_LENGTH"] = _s2l_state.MAX_BODY_BYTES
+    cdn_app.before_request(_s2l_state._ensure_browser_session)
+    cdn_app.after_request(_s2l_state._set_browser_cookie)
 
     @cdn_app.after_request
     def _cdn_security_headers(response: Response) -> Response:
@@ -151,7 +153,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 "headers":         ctx.req_headers,
                 "timeout":         (_s2l_state.TIMEOUT_CONN, _read_timeout_c),
                 "allow_redirects": True,
-                "verify":          False,
+                "verify":          _s2l_state.TLS_VERIFY,
             }
             if method in _s2l_state._BODY_METHODS:
                 kw["data"] = ctx.req_body
@@ -187,7 +189,7 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                         _retry_r = _s2l_state._get_client_session().request(
                             method, cdn_url, headers=_retry_hdrs,
                             timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ),
-                            allow_redirects=True, verify=False, stream=False)
+                            allow_redirects=True, verify=_s2l_state.TLS_VERIFY, stream=False)
                         _retry_body = _retry_r.content
                         if _retry_body:
                             body = _retry_body

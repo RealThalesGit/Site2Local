@@ -1,24 +1,37 @@
-#!/usr/bin/env python3
-"""Drive a REAL headless Chromium against the live S2L mirror of
-aya.nodium.lol and report crossOriginIsolated + every console error."""
-from playwright.sync_api import sync_playwright
+"""Real Chromium isolation checks against the isolated local live proxy."""
+import unittest
+import test_live_proxy as live
 
-with sync_playwright() as p:
-    b = p.chromium.launch(args=["--enable-features=SharedArrayBuffer"])
-    pg = b.new_page()
-    errors, pageerrors = [], []
-    pg.on("console", lambda m: errors.append(f"[{m.type}] {m.text[:300]}") if m.type in ("error", "warning") else None)
-    pg.on("pageerror", lambda e: pageerrors.append(str(e)[:400]))
-    pg.goto("http://localhost:8080/", wait_until="domcontentloaded", timeout=60000)
-    pg.wait_for_timeout(8000)
-    iso = pg.evaluate("window.crossOriginIsolated")
-    sab = pg.evaluate("typeof SharedArrayBuffer")
-    print("crossOriginIsolated:", iso)
-    print("SharedArrayBuffer:", sab)
-    print("--- page errors ---")
-    for e in pageerrors[:10]:
-        print(" *", e)
-    print("--- console errors/warnings ---")
-    for e in errors[:15]:
-        print(" *", e)
-    b.close()
+class BrowserIsolationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise unittest.SkipTest("Install Playwright and Chromium to run browser checks")
+        cls.playwright = sync_playwright().start()
+        cls.addClassCleanup(cls.playwright.stop)
+        from pathlib import Path
+        if not Path(cls.playwright.chromium.executable_path).exists():
+            raise unittest.SkipTest("Playwright Chromium is not installed")
+        cls.browser = cls.playwright.chromium.launch(headless=True)
+        cls.addClassCleanup(cls.browser.close)
+        cls.fixture = type("BrowserProxyFixture", (live.LiveProxyTests,),
+                           {"CONFIG_OVERRIDES": {"CROSS_ORIGIN_ISOLATION": True}})
+        cls.addClassCleanup(cls.fixture.doClassCleanups)
+        cls.fixture.setUpClass()
+
+    def test_live_page_is_isolated_and_javascript_runs(self):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        failures = []
+        page.on("pageerror", lambda error: failures.append(str(error)))
+        page.goto(self.fixture.base, wait_until="networkidle", timeout=20000)
+        self.assertEqual(page.title(), "Site2Local live test")
+        self.assertTrue(page.evaluate("window.liveFixture === true"))
+        self.assertTrue(page.evaluate("window.crossOriginIsolated"))
+        self.assertEqual(page.evaluate("typeof SharedArrayBuffer"), "function")
+        self.assertEqual(failures, [])
+
+if __name__ == "__main__":
+    unittest.main()

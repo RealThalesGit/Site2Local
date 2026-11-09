@@ -277,7 +277,11 @@ Optional TCP/UDP tunnels carry traffic over WebSocket. Their flags are separate 
 
 [HTTP/Sessions/](HTTP/Sessions/) contains upstream client selection, device profiles, and session/block helpers. Client choices include `curl_cffi`, cloudscraper-compatible implementations, and requests depending on availability.
 
-Main request sessions are keyed by an IP-derived identifier, not a browser-profile identity. Browsers sharing an address can therefore share a session identifier. Background fetches use their own request context/session path and may not have the authentication state of an interactive browser.
+Main request sessions use a random, signed `HttpOnly` browser cookie rather than an IP-derived identifier. Browsers sharing an IP have separate upstream cookie jars. The identity is shared across CDN ports, excluded from upstream requests, and protected against replacement by upstream `Set-Cookie` headers. In-memory sessions expire and are capped at 512 entries; restarting invalidates browser identities. Background fetches use separate sessions and do not inherit interactive authentication state.
+
+`Network/Outbound.py` applies a shared outbound destination policy. HTTP backends use an authenticated loopback proxy so every connection, including redirects, connects to a checked numeric address rather than resolving the hostname again. Native WebSockets and raw tunnels use the same resolver and connector. Non-global, multicast, reserved and private addresses are denied unless an exact `host:port` is configured in `OUTBOUND_PRIVATE_ALLOWLIST` (bracket IPv6 hosts). Environment proxy settings are ignored. Optional WAF detection uses the guarded requests transport too.
+
+`TLS_VERIFY` controls certificate and hostname validation for HTTPS/WSS, including startup probes and retry paths. Enabling it prevents startup from silently falling back to HTTP. It is independent of destination restrictions: disabling certificate validation does not permit private network access. These controls do not authenticate incoming clients; restrict network exposure or add an authenticated gateway before publishing the service.
 
 Cookie/header rewriting, TLS impersonation, retries, and block-page checks improve compatibility but do not reproduce all browser state or defeat every upstream restriction. Cookie-domain/path handling and origin-specific SDK checks remain important boundaries to investigate for login problems. Do not interpret a successful transport connection as successful authentication or application startup.
 

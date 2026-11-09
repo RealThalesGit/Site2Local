@@ -12,11 +12,7 @@ def filter_resp(headers: dict, body: bytes = b"", is_top_level_html: bool = Fals
                 is_worker_script: bool | None = None) -> dict:
     # Strip security headers that block our local proxy, plus hop-by-hop headers.
     # `is_worker_script`: None (default) = auto-detect from Sec-Fetch-Dest, so
-    # callers that don't care keep the exact pre-existing behavior; an explicit
-    # bool overrides. The streaming path (HTTP/Streaming/Response.py) has passed
-    # this keyword since the Worker hardening, but the signature never accepted
-    # it — every streamed response (large downloads, media, 206 ranges) died
-    # with TypeError until Fix 13 added the parameter.
+    # callers use automatic detection unless they pass an explicit bool.
     skip = _s2l_state._HOP_BY_HOP | {
         "content-encoding",
         "content-security-policy", "content-security-policy-report-only",

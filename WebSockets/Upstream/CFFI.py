@@ -44,7 +44,8 @@ class _CffiUpstreamWS:
         # the same TLS fingerprint as the main page) instead of creating a
         # fresh one. This is what fixes CF-protected WS endpoints
         # — a fresh session has no cookies and gets 403'd by Cloudflare.
-        sess, should_close = _s2l_state._get_session_for_ws()
+        sess, should_close = _s2l_state._get_session_for_ws(extra_headers)
+        hdrs = _s2l_state._strip_browser_cookie(hdrs)
         if not hasattr(sess, "ws_connect"):
             if should_close:
                 try: sess.close()

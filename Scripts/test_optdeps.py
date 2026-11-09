@@ -34,11 +34,11 @@ import types
 import zlib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent / "download" / "Site2Local"
-sys.path.insert(0, str(ROOT.parent))
+from legacy_test_support import load_legacy_runtime
+
+ROOT, S = load_legacy_runtime("test_optdeps")
 
 from flask import Flask  # noqa: E402
-from Site2Local import Runtime as S  # noqa: E402
 
 app = Flask(__name__)
 RESULTS = []
@@ -49,8 +49,12 @@ def check(name, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
 
 
-import brotli       # noqa: E402  (present in this sandbox)
-import zstandard    # noqa: E402  (installed for this battery)
+try:
+    import brotli
+    import zstandard
+except ImportError as exc:
+    print(f"[SKIP] optional compression dependency unavailable: {exc}")
+    sys.exit(77)
 
 # --------------------------------------------------------------------------
 # OD1 — brotli one-shot regression
@@ -188,6 +192,8 @@ TIER_BLOCK = m.group(1)
 def _tier_scenario(mods):
     saved = {k: sys.modules.get(k) for k in ("ai_cloudscraper", "cloudscraper")}
     try:
+        for k in saved:
+            sys.modules[k] = None  # Mask installed packages in the missing-tier scenario.
         for k in mods:
             sys.modules[k] = types.ModuleType(k)
         ns: dict = {}

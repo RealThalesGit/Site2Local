@@ -16,7 +16,7 @@ def _parse_range_header(range_hdr: str, file_size: int) -> tuple[int, int] | Non
     if not range_hdr or file_size <= 0:
         return None
     try:
-        m = re.match(r"bytes=(\d*)-(\d*)", range_hdr.strip())
+        m = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", range_hdr.strip())
         if not m:
             return None
         start_s, end_s = m.group(1), m.group(2)

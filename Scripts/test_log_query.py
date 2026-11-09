@@ -24,9 +24,11 @@ import re
 import shutil
 import sys
 
+from legacy_test_support import legacy_workspace, prepare_legacy
+
 _here    = os.path.dirname(os.path.abspath(__file__))
-SRC_TREE = os.path.join(os.path.dirname(_here), "download", "Site2Local")
-WORK     = "/tmp/s2l_logtest"
+SRC_TREE = os.path.dirname(_here)
+WORK = legacy_workspace("test_log_query")
 
 JS_PLAIN = b"// no-query build\n" + b"console.log('plain');\n" * 60
 JS_A     = b"// variant aaa111\n" + b"console.log('aaa');\n" * 40
@@ -34,11 +36,7 @@ JS_B     = b"// variant bbb222\n" + b"console.log('bbb');\n" * 20
 
 
 def build_test_env():
-    if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
-    os.makedirs(WORK)
-    shutil.copytree(SRC_TREE, os.path.join(WORK, "Site2Local"),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    prepare_legacy(WORK)
     cfg = os.path.join(WORK, "Site2Local", "Config.py")
     txt = open(cfg, encoding="utf-8").read()
     txt = re.sub(r'SITE\s*=\s*"[^"]*"', 'SITE = "aya.nodium.lol"', txt)
@@ -142,7 +140,7 @@ def main():
     r, out = get("/__s2l_ext__/fonts.googleapis.com/css2?family=Test:wght@400&display=swap")
     check("L7 [EXT] HIT shows query",
           r.status_code == 200
-          and "[EXT] GET HIT fonts.googleapis.com/css2?family=Test:wght@400&display=swap" in out,
+          and "GET HIT fonts.googleapis.com/css2?family=Test:wght@400&display=swap" in out,
           f"{r.status_code} {lastline(out)}")
 
     # ── L8: [EXT] offline 404 (not cached) shows the query too ─────────────

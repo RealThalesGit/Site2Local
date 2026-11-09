@@ -17,6 +17,11 @@ def log(msg: str, level: str = "INFO") -> None:
     with _s2l_state._log_lock:
         if _s2l_state.RAINBOW_LOGS:
             line = _s2l_state._lolcat_real(line) or _s2l_state._lolcat_internal(line)
+        output = (sys.stderr if _s2l_state._TQDM_OK
+                  and _s2l_state._active_scan_pbar is not None else sys.stdout)
+        encoding = getattr(output, "encoding", None)
+        if encoding:
+            line = line.encode(encoding, errors="backslashreplace").decode(encoding)
         # When a tqdm progress bar is active (SCAN_PATHS), route ALL log
         # output through tqdm.write() so log lines from any thread appear
         # ABOVE the bar instead of corrupting it mid-line. Without this,

@@ -73,7 +73,7 @@ def _crawl(u: str) -> None:
         if _s2l_state._is_host_dead(netloc):
             return
         try:
-            r = _s2l_state._get_proxy_session().get(u, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=False)
+            r = _s2l_state._get_proxy_session().get(u, timeout=(_s2l_state.TIMEOUT_CONN, _s2l_state.TIMEOUT_READ), verify=_s2l_state.TLS_VERIFY)
         except _s2l_state._CONN_ERRORS as e:
             _s2l_state.log(f"Skipping {netloc} — {_s2l_state._short_exc(e)}", "WARN")
             _s2l_state._mark_host_dead(netloc)

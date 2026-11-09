@@ -21,9 +21,11 @@ reproduce the field scenarios from the 2026-11-07/08 test sessions:
 """
 import os, re, shutil, sys
 
+from legacy_test_support import legacy_workspace, prepare_legacy
+
 _here    = os.path.dirname(os.path.abspath(__file__))
-SRC_TREE = os.path.join(os.path.dirname(_here), "download", "Site2Local")
-WORK     = "/tmp/s2l_test"
+SRC_TREE = os.path.dirname(_here)
+WORK = legacy_workspace("test_aya_e2e")
 # Fixtures resolve in this order: S2L_AYA_FIXTURES env var → the packed
 # scripts/fixtures/ folder shipped next to this battery → the maintainer's
 # /tmp/aya drop. Needs: index.html, app.css, fonts.css, Aya.App.js, and
@@ -40,11 +42,7 @@ FONTS_EXT = "/__s2l_ext__/fonts.googleapis.com/css2?family=Montserrat%3Awght@400
 
 
 def build_test_env():
-    if os.path.isdir(WORK):
-        shutil.rmtree(WORK)
-    os.makedirs(WORK)
-    shutil.copytree(SRC_TREE, os.path.join(WORK, "Site2Local"),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    prepare_legacy(WORK)
     cfg = os.path.join(WORK, "Site2Local", "Config.py")
     txt = open(cfg, encoding="utf-8").read()
     txt = re.sub(r'SITE\s*=\s*"[^"]*"', 'SITE = "aya.nodium.lol"', txt)
@@ -288,16 +286,12 @@ def main():
     check("C8 lying .js → text/css", ct.startswith("text/css"), ct)
 
     # ── C8b: obscure extension (.gl mapped to video/gl) serving JS ────────
-    import urllib.request
-    try:
-        gg = urllib.request.urlopen("https://unpkg.com/globe.gl", timeout=15).read(4096)
-    except Exception:
-        gg = (b"(function (global, factory) { typeof exports === 'object' && typeof module !== 'undefined'"
-              b" ? factory(exports) : typeof define === 'function' && define.amd ? define(['exports'], factory)"
-              b" : (global = typeof globalThis !== 'undefined' ? globalThis : global || self,"
-              b" factory(global.Globe = {})); })(this, (function (exports) { 'use strict';"
-              b" var THREE = window.THREE; function sel() { return typeof document; }"
-              b" exports.Globe = Globe; Object.defineProperty(exports, '__esModule', { value: true });}));")
+    gg = (b"(function (global, factory) { typeof exports === 'object' && typeof module !== 'undefined'"
+          b" ? factory(exports) : typeof define === 'function' && define.amd ? define(['exports'], factory)"
+          b" : (global = typeof globalThis !== 'undefined' ? globalThis : global || self,"
+          b" factory(global.Globe = {})); })(this, (function (exports) { 'use strict';"
+          b" var THREE = window.THREE; function sel() { return typeof document; }"
+          b" exports.Globe = Globe; Object.defineProperty(exports, '__esModule', { value: true });}));")
     lp_gl = os.path.join(host, "assets", "globe.gl")
     with open(lp_gl, "wb") as f:
         f.write(gg)
