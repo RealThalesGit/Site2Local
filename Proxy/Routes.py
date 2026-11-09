@@ -715,13 +715,12 @@ def proxy(path: str) -> Response:
                 else Fore.RED)
     _is_api  = any(x in ctx.resp_ct for x in ("json", "xml", "event-stream"))
     _lbl     = "API" if _is_api else "HTML" if "text/html" in ctx.resp_ct else "   "
-    _suppress = _s2l_state.is_subresource(ctx.resp_ct) and not _is_api
     _host_disp = _s2l_state._fmt_host(urlparse(target).netloc)
-    if not _suppress:
-        _waf_name = _s2l_state.get_last_platform().get("name", "Unknown")
-        _s2l_state.log(f"{method} {sc_color}{upstream_r.status_code}{Style.RESET_ALL}"
-            f" {_lbl} {_host_disp}{_s2l_state._fmt_path_qs(req_path)} {_s2l_state._fmt_size(len(body))}"
-            + (f" [{_waf_name}]" if _waf_name != "Unknown" else ""), "→")
+    # Log every upstream response, including JS/CSS/fonts/images on cache misses.
+    _waf_name = _s2l_state.get_last_platform().get("name", "Unknown")
+    _s2l_state.log(f"{method} {sc_color}{upstream_r.status_code}{Style.RESET_ALL}"
+        f" {_lbl} {_host_disp}{_s2l_state._fmt_path_qs(req_path)} {_s2l_state._fmt_size(len(body))}"
+        + (f" [{_waf_name}]" if _waf_name != "Unknown" else ""), "→")
     if upstream_r.status_code >= 400:
         _s2l_state.stats.inc("http_errors")
     if _s2l_state.SHOW_HIDDEN and _s2l_state.is_html(ctx.resp_body, ctx.resp_ct):
