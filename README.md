@@ -52,7 +52,7 @@ Run a website through a local Python proxy, save the resources you visit, and ed
 
 4. Open **http://localhost:8080**. Browse normally to fetch and save resources. Stop with **Ctrl+C** and allow pending saves to drain.
 
-With the example's `CRAWL = True`, startup includes an initial crawl before the proxy starts listening. Set `CRAWL = False` if you want to open the proxy without waiting for that crawl.
+With the example's `CRAWL = True`, the initial crawl runs in the background while the proxy starts. You can browse while files are discovered and downloaded. Set `CRAWL = False` to skip that initial crawl.
 
 Restart the application after changing configuration flags. `Boot.py` keeps generated paths relative to the project folder. You can also run `python -m Site2Local` from its parent directory.
 
@@ -264,5 +264,5 @@ For a bug report, include the target URL, relevant settings, whether the failure
 
 - [Configuration reference in the source](Config.py)
 - [Modular map and response pipeline](MODULAR_MAP.md)
-- [Historical technical documentation](DOCUMENTARY.MD) — describes the older V8.1 monolith; some details differ from the current package.
+- [Technical reference](DOCUMENTARY.MD) — current modular architecture, request pipelines, cache behavior, hooks, and operational limits.
 - [Apache 2.0 license](LICENSE)
