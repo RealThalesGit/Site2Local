@@ -79,6 +79,21 @@ class HookEditorTests(unittest.TestCase):
             self.assertEqual(ctx.resp_ct, ct)
             self.assertEqual(ctx.resp_body, body)
 
+    def test_query_specific_hook_does_not_match_other_parameter_values(self):
+        self.hook(b'{"edited":true}', r'^/api/data\?id=1$')
+        for query, expected in (("id=1", b'{"edited":true}'), ("id=2", b"original")):
+            ctx = self.context("/api/data", "application/json")
+            ctx.query = query
+            self.hooks["_apply_gui_hooks"](ctx)
+            self.assertEqual(ctx.resp_body, expected)
+
+    def test_existing_path_only_patterns_still_match_requests_with_query(self):
+        self.hook(b"body{color:red}", r'^/style\.css$')
+        ctx = self.context("/style.css", "text/css")
+        ctx.query = "v=123"
+        self.hooks["_apply_gui_hooks"](ctx)
+        self.assertEqual(ctx.resp_body, b"body{color:red}")
+
 
 if __name__ == "__main__":
     unittest.main()

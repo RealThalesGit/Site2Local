@@ -88,36 +88,9 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 _rng_c = _s2l_state._serve_range_from_disk(lp, cdn_url, method, "/" + p.lstrip("/"))
                 if _rng_c is not None:
                     return _rng_c
-            _c304 = _s2l_state._conditional_304(lp, _s2l_state._resolve_mime_with_sniff(lp))
-            if _c304 is not None:
-                _s2l_state.stats.inc("cache_304")
-                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT 304 {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)}", "CDN")
-                return _c304
-            result = _s2l_state._serve_cached(lp)
-            if result is not None:
-                data, ct = result
-                # Fix 17 — the root-relative pass on cache HITs (same rule as
-                # ext_asset): root-relative URLs need THIS mini-server's host
-                # to resolve, or they land on the main-site route.
-                _ctb_c = ct.split(";")[0].strip().lower()
-                if _s2l_state.PROXY_CDN and ("text/html" in _ctb_c or "text/css" in _ctb_c):
-                    data = _s2l_state.rewrite_doc_relative(
-                        data, cdn_host, html_doc=("text/html" in _ctb_c))
-                _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} {method} HIT {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} {_s2l_state._fmt_size(len(data))}", "CDN")
-                resp = Response(data, content_type=ct)
-                if ct.startswith("text/html") or "json" in ct:
-                    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                else:
-                    resp.headers["Cache-Control"] = "no-cache"
-                    _val = _s2l_state._disk_validators(lp, ct)
-                    if _val:
-                        resp.headers["ETag"] = _val[0]
-                        resp.headers["Last-Modified"] = _val[1]
-                _s2l_state._apply_cors_headers(resp.headers)
-                _s2l_state._apply_isolation_headers(resp.headers,
-                                         is_worker_script=_s2l_state._is_worker_request())
-                _s2l_state._apply_security_headers(resp.headers)
-                return resp
+            cached = _s2l_state._cached_response(lp, cdn_url, method, "/" + p.lstrip("/"))
+            if cached is not None:
+                return cached
 
         if _s2l_state.OFFLINE:
             _s2l_state.log(f"CDN {method} 404 {_s2l_state._fmt_host(cdn_host)}/{_s2l_state._fmt_path_qs(p, qs)} (not cached)", "CDN")

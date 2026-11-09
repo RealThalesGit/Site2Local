@@ -19,7 +19,15 @@ def _safe_seg(name: str) -> str:
         return name
     base, ext = os.path.splitext(name)
     h = hashlib.sha1(name.encode()).hexdigest()[:12]
-    return f"{base[:32]}_{h}{ext}"
+    limit = _s2l_state.MAX_FNAME
+    if limit <= len(h):
+        return h[:limit]
+    # Extensions can themselves be huge. Keep ordinary MIME-bearing suffixes,
+    # but never let a suffix defeat the final component-length limit.
+    if len(ext) > min(32, limit - len(h) - 2):
+        ext = ""
+    room = limit - len(h) - 1 - len(ext)
+    return f"{base[:min(32, room)]}_{h}{ext}"
 
 
 #: Characters a beautified query segment keeps. Everything else (spaces,

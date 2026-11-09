@@ -65,7 +65,10 @@ def _apply_gui_hooks(ctx: _s2l_state.HookContext) -> None:
             continue
         # Path + query pattern (match against full path?query so hooks can target specific params)
         try:
-            if not re.search(h["pattern"], ctx.path, re.IGNORECASE):
+            query = getattr(ctx, "query", "")
+            full_path = ctx.path + ("?" + query if query else "")
+            if not (re.search(h["pattern"], full_path, re.IGNORECASE)
+                    or re.search(h["pattern"], ctx.path, re.IGNORECASE)):
                 continue
         except re.error:
             continue

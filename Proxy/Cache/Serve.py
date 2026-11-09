@@ -130,6 +130,10 @@ def _cached_response(lp: str, target: str, method: str, req_path: str) -> Respon
         return None
 
     data, ct = result
+    target_host = urlparse(target).netloc
+    if (_s2l_state.PROXY_CDN and target_host != _s2l_state.MAIN_HOST
+            and ("text/html" in ct or "text/css" in ct)):
+        data = _s2l_state.rewrite_doc_relative(data, target_host, html_doc="text/html" in ct)
     _s2l_state.log(f"{method} HIT {_s2l_state._fmt_host(urlparse(target).netloc)}{_s2l_state._fmt_path_qs(req_path)} {_s2l_state._fmt_size(len(data))}", "←")
     _is_static = not (ct.startswith("text/html") or "json" in ct)
     _val = _s2l_state._disk_validators(lp, ct) if _is_static else None

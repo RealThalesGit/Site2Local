@@ -59,43 +59,9 @@ def ext_asset(extpath: str) -> Response:
             if _rng is not None:
                 return _rng
             # unparseable range / read failure — fall through to full serve
-        _probe_ct_e = _s2l_state._resolve_mime_with_sniff(lp)
-        _c304 = _s2l_state._conditional_304(lp, _probe_ct_e)
-        if _c304 is not None:
-            _s2l_state.stats.inc("cache_304")
-            _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} [EXT] {method} HIT 304 {_s2l_state._fmt_host(ext_host)}{_s2l_state._fmt_path_qs(ext_path, qs)}", "CDN")
-            _s2l_state._gui_push_raw(method, ext_path, 304, _probe_ct_e, b"",
-                          display_tag="[CDN] [←] [EXT]", origin=ext_host, _skip_log=True)
-            return _c304
-        result = _s2l_state._serve_cached(lp)
-        if result is not None:
-            data, ct = result
-            # Fix 17 — the root-relative pass on cache HITs: _serve_cached
-            # already applied the absolute-URL passes, but root-relative
-            # URLs need THIS route's host to resolve — without this they'd
-            # land on the main-site route (404 JSON + nosniff → the browser
-            # drops the resource with a MIME mismatch).
-            _ctb_e = ct.split(";")[0].strip().lower()
-            if _s2l_state.PROXY_CDN and ("text/html" in _ctb_e or "text/css" in _ctb_e):
-                data = _s2l_state.rewrite_doc_relative(
-                    data, ext_host, html_doc=("text/html" in _ctb_e))
-            _s2l_state.log(f"{_s2l_state._CACHE_HIT_MARKER} [EXT] {method} HIT {_s2l_state._fmt_host(ext_host)}{_s2l_state._fmt_path_qs(ext_path, qs)} {_s2l_state._fmt_size(len(data))}", "CDN")
-            _s2l_state._gui_push_raw("GET", ext_path, 200, ct, data,
-                          display_tag="[CDN] [←] [EXT]", origin=ext_host, _skip_log=True)
-            resp = Response(data, content_type=ct)
-            if ct.startswith("text/html") or "json" in ct:
-                resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            else:
-                resp.headers["Cache-Control"] = "no-cache"
-                _val = _s2l_state._disk_validators(lp, ct)
-                if _val:
-                    resp.headers["ETag"] = _val[0]
-                    resp.headers["Last-Modified"] = _val[1]
-            _s2l_state._apply_cors_headers(resp.headers)
-            _s2l_state._apply_isolation_headers(resp.headers,
-                                     is_worker_script=_s2l_state._is_worker_request())
-            _s2l_state._apply_security_headers(resp.headers)
-            return resp
+        cached = _s2l_state._cached_response(lp, real_url, method, ext_path)
+        if cached is not None:
+            return cached
     if _s2l_state.OFFLINE:
         _s2l_state.log(f"EXT {method} 404 {_s2l_state._fmt_host(ext_host)}{_s2l_state._fmt_path_qs(ext_path, qs)} (not cached)", "CDN")
         return Response("Offline — not cached", status=404)
