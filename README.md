@@ -54,7 +54,7 @@ Run a website through a local Python proxy, save the resources you visit, and ed
 
 With the example's `CRAWL = True`, the initial crawl runs in the background while the proxy starts. You can browse while files are discovered and downloaded. Set `CRAWL = False` to skip that initial crawl.
 
-Restart the application after changing configuration flags. `Boot.py` keeps generated paths relative to the project folder. You can also run `python -m Site2Local` from its parent directory.
+Restart the application after changing configuration flags. `Boot.py` keeps generated paths relative to the project folder. The folder can have any name (for example `S2L` or `My Site Proxy`); launch with `python Boot.py` inside it, or `python /path/to/project/Boot.py` from elsewhere. You can also run `python -m Site2Local` from its parent directory when the folder is named `Site2Local`.
 
 ## How it works
 
