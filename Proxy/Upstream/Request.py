@@ -184,8 +184,10 @@ def _do_upstream(method: str, target: str, ctx: _s2l_state.HookContext,
             and not _resp_cl_explicit_zero
             and response.status_code in (200, 201)
             and response.content == b""
-            and method in _s2l_state._SAFE_METHODS | {"POST"}):
+            and method in _s2l_state._SAFE_METHODS):
         try:
+            # A successful empty POST may already have changed upstream state.
+            # Only retry safe methods to avoid duplicating that operation.
             # Retry with the SAME authenticated session + identity encoding
             retry_fwd = dict(fwd)
             retry_fwd["Accept-Encoding"] = "identity"

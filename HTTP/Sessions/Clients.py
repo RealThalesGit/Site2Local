@@ -51,6 +51,8 @@ def _get_client_session():
 
 def _short_exc(exc: Exception) -> str:
     msg = str(exc)
+    if not msg.strip():
+        return type(exc).__name__
     for pat in (r"HTTPSConnectionPool\(host='([^']+)'",
                 r"nodename nor servname provided",
                 r"SSL: (.+)", r"Caused by (.+)"):
