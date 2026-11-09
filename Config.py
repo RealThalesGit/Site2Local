@@ -79,7 +79,7 @@ ATOMIC_SERVE = False             # bounded RAM cache; disk edits stay live
 ATOMIC_SERVE_MAX_BYTES = "256"  # total raw-file RAM budget; 0 disables body caching
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
 CROSS_ORIGIN_ISOLATION = "auto" # "auto" detects document requirements; True forces isolation, False disables it
-HOOK_GUI = True                # PyQt6 traffic inspector + live hook editor (Fusion theme)
+HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output
 SHOW_HIDDEN = False             # un-hide display:none / disabled elements in HTML
 SCAN_PATHS = False             # hidden-path scanner: False | "all" | "all-in-dir" | "<dir>/<file>"
