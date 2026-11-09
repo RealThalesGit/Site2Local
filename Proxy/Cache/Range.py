@@ -6,6 +6,7 @@ from flask import request as flask_request
 from urllib.parse import urlparse
 import os
 import re
+import email.utils
 
 from ... import Runtime as _s2l_state
 
@@ -45,13 +46,9 @@ def _parse_range_header(range_hdr: str, file_size: int) -> tuple[int, int] | Non
 def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> Response | None:
     """206 Partial Content served straight from a disk-cached file.
 
-    Shared range-serving seam (currently the OFFLINE branch of the main
-    proxy). Range requests must never be answered with a full 200 — HTML5
-    <video>/<audio> interpret that as a truncated stream and loop/stall —
-    and when there is no upstream (OFFLINE) the file on disk is the only
-    possible source. Returns None when the Range header is absent or
-    unparseable, or the read fails, so the caller can fall back to a
-    full-file serve (the policy this branch always had).
+    Shared by the main proxy, external assets and CDN servers. Return None
+    for missing/unsupported ranges, failed reads, or a stale If-Range
+    validator so callers can serve the complete current representation.
     """
     rng = flask_request.headers.get("Range", "")
     if not rng:
@@ -63,6 +60,27 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     rng_parsed = _s2l_state._parse_range_header(rng, file_size)
     if rng_parsed is None:
         return None
+    # Resolve the type from the file head, never from a mid-file slice.
+    ct = _s2l_state._resolve_mime_with_sniff(lp)
+    ct = _s2l_state._ensure_wasm_content_type(ct, lp)
+    validators = _s2l_state._disk_validators(lp, ct)
+    if_range = flask_request.headers.get("If-Range", "").strip()
+    if if_range:
+        if validators is None:
+            return None
+        etag, last_modified = validators
+        if if_range.startswith(('"', 'W/')):
+            # If-Range requires a strong comparison; weak tags never match.
+            if if_range.startswith('W/') or if_range != etag:
+                return None
+        else:
+            try:
+                supplied = email.utils.parsedate_to_datetime(if_range)
+                current = email.utils.parsedate_to_datetime(last_modified)
+                if supplied.tzinfo is None or supplied != current:
+                    return None
+            except (ValueError, TypeError, OverflowError):
+                return None
     start, end = rng_parsed
     try:
         with open(lp, "rb") as _rf:
@@ -77,9 +95,9 @@ def _serve_range_from_disk(lp: str, target: str, method: str, req_path: str) -> 
     # head (a fresh 2 KB read) instead of the requested slice: the 200 and
     # the 206 of the same file must carry the SAME Content-Type, and a
     # short mid-file slice would starve the sniffer of evidence.
-    ct = _s2l_state._resolve_mime_with_sniff(lp)
-    ct = _s2l_state._ensure_wasm_content_type(ct, lp)
     resp = Response(_slice, status=206, content_type=ct)
+    if validators:
+        resp.headers["ETag"], resp.headers["Last-Modified"] = validators
     resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = str(len(_slice))

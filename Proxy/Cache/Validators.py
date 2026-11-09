@@ -46,6 +46,19 @@ def _conditional_304(lp: str, ct: str) -> Response | None:
     no-store, so browsers never send conditionals for them — skipped here to
     keep the semantics consistent.
     """
+    # A disk validator cannot describe a body changed by request/response
+    # hooks. Always run the full response pipeline when hooks are enabled.
+    if (getattr(_s2l_state, "HOOK_GUI", False)
+            or getattr(_s2l_state, "_REQ_HOOKS", ())
+            or getattr(_s2l_state, "_RESP_HOOKS", ())):
+        return None
+    # The range helper already handled matching If-Range requests. A fallback
+    # must deliver the complete representation, not resurrect a cached body.
+    try:
+        if flask_request.headers.get("Range") and flask_request.headers.get("If-Range"):
+            return None
+    except RuntimeError:
+        return None
     if ct.startswith("text/html") or "json" in ct:
         return None
     val = _s2l_state._disk_validators(lp, ct)
