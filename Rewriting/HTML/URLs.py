@@ -94,8 +94,7 @@ def _rewrite_ext_urls(html_bytes: bytes, html_doc: bool = False) -> bytes:
     #    collapsing the menu into an unstyled vertical list with black text
     #    and wrapped caret icons.
     # 2. UNQUOTED urls: tolerate ONE level of balanced parentheses, then trim
-    #    a trailing ')' that isn't part of the URL (same idea as
-    #    _clean_url_match).
+    #    a trailing ')' that isn't part of the URL.
     # Rewritten values are always re-quoted with double quotes — valid CSS in
     # every context and immune to parens/commas in the proxied path.
     #

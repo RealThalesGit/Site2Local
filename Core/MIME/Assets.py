@@ -21,14 +21,3 @@ def is_static_asset(ct: str) -> bool:
             or base.startswith(("application/font-woff", "application/font-woff2"))
             or base.startswith("image/")
             or base.startswith(("audio/", "video/")))
-
-
-def is_subresource(ct: str) -> bool:
-    """Dynamic check: is this a subresource (asset that's typically
-    uninteresting to log)? Mirrors what is_static_asset covers, plus
-    octet-stream (which usually means a binary download)."""
-    if _s2l_state.is_static_asset(ct):
-        return True
-    base = _s2l_state._ct_base(ct)
-    return base in ("application/octet-stream", "application/zip",
-                    "application/x-tar", "application/gzip")

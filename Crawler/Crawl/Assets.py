@@ -7,34 +7,6 @@ import threading
 from ... import Runtime as _s2l_state
 
 
-def _clean_url_match(m: bytes) -> bytes:
-    """Strip trailing punctuation that the greedy path class captures.
-
-    These characters are valid inside URLs (e.g. a comma in a query string)
-    but almost never appear at the very end of a real URL — they're sentence
-    punctuation, JS operators, or closing delimiters that the regex hoovers
-    up because they're in the path character class.
-
-    Also strips a SINGLE trailing closing-paren when the match contains an
-    UNMATCHED opening paren — this is the common case of `url(//host/path)`
-    in CSS, where the `)` is the CSS function close, not part of the URL.
-    The regex can't express "balanced parens" so we approximate here: count
-    opens vs closes; if there's one extra close, drop it.
-    """
-    while m and m[-1] in _s2l_state._URL_TRAILING:
-        m = m[:-1]
-    # Unbalanced-paren fixup: if the trimmed match has more `)` than `(`,
-    # drop exactly one trailing `)`. This is the standard CSS `url(/path)`
-    # case and costs almost nothing for non-CSS matches (which are balanced
-    # or have no parens at all).
-    if m and m[-1] == ord(b")"):
-        opens  = m.count(b"(")
-        closes = m.count(b")")
-        if closes > opens:
-            m = m[:-1]
-    return m
-
-
 def _fetch_external_asset(u: str) -> None:
     """Fetch a CDN asset; discover CSS dependencies through the bounded queue."""
     netloc = urlparse(u).netloc

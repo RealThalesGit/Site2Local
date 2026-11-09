@@ -9,7 +9,6 @@ from .ContentType import (
 )
 from .Assets import (
     is_static_asset,
-    is_subresource,
 )
 
 __all__ = [
@@ -18,5 +17,4 @@ __all__ = [
     "_ct_base",
     "_resolve_mime_with_sniff",
     "is_static_asset",
-    "is_subresource",
 ]

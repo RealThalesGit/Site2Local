@@ -26,7 +26,7 @@ Site2Local/
 │   ├── MIME/
 │   │   ├── Guess.py       guess_mime + UNIFIED content resolver (Fix 6R, 9.1)
 │   │   ├── ContentType.py _ensure_wasm_content_type, _ct_base
-│   │   └── Assets.py      is_static_asset / is_subresource
+│   │   └── Assets.py      is_static_asset
 │   ├── Compression.py   gzip/deflate/br/zstd (incl. streaming bomb guard)
 │   ├── Logging/         log(), lolcat rainbow
 │   ├── Stats/           _Stats counters + CDN health tracking

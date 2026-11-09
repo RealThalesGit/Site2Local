@@ -4,7 +4,6 @@ from .Hosts import (
     _is_host_dead,
 )
 from .Assets import (
-    _clean_url_match,
     _fetch_external_asset,
     _start_ext_asset_workers,
     _ext_asset_worker,
@@ -28,7 +27,6 @@ from .Save import (
 __all__ = [
     "_mark_host_dead",
     "_is_host_dead",
-    "_clean_url_match",
     "_fetch_external_asset",
     "_save_worker",
     "enqueue",

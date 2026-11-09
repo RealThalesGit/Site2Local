@@ -863,54 +863,6 @@ _dead_hosts_lock: threading.Lock = threading.Lock()
 _crawl_done     = threading.Event()   # set when initial crawl finishes
 _cdn_thread_sem = threading.Semaphore(32)  # cap concurrent CDN fetch threads
 
-# Regex for extracting URLs from arbitrary response bodies (DUMP_ALL mode).
-# Three alternatives, each with guards tuned to minimise false positives:
-#
-#  1. Explicit scheme:// — http(s)://, ws(s)://, ftp://, file://. The host
-#     char class stops at the first character that can't legally appear in
-#     a hostname, then the path/query portion is allowed the full RFC 3986
-#     sub-delims + pchar set. ws/wss support is new — modern SPAs route
-#     realtime traffic over WebSocket and DUMP_ALL needs to see those URLs
-#     so the WS handler can pre-register the upstream host.
-#
-#  2. Protocol-relative //host/path — only matched right after a context
-#     character that genuinely precedes a URL in real code: quotes, parens,
-#     `=`, `:`, backtick (template literals), or comma (JSON arrays /
-#     multi-attribute HTML). This is how these are actually written
-#     (src="//cdn...", url(//fonts...), fetch(`//api...`), ["//a.com","//b.com"]).
-#     Without that guard, a bare "// comment" in JS/CSS matches just as easily.
-#
-#  3. Bare root-relative /path — only matched when NOT a continuation of a
-#     longer token (so "foo/bar/baz" inside a string doesn't yield a spurious
-#     "/bar/baz"). Requires at least 2 chars to avoid matching "/" alone.
-#     The path char class adds @, ~, %, &, ?, =, # so query strings and
-#     fragment-bearing links inside JS bundles are caught too.
-#
-# Trailing punctuation (.,;:!?)]}>'"`\) that the greedy path class hoovers up
-# is trimmed post-match by _clean_url_match() — doing it in-regex would require
-# variable-length lookbehinds which Python's re doesn't support.
-_URL_HOST_CHARS  = rb"[a-zA-Z0-9\-._:]+"          # host + port
-_URL_PATH_CHARS  = rb"[a-zA-Z0-9\-._~:/?#@!$&'*+,;=%()"  # path + query
-_URL_TRAILING    = frozenset(b".,;:!?)\"'<>]}\\`")
-
-# Schemes we recognize. `wss?` covers ws:// and wss:// (realtime APIs).
-# `ftp`/`file` are rare in practice but cost nothing to include.
-_URL_SCHEME_PREFIX = rb"(?:https?|wss?|ftp|file)://"
-
-URL_REGEX = re.compile(
-    # 1. Explicit scheme:// — extended to ws/wss/ftp/file in addition to http(s)
-    _URL_SCHEME_PREFIX + _URL_HOST_CHARS + _URL_PATH_CHARS + rb"]*"
-    # 2. Protocol-relative //host/path — backtick and comma added to the
-    #    lookbehind so template literals and JSON arrays of CDN URLs are caught.
-    rb"|(?<=[\"'(=:` ,])//" + _URL_HOST_CHARS + _URL_PATH_CHARS + rb"]*"
-    # 3. Root-relative /path — expanded path char class with @ ~ % & ? = #
-    #    so query/fragment-bearing in-page links inside JS bundles match.
-    rb"|(?<![a-zA-Z0-9_/])/(?!/)[a-zA-Z0-9_\-/.@~%&?=#]{2,}"
-)
-
-# HTML tags that represent external sub-resources worth fetching
-_ASSET_TAGS = frozenset({"script", "img", "link", "source", "video", "audio"})
-
 # save_queue must be defined before _save_worker starts
 save_queue: queue.Queue = queue.Queue()
 
@@ -1269,7 +1221,6 @@ from .Core.Compression import (
 from .Crawler.Crawl import (
     _mark_host_dead,
     _is_host_dead,
-    _clean_url_match,
     _fetch_external_asset,
     _save_worker,
     enqueue,
@@ -1337,7 +1288,6 @@ from .Core.MIME import (
     _ct_base,
     _resolve_mime_with_sniff,
     is_static_asset,
-    is_subresource,
 )
 from .Proxy.Upstream import (
     _main_security_headers,
