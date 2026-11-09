@@ -1,5 +1,15 @@
 # Site2Local
 
+`CROSS_ORIGIN_ISOLATION = "auto"` (default) enables COOP/COEP when document
+headers or HTML indicate isolation requirements (SharedArrayBuffer/threaded
+WASM). Ordinary pages and workers do not enable isolation by themselves.
+Once detected on a top-level page, isolation stays enabled across proxy ports
+until restart, including cached documents and workers. Detection is heuristic:
+requirements hidden in external JavaScript may need `True` to force isolation
+before loading the main page. `False` disables enforcement for compatibility.
+Isolation can block external frames that do not opt in, even with
+`credentialless`. Restart and reload the main page after changing the setting.
+
 `ATOMIC_SERVE = True` in `Config.py` accelerates already-downloaded files
 on the main proxy and CDN cache paths with a shared, thread-safe RAM cache.
 `ATOMIC_SERVE_MAX_BYTES = "64MB"` sets the raw-file RAM budget; accepts values

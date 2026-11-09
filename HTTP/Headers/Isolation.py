@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from flask import request as flask_request
 import re
+import threading
 
 from ... import Runtime as _s2l_state
 
@@ -11,6 +12,8 @@ from ... import Runtime as _s2l_state
 #: Callers use this instead of hand-rolling `"text/html" in ct` so XHTML
 #: documents get the same isolation treatment as HTML ones.
 _DOC_CT_MARKERS = ("text/html", "application/xhtml+xml")
+_auto_isolation_lock = threading.Lock()
+_auto_isolation_required = False
 
 
 def _is_document_ct(ct: str) -> bool:
@@ -146,7 +149,7 @@ def _coep_value() -> str:
 def _apply_isolation_headers(out, body: bytes = b"",
                              is_top_level_html: bool = False,
                              is_worker_script: bool = False) -> None:
-    """Inject COOP/COEP on document navigations and Worker responses.
+    """Apply automatic or explicit COOP/COEP policy consistently.
 
     Two paths trigger isolation:
 
@@ -175,11 +178,41 @@ def _apply_isolation_headers(out, body: bytes = b"",
     (online filter_resp, cache-hit _cached_response, _make_flask_resp
     safety net, _stream_resp, CDN mini-server, ext_asset route).
     """
-    # Document navigations always get the pair. Body inspection remains a
-    # fallback for HTML responses in clients without Fetch Metadata headers.
+    # Isolation changes which third-party frames a page may embed. Enforcing
+    # it on every mirrored site breaks ordinary game portals, even when all
+    # proxied assets have CORP. Default to compatibility; threaded WASM sites
+    # can explicitly opt in for the entire proxy (main page, CDN and workers).
+    global _auto_isolation_required
+    mode = getattr(_s2l_state, "CROSS_ORIGIN_ISOLATION", "auto")
+    if mode is not True and mode is not False and mode != "auto":
+        raise ValueError('CROSS_ORIGIN_ISOLATION must be True, False, or "auto"')
+    enabled = mode is True
+    if mode == "auto":
+        is_document = bool(is_top_level_html or _s2l_state._is_document_request())
+        upstream_coep = _s2l_state._ci_get_header(out, "Cross-Origin-Embedder-Policy").split(";", 1)[0].strip().lower()
+        evidence = is_document and (
+            upstream_coep in ("require-corp", "credentialless")
+            or bool(body and _needs_isolation(body)))
+        try:
+            destination = flask_request.headers.get("Sec-Fetch-Dest", "").lower()
+        except RuntimeError:
+            destination = ""
+        with _auto_isolation_lock:
+            # Only a top-level document can establish isolation for its
+            # descendants. A late iframe/worker cannot change its parent.
+            if evidence and destination not in ("iframe", "frame", "fencedframe"):
+                _auto_isolation_required = True
+            enabled = _auto_isolation_required or evidence
+    if not enabled:
+        _s2l_state._ci_remove_header(out, "Cross-Origin-Opener-Policy")
+        _s2l_state._ci_remove_header(out, "Cross-Origin-Embedder-Policy")
+        return
+    # Navigation metadata identifies the destination even when a redirect,
+    # error, streamed response or revalidation lacks an HTML Content-Type.
+    # Conversely HTML must keep the same policy when Fetch Metadata is absent.
+    # Otherwise an isolated parent can reject a nested document on reload.
     _html_needs_isolation = bool(
-        is_top_level_html
-        and (_s2l_state._is_document_request() or (body and _needs_isolation(body))))
+        is_top_level_html or _s2l_state._is_document_request())
     # Worker responses need COEP so the Worker can inherit
     # crossOriginIsolated from its parent.
     _should_apply = _html_needs_isolation or is_worker_script
