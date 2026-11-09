@@ -10,6 +10,7 @@ import os
 import threading
 
 from .. import Runtime as _s2l_state
+from ..HTTP.Streaming.Response import _buffer_rewritable_response
 
 
 def _start_cdn_server(cdn_host: str, port: int) -> None:
@@ -183,13 +184,12 @@ def _start_cdn_server(cdn_host: str, port: int) -> None:
                 kw["data"] = ctx.req_body
             kw["stream"] = _do_stream_c
             r    = _s2l_state._get_client_session().request(method, cdn_url, **kw)
-            # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
-            # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
-            # large binary files (.tar bundles, .wasm, video, etc), producing
-            # "0.0B" bodies even though the server returned 200 with real content.
-            if _do_stream_c:
+            # Buffer only rewritable documents using the real stream iterator.
+            body = _buffer_rewritable_response(r) if _do_stream_c else None
+            if _do_stream_c and body is None:
                 return _s2l_state._stream_resp(r, method, cdn_url)
-            body = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
+            if body is None:
+                body = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
             ct   = _s2l_state._ensure_wasm_content_type(
                 r.headers.get("Content-Type", "application/octet-stream"),
                 "/" + p.lstrip("/"))

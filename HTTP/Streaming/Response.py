@@ -5,8 +5,27 @@ from flask import Response
 from flask import stream_with_context
 from urllib.parse import urlparse
 import zlib
+import re
 
 from ... import Runtime as _s2l_state
+
+
+def _buffer_rewritable_response(upstream_r) -> bytes | None:
+    """Consume streamed documents via iter_content, then use the normal pipeline.
+
+    Never buffer partial ranges or SSE here. None leaves the binary streaming
+    path intact; empty bytes represent a consumed, genuinely empty document.
+    """
+    ct = (upstream_r.headers.get("Content-Type", "") or "").split(";", 1)[0].lower().strip()
+    if (upstream_r.status_code == 206 or upstream_r.headers.get("Content-Range")
+            or not (ct in ("text/html", "application/xhtml+xml", "text/css")
+                    or ("json" in ct and "stream" not in ct))):
+        return None
+    try:
+        raw = b"".join(upstream_r.iter_content(chunk_size=65536))
+        return _s2l_state.decompress_body(raw, upstream_r.headers.get("Content-Encoding", ""))
+    finally:
+        upstream_r.close()
 
 
 def _stream_resp(upstream_r, method: str, target: str) -> Response:
@@ -130,7 +149,7 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
         finally:
             # Only cache if the stream completed normally AND we stayed within
             # the memory bound AND it's a full response (200, or 206 that
-            # covers the ENTIRE file — detected via Content-Range starting at 0).
+            # covers the ENTIRE file, with a known total and matching byte count).
             # A 206 for "Range: bytes=1000-2000" is a partial slice and must
             # NOT be cached (would overwrite the full file with a slice).
             # But a 206 for "Range: bytes=0-" returns the whole file with
@@ -140,9 +159,18 @@ def _stream_resp(upstream_r, method: str, target: str) -> Response:
                 _cr_header = upstream_r.headers.get("Content-Range", "") or ""
             except Exception:
                 pass
-            _is_full_content = (sc == 200) or (
-                sc == 206 and _cr_header and _cr_header.startswith("bytes 0-"))
-            if (method == "GET" and _is_full_content and completed
+            _is_full_content = sc == 200
+            if sc == 206:
+                _range_match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", _cr_header.strip())
+                if _range_match:
+                    _range_end, _range_size = map(int, _range_match.groups())
+                    _is_full_content = (
+                        _range_size > 0
+                        and _range_end == _range_size - 1
+                        and total == _range_size)
+            _is_external = urlparse(target).hostname != urlparse("//" + _s2l_state.MAIN_HOST).hostname
+            _cache_allowed = not _is_external or _s2l_state.CACHE_CDN
+            if (method == "GET" and _cache_allowed and _is_full_content and completed
                     and raw_chunks and total <= _s2l_state._STREAM_CACHE_MAX_BYTES):
                 full  = b"".join(raw_chunks)
                 plain = _s2l_state.decompress_body(full, enc)

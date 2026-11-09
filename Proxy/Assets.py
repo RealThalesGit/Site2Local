@@ -6,6 +6,7 @@ from flask import request as flask_request
 import os
 
 from .. import Runtime as _s2l_state
+from ..HTTP.Streaming.Response import _buffer_rewritable_response
 
 
 def ext_asset(extpath: str) -> Response:
@@ -147,15 +148,13 @@ def ext_asset(extpath: str) -> Response:
             kw["data"] = ctx.req_body
         kw["stream"] = _do_stream_ext
         r    = _s2l_state._get_client_session().request(method, real_url, **kw)
-        # CRITICAL: when stream=True was used, ALWAYS hand off to _stream_resp.
-        # Falling through to r.content loses chunks on curl_cffi HTTP/2 for
-        # large binary files (.tar bundles, .wasm, video, etc), producing
-        # "0.0B" bodies even though the server returned 200 with real content.
-        # The stream-mode r.content read is unreliable — _stream_resp reads
-        # chunk-by-chunk and is always correct.
-        if _do_stream_ext:
+        # Documents need the normal rewrite/hook pipeline even when path
+        # heuristics selected streaming. Consume iter_content, never r.content.
+        body = _buffer_rewritable_response(r) if _do_stream_ext else None
+        if _do_stream_ext and body is None:
             return _s2l_state._stream_resp(r, method, real_url)
-        body = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
+        if body is None:
+            body = _s2l_state.decompress_body(r.content, r.headers.get("Content-Encoding", ""))
         ct   = _s2l_state._ensure_wasm_content_type(
             r.headers.get("Content-Type", "application/octet-stream"), ext_path)
         # Only save real 200 responses with content — 304 has empty body and saving
