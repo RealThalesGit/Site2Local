@@ -214,6 +214,8 @@ from .Config import (
     DUMP_ALL,
     PROXY_CDN,
     CACHE_CDN,
+    ATOMIC_SERVE,
+    ATOMIC_SERVE_MAX_BYTES,
     VERSION,
     MULTIPORT,
     HOOK_GUI,
@@ -264,6 +266,7 @@ WS_MAX_MSG_BYTES       = parse_size(WS_MAX_MSG_BYTES)
 MAX_BODY_BYTES         = parse_size(MAX_BODY_BYTES)
 MAX_DECOMPRESSED_BYTES = parse_size(MAX_DECOMPRESSED_BYTES)
 STREAM_CACHE_MAX_BYTES = parse_size(STREAM_CACHE_MAX_BYTES)
+ATOMIC_SERVE_MAX_BYTES = parse_size(ATOMIC_SERVE_MAX_BYTES)
 
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",

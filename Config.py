@@ -75,6 +75,8 @@ SAVE_ERRORS = False            # cache 4xx/5xx responses
 DUMP_ALL = False               # extract + crawl every URL found in any response body
 PROXY_CDN = True                # proxy external CDN/third-party assets
 CACHE_CDN = True                # cache CDN assets to disk (False = live-proxy, no disk)
+ATOMIC_SERVE = False             # bounded RAM cache; disk edits stay live
+ATOMIC_SERVE_MAX_BYTES = "256"  # total raw-file RAM budget; 0 disables body caching
 MULTIPORT = True                # each CDN host gets a dedicated port (False = /__s2l_ext__/)
 HOOK_GUI = False                # PyQt6 traffic inspector + live hook editor (Fusion theme)
 RAINBOW_LOGS = False            # lolcat-style terminal output

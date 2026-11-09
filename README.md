@@ -1,4 +1,17 @@
 # Site2Local
+
+`ATOMIC_SERVE = True` in `Config.py` accelerates already-downloaded files
+on the main proxy and CDN cache paths with a shared, thread-safe RAM cache.
+`ATOMIC_SERVE_MAX_BYTES = "64MB"` sets the raw-file RAM budget; accepts values
+such as `"256MB"`, `"1GB"`, or an integer byte count. Use `0` to disable raw-file
+RAM storage while keeping MIME memoization. Raw file bytes are limited to
+this budget / 4096 entries (files over 16 MiB bypass
+the body cache), and MIME sniff results to 4096 entries. Disk signatures are
+checked on every read so edits, replacements and deletions stay visible.
+HTML injection, URL rewriting, hooks and per-file logging still run normally.
+Set it to `False` to use ordinary disk reads and MIME detection. Restart after
+changing the flag; it does not accelerate upstream downloads on first access.
+
 > **Mildly Powerful and IT'S FREE!!**
 
 A **Vibe-coded** python project which makes a existent website running on localhost or any external ip address!

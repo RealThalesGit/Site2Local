@@ -4,8 +4,10 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+from functools import lru_cache
 
 from ... import Runtime as _s2l_state
+from ..Cache.Memory import read_cached_file
 
 
 def guess_mime(path: str) -> str:
@@ -160,9 +162,30 @@ def _sniff_js(head: bytes) -> bool:
     stay far below. `crossOriginIsolated`-style API prose in HTML comments
     never reaches the threshold either.
     """
+    # Small webpack/CSS-module chunks often contain only a registration and
+    # an object of class names: they never reach the token-count threshold.
+    # Their CSS-like strings/properties must not turn executable JS into CSS.
+    # Keep quoted literals intact while removing comments, so // inside a
+    # URL does not eat the rest of the line. Ignore truncated comments too.
+    quoted = rb'''"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|`(?:\\.|[^`\\])*(?:`|$)'''
+    uncommented = re.sub(
+        quoted + rb'|(?P<comment>/\*.*?(?:\*/|$)|//[^\r\n]*)',
+        lambda m: b' ' if m.group('comment') is not None else m.group(0),
+        head, flags=re.DOTALL)
+    prefix = uncommented.lstrip()
+    if re.match(rb'''["']use (?:strict|asm)["']\s*;''', prefix):
+        return True
+    if re.match(
+            rb'(?:\(\s*)?(?:this|self|window|globalThis)\s*'
+            rb'(?:\.\s*webpackChunk[\w$]*|\[\s*["\']webpackChunk[^"\']*["\']\s*\])\s*=',
+            prefix):
+        return True
+    # CSS comments and content strings can describe JavaScript without
+    # being executable code. Only count evidence outside those literals.
+    code = re.sub(quoted, b' ', uncommented, flags=re.DOTALL)
     hits = 0
     for tok in _JS_EXECUTABLE:
-        if tok in head:
+        if tok in code:
             hits += 1
             if hits >= _JS_MIN_HITS:
                 return True
@@ -171,6 +194,12 @@ def _sniff_js(head: bytes) -> bool:
 
 def _sniff_css(head: bytes) -> bool:
     """Stylesheet check — @-rules first (strong), then property shapes."""
+    # CSS inside a JavaScript/JSON string is data, not a stylesheet. Ignore
+    # quoted strings and comments before looking for rules/declarations.
+    # The sniff window may end inside a long string/comment.
+    head = re.sub(
+        rb'''/\*.*?(?:\*/|$)|"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|`(?:\\.|[^`\\])*(?:`|$)''',
+        b' ', head, flags=re.DOTALL)
     for rule in _CSS_AT_RULES:
         if rule in head:
             return True
@@ -256,6 +285,8 @@ def _sniff_json(head: bytes) -> bool:
 
 def _read_head(lp: str, size: int) -> bytes:
     try:
+        if getattr(_s2l_state, "ATOMIC_SERVE", False):
+            return read_cached_file(lp, size)
         with open(lp, "rb") as f:
             return f.read(size)
     except OSError:
@@ -264,6 +295,21 @@ def _read_head(lp: str, size: int) -> bytes:
 
 def _resolve_mime_with_sniff(lp: str, data: bytes | None = None,
                              live_ct: str = "") -> str:
+    """Resolve MIME, memoizing sniff results when ATOMIC_SERVE is enabled."""
+    if getattr(_s2l_state, "ATOMIC_SERVE", False):
+        head = _read_head(lp, _SNIFF_HEAD) if data is None else data[:_SNIFF_HEAD]
+        return _memoized_mime(lp, head, live_ct)
+    return _resolve_mime_uncached(lp, data, live_ct)
+
+
+@lru_cache(maxsize=4096)
+def _memoized_mime(lp: str, head: bytes, live_ct: str) -> str:
+    # Actual sniff bytes in the key keep edited files' MIME results current.
+    return _resolve_mime_uncached(lp, head, live_ct)
+
+
+def _resolve_mime_uncached(lp: str, data: bytes | None = None,
+                           live_ct: str = "") -> str:
     """Resolve the MIME type of a cached file from name + content + any CT
     the live pipeline still knows about.
 

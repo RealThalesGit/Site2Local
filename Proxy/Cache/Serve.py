@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import os
 
 from ... import Runtime as _s2l_state
+from ...Core.Cache.Memory import read_cached_file
 
 
 def _serve_cached(lp: str) -> tuple[bytes, str] | None:
@@ -32,24 +33,27 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
       URL-rewrite passes applied for CSS and JSON.
     """
     try:
-        with open(lp, "rb") as f:
-            data = f.read()
+        if getattr(_s2l_state, "ATOMIC_SERVE", False):
+            data = read_cached_file(lp)
+        else:
+            with open(lp, "rb") as f:
+                data = f.read()
     except OSError:
         return None
 
     looks_html = lp.endswith(".html") or lp.endswith("/index.html")
     has_ext = bool(os.path.splitext(os.path.basename(lp))[1])
+    ct = None
 
     if not has_ext and not looks_html:
         # No-extension file (beautified/09/10 layouts) — unified content
         # resolver decides HTML vs typed vs octet-stream. This is the SAME
         # resolver the 304-probe and the 206 path use, so every response
         # shape for one file agrees on the type.
-        ct_sniff = _s2l_state._resolve_mime_with_sniff(lp, data)
-        if ct_sniff.startswith("text/html"):
+        ct = _s2l_state._resolve_mime_with_sniff(lp, data)
+        if ct.startswith("text/html"):
             looks_html = True
-        else:
-            return data, ct_sniff
+        # Non-HTML files still need the shared CSS/JSON rewrite pipeline.
 
     if looks_html:
         if _s2l_state._is_wire_payload(data) or not _s2l_state._is_valid_html(data):
@@ -80,7 +84,8 @@ def _serve_cached(lp: str) -> tuple[bytes, str] | None:
         data = _s2l_state._inject_sw_clear(data)
         return data, "text/html; charset=utf-8"
 
-    ct = _s2l_state._resolve_mime_with_sniff(lp, data)
+    if ct is None:
+        ct = _s2l_state._resolve_mime_with_sniff(lp, data)
     # Ensure WASM files served from disk cache also have the correct Content-Type
     # — critical for WebAssembly.instantiateStreaming() after a cache hit.
     ct = _s2l_state._ensure_wasm_content_type(ct, lp)
